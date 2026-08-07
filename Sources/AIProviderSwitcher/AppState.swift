@@ -191,6 +191,25 @@ final class AppState: ObservableObject {
 
     // MARK: Keys
 
+    /// Switches the active model: writes the config override and relaunches
+    /// ChatGPT/Codex so the new model applies in the Desktop.
+    func setModel(_ model: String) async {
+        guard let router, let provider = activeProvider else { return }
+        do {
+            _ = try await router.setActive(providerID: provider.id, model: model)
+            if provider.id != "openai" {
+                installProviders(activeProviderID: provider.id)
+                _ = try configStore.applyOverride(provider: provider, model: model)
+                log("Modèle : \(model). Relance de ChatGPT/Codex…")
+                await relaunchChatGPT()
+            } else {
+                log("Modèle : \(model).")
+            }
+        } catch {
+            log("Changement de modèle échoué: \(error.localizedDescription)")
+        }
+    }
+
     func setSessionKey(_ value: String) async {
         guard let provider = activeProvider else { return }
         keyStore.setKey(value, for: provider.id)

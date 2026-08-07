@@ -113,9 +113,28 @@ struct PanelView: View {
                     }
                 }
             }
+            modelPicker
             Text("Un clic sur un fournisseur : config appliquée + ChatGPT/Codex relancé avec les clés.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Model selector for the active provider. The Desktop picker is fed by
+    /// OpenAI's own backend (quota/limits), so switching happens here instead.
+    private var modelPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            panelTitle("Modèle actif")
+            Picker("Modèle", selection: Binding(
+                get: { state.snapshot.activeModel },
+                set: { newValue in Task { await state.setModel(newValue) } }
+            )) {
+                ForEach(state.activeProvider?.models ?? [], id: \.self) { model in
+                    Text(model).tag(model)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
         }
     }
 

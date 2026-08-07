@@ -135,7 +135,8 @@ public struct ProviderCatalog: Sendable, Equatable {
             // Latest Claude models (4.6 -> 5.0), as used by Claude Code 2.1.
             models: ["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
                      "claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"],
-            defaultModel: "claude-sonnet-4-6",
+            // haiku-4-5: seul modèle non rate-limité sur le compte actuel.
+            defaultModel: "claude-haiku-4-5",
             requiresKey: false,
             configProviderIDDirect: "claude"
         )
