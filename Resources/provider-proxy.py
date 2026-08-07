@@ -489,11 +489,18 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             data = self.rfile.read(length) if length else None
             stream = False
+            model = "?"
+            tools = 0
             if data:
                 try:
-                    stream = bool(json.loads(data).get("stream"))
+                    req = json.loads(data)
+                    stream = bool(req.get("stream"))
+                    model = req.get("model", "?")
+                    tools = len(req.get("tools") or [])
                 except Exception:
                     pass
+            sys.stderr.write("[proxy %s] POST %s model=%s tools=%s stream=%s\n"
+                             % (DISPLAY, self.path, model, tools, stream))
             code, body, ctype = do_anthropic_request(data or b"{}", self.headers, stream)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -510,6 +517,19 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         break
             return
+        if self.path.startswith("/v1/responses"):
+            length = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(length) if length else None
+            model, tools = "?", 0
+            if data:
+                try:
+                    req = json.loads(data)
+                    model = req.get("model", "?")
+                    tools = len(req.get("tools") or [])
+                except Exception:
+                    pass
+            sys.stderr.write("[proxy %s] POST %s model=%s tools=%s\n"
+                             % (DISPLAY, self.path, model, tools))
         self.relay()
 
     def do_DELETE(self):
