@@ -198,6 +198,36 @@ def _input_to_text(part):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Helper: when the client (Codex Desktop) sends zero tools, the model keeps
+# describing tool calls it can never execute. Inject a note so it answers in
+# plain text instead. CLI sessions send tools (>0) and are left untouched.
+# ---------------------------------------------------------------------------
+
+NO_TOOLS_NOTE = ("Note système : aucun outil n'est disponible dans cette session "
+                 "et aucune exécution d'outil ne se produira. Ne décris pas et ne "
+                 "planifie pas d'appels d'outils ; réponds directement en texte "
+                 "à la demande de l'utilisateur.")
+
+
+def apply_no_tools_note(req, tools_count):
+    if tools_count > 0:
+        return req
+    raw = req.get("input")
+    note_item = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": NO_TOOLS_NOTE}],
+    }
+    if isinstance(raw, list):
+        req["input"] = raw + [note_item]
+    elif isinstance(raw, str):
+        req["input"] = [{"type": "message", "role": "user", "content": raw}, note_item]
+    else:
+        req["input"] = [note_item]
+    return req
+
+
 def responses_to_anthropic(body):
     """Translate a Responses API request body to an Anthropic Messages body."""
     model = body.get("model") or MODELS[0]
@@ -443,6 +473,7 @@ class AnthropicStreamTranslator:
 def do_anthropic_request(body_bytes, headers, stream):
     """POST /v1/responses translated to the Anthropic-compatible /v1/messages."""
     req = json.loads(body_bytes.decode("utf-8"))
+    req = apply_no_tools_note(req, len(req.get("tools") or []))
     anth = responses_to_anthropic(req)
     if stream:
         anth["stream"] = True
@@ -498,6 +529,25 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         sys.stderr.write("[proxy %s] POST %s model=%s tools=%s stream=%s\n"
                          % (DISPLAY, self.path, model, tools, stream))
+        if data:
+            try:
+                req = json.loads(data)
+                inp = req.get("input")
+                if isinstance(inp, str):
+                    prompt = inp
+                elif isinstance(inp, list):
+                    prompt = " ".join(
+                        (p.get("content") or "") if isinstance(p, dict) else ""
+                        for p in inp
+                        if isinstance(p, dict) and p.get("type") == "message"
+                        and isinstance(p.get("content"), str))
+                else:
+                    prompt = ""
+                flag = "REMINDERS" if "system_reminder" in (inp and json.dumps(inp) or "") else "clean"
+                sys.stderr.write("[proxy %s] prompt: %s | %s\n"
+                                 % (DISPLAY, flag, prompt[:300].replace("\n", " ")))
+            except Exception:
+                pass
         if ADAPTER == "anthropic" and self.path.startswith("/v1/responses"):
             code, body, ctype = do_anthropic_request(data or b"{}", self.headers, stream)
             self.send_response(code)
@@ -525,8 +575,15 @@ class Handler(BaseHTTPRequestHandler):
         if body_bytes is None:
             length = int(self.headers.get("Content-Length") or 0)
             body_bytes = self.rfile.read(length) if length else None
+        if body_bytes and self.path.startswith("/v1/responses"):
+            try:
+                req = json.loads(body_bytes)
+                req = apply_no_tools_note(req, len(req.get("tools") or []))
+                body_bytes = json.dumps(req).encode()
+            except Exception:
+                pass
         headers = {k: v for k, v in self.headers.items()
-                   if k.lower() not in ("host", "accept-encoding")}
+                   if k.lower() not in ("host", "accept-encoding", "content-length", "transfer-encoding")}
         req = urllib.request.Request(url, data=body_bytes, headers=headers, method=self.command)
         try:
             with urllib.request.urlopen(req, context=ssl_context()) as resp:
