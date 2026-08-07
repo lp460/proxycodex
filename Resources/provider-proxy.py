@@ -331,7 +331,15 @@ class AnthropicStreamTranslator:
         self.sent_created = False
         self.current_tool = None
         self.text_item_id = None
-        self.parts = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def _usage(self):
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.input_tokens + self.output_tokens,
+        }
 
     def feed(self, line):
         if not line.startswith("data: "):
@@ -349,7 +357,10 @@ class AnthropicStreamTranslator:
             chunks.append(sse({"type": "response.created", "response": self.response}))
             chunks.append(sse({"type": "response.in_progress", "response": self.response}))
             self.sent_created = True
-        if etype == "content_block_start":
+        if etype == "message_start":
+            usage = (event.get("message") or {}).get("usage") or {}
+            self.input_tokens = usage.get("input_tokens", 0) or 0
+        elif etype == "content_block_start":
             block = event.get("content_block", {})
             if block.get("type") == "text":
                 self.text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -414,8 +425,12 @@ class AnthropicStreamTranslator:
                              "role": "assistant", "content": []},
                 }))
                 self.text_item_id = None
+        elif etype == "message_delta":
+            usage = event.get("usage") or {}
+            self.output_tokens = usage.get("output_tokens", self.output_tokens) or self.output_tokens
         elif etype == "message_stop":
             self.response["status"] = "completed"
+            self.response["usage"] = self._usage()
             chunks.append(sse({"type": "response.completed", "response": self.response}))
             chunks.append(sse({"type": "response.done", "response": self.response}))
         return b"".join(chunks)
