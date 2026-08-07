@@ -29,7 +29,12 @@ Les proxies sont démarrés automatiquement par l'app à son lancement (script c
 
 ## Claude Code
 
-Aucune clé API à saisir : l'adaptateur lit **l'environnement de Claude Code** (`~/.claude/settings.json`) — `ANTHROPIC_AUTH_TOKEN` (jeton OAuth) et `ANTHROPIC_BASE_URL` — et l'utilise pour authentifier les requêtes vers `/v1/messages`. Modèles disponibles : `claude-sonnet-4-6` (défaut), `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`.
+Aucune clé API à saisir : l'adaptateur utilise **l'environnement de Claude Code** dans cet ordre :
+1. **Trousseau macOS** (`Claude Code-credentials` → `claudeAiOauth.accessToken`, jeton OAuth Anthropic `sk-ant-oat01-…`) → `api.anthropic.com` avec l'en-tête `anthropic-beta: oauth-2025-04-20` (comme le fait le CLI), avec **refresh automatique** du jeton ;
+2. sinon `~/.claude/settings.json` (`ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`) ;
+3. sinon une clé API passée dans la requête.
+
+Modèles disponibles : `claude-sonnet-4-6` (défaut), `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5`.
 
 ## Clés API
 

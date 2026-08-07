@@ -14,6 +14,7 @@ Usage: provider-proxy.py <port> <upstream_base> <display_name> <model1,model2...
 """
 import json
 import os
+import subprocess
 import ssl
 import sys
 import time
@@ -105,7 +106,51 @@ def claude_settings_env():
         return {}
 
 
+def _keychain_oauth_blob():
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-w", "-s", "Claude Code-credentials"],
+            capture_output=True, text=True, timeout=10)
+        return json.loads((out.stdout or "").strip()).get("claudeAiOauth", {})
+    except Exception:
+        return {}
+
+
+def _try_refresh(oauth):
+    """Best-effort OAuth refresh (expired access token)."""
+    rt = (oauth.get("refreshToken") or "").strip()
+    if not rt:
+        return None
+    import urllib.parse
+    body = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": rt}).encode()
+    for url in ("https://api.anthropic.com/v1/oauth/token", "https://claude.ai/oauth/token"):
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+            resp = urllib.request.urlopen(req, context=ssl_context(), timeout=15)
+            token = json.loads(resp.read().decode("utf-8")).get("access_token", "")
+            if token:
+                return token
+        except Exception:
+            continue
+    return None
+
+
+def _anthropic_oauth_token():
+    """Claude Code's real Anthropic OAuth access token from the keychain."""
+    oauth = _keychain_oauth_blob()
+    token = (oauth.get("accessToken") or "").strip()
+    if not token:
+        return None
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at and expires_at < time.time() * 1000:
+        token = _try_refresh(oauth) or None
+    return token
+
+
 def anthropic_base_url():
+    if _anthropic_oauth_token():
+        return UPSTREAM  # real Anthropic (api.anthropic.com)
     env = claude_settings_env()
     base = (env.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
     if base:
@@ -121,6 +166,15 @@ def anthropic_messages_url():
 
 
 def anthropic_headers(request_authorization):
+    """Real Anthropic first (Claude Code's keychain OAuth), then Claude Code's
+    settings.json env, then a request-level API key."""
+    token = _anthropic_oauth_token()
+    if token:
+        return {
+            "Authorization": "Bearer " + token,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+        }
     env = claude_settings_env()
     token = (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
     if token:
@@ -150,6 +204,7 @@ def responses_to_anthropic(body):
     max_tokens = body.get("max_output_tokens") or 4096
     raw = body.get("input")
     messages = []
+    system_parts = []
     if isinstance(raw, str):
         messages.append({"role": "user", "content": raw})
     elif isinstance(raw, list):
@@ -158,6 +213,13 @@ def responses_to_anthropic(body):
             if t == "message":
                 role = item.get("role") or "user"
                 content = item.get("content")
+                if role in ("developer", "system"):
+                    # Anthropic has no developer role: fold into the system prompt.
+                    parts = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                    text = "".join(_input_to_text(p) for p in parts).strip()
+                    if text:
+                        system_parts.append(text)
+                    continue
                 blocks = []
                 if isinstance(content, str):
                     blocks.append({"type": "text", "text": content})
@@ -194,8 +256,11 @@ def responses_to_anthropic(body):
                     }],
                 })
     out = {"model": model, "max_tokens": max_tokens, "messages": messages}
-    if body.get("instructions"):
-        out["system"] = body["instructions"]
+    system = body.get("instructions")
+    if system_parts:
+        system = "\n\n".join([s for s in ([system] if system else []) + system_parts if s])
+    if system:
+        out["system"] = system
     tools = []
     for t in body.get("tools") or []:
         if t.get("type") == "function":
