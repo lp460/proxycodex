@@ -485,22 +485,20 @@ class Handler(BaseHTTPRequestHandler):
         self.relay()
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        data = self.rfile.read(length) if length else None
+        model, tools, stream = "?", 0, False
+        if data:
+            try:
+                req = json.loads(data)
+                model = req.get("model", "?")
+                tools = len(req.get("tools") or [])
+                stream = bool(req.get("stream"))
+            except Exception:
+                pass
+        sys.stderr.write("[proxy %s] POST %s model=%s tools=%s stream=%s\n"
+                         % (DISPLAY, self.path, model, tools, stream))
         if ADAPTER == "anthropic" and self.path.startswith("/v1/responses"):
-            length = int(self.headers.get("Content-Length") or 0)
-            data = self.rfile.read(length) if length else None
-            stream = False
-            model = "?"
-            tools = 0
-            if data:
-                try:
-                    req = json.loads(data)
-                    stream = bool(req.get("stream"))
-                    model = req.get("model", "?")
-                    tools = len(req.get("tools") or [])
-                except Exception:
-                    pass
-            sys.stderr.write("[proxy %s] POST %s model=%s tools=%s stream=%s\n"
-                             % (DISPLAY, self.path, model, tools, stream))
             code, body, ctype = do_anthropic_request(data or b"{}", self.headers, stream)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -517,40 +515,38 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         break
             return
-        if self.path.startswith("/v1/responses"):
-            length = int(self.headers.get("Content-Length") or 0)
-            data = self.rfile.read(length) if length else None
-            model, tools = "?", 0
-            if data:
-                try:
-                    req = json.loads(data)
-                    model = req.get("model", "?")
-                    tools = len(req.get("tools") or [])
-                except Exception:
-                    pass
-            sys.stderr.write("[proxy %s] POST %s model=%s tools=%s\n"
-                             % (DISPLAY, self.path, model, tools))
-        self.relay()
+        self.relay(body_bytes=data)
 
     def do_DELETE(self):
         self.relay()
 
-    def relay(self):
+    def relay(self, body_bytes=None):
         url = UPSTREAM + self.path
-        length = int(self.headers.get("Content-Length") or 0)
-        data = self.rfile.read(length) if length else None
+        if body_bytes is None:
+            length = int(self.headers.get("Content-Length") or 0)
+            body_bytes = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "accept-encoding")}
-        req = urllib.request.Request(url, data=data, headers=headers, method=self.command)
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=self.command)
         try:
             with urllib.request.urlopen(req, context=ssl_context()) as resp:
-                body = resp.read()
+                ctype = resp.headers.get("Content-Type", "")
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
                     if k.lower() in ("content-type", "content-length", "connection"):
                         self.send_header(k, v)
                 self.end_headers()
-                self.wfile.write(body)
+                if "event-stream" in ctype:
+                    # Stream SSE chunks as they arrive: the client must see
+                    # tokens incrementally, not wait for the full response.
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                else:
+                    self.wfile.write(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read()
             self.send_response(e.code)
