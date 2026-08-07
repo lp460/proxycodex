@@ -54,6 +54,21 @@ final class AppState: ObservableObject {
         // Build the router/detect native config as soon as the app launches, so the
         // menu actions (select, key, launch) are wired before the user clicks.
         Task { await self.bootstrap() }
+        // Debug: `--panel-screenshot` shows the real panel in a window so it can
+        // be captured for the README (no menu bar interaction required).
+        if CommandLine.arguments.contains("--panel-screenshot") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self else { return }
+                let host = NSHostingController(rootView: PanelView(state: self))
+                let win = NSWindow(contentViewController: host)
+                win.styleMask = [.titled, .closable]
+                win.titleVisibility = .hidden
+                win.setContentSize(NSSize(width: 372, height: 660))
+                win.center()
+                win.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
     }
 
     // MARK: Logging (kept in-memory; drives the status line + journal)
