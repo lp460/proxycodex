@@ -209,6 +209,10 @@ NO_TOOLS_NOTE = ("Note système : aucun outil n'est disponible dans cette sessio
                  "planifie pas d'appels d'outils ; réponds directement en texte "
                  "à la demande de l'utilisateur.")
 
+TOOL_UNAVAILABLE_OUTPUT = ("Outil non disponible dans cette session : aucune exécution "
+                           "d'outil n'est possible. Réponds directement à la demande "
+                           "de l'utilisateur, sans appeler d'outil.")
+
 
 def apply_no_tools_note(req, tools_count):
     if tools_count > 0:
@@ -226,6 +230,72 @@ def apply_no_tools_note(req, tools_count):
     else:
         req["input"] = [note_item]
     return req
+
+
+def has_function_calls(response):
+    return any(i.get("type") == "function_call" for i in (response or {}).get("output", []))
+
+
+def append_synthetic_tool_results(req, response):
+    """Answer every pending function_call with 'tool unavailable' so the model
+    can finish with a plain-text answer."""
+    history = req.get("input")
+    if not isinstance(history, list):
+        history = [{"type": "message", "role": "user", "content": history}]
+    new_input = history + (response.get("output") or [])
+    for item in (response.get("output") or []):
+        if item.get("type") == "function_call":
+            new_input.append({
+                "type": "function_call_output",
+                "call_id": item.get("call_id", ""),
+                "output": TOOL_UNAVAILABLE_OUTPUT,
+            })
+    req["input"] = new_input
+    req["stream"] = False
+    return req
+
+
+def emit_stream_from_response(resp):
+    """Emit a valid Responses-API SSE stream from a completed response object."""
+    events = [{"type": "response.created", "response": resp},
+              {"type": "response.in_progress", "response": resp}]
+    for idx, item in enumerate(resp.get("output", [])):
+        itype = item.get("type")
+        events.append({"type": "response.output_item.added", "output_index": idx, "item": item})
+        if itype in ("reasoning", "message"):
+            delta_key = "reasoning_text.delta" if itype == "reasoning" else "output_text.delta"
+            done_key = "reasoning_text.done" if itype == "reasoning" else "output_text.done"
+            for ci, part in enumerate(item.get("content") or []):
+                events.append({"type": "response.content_part.added", "item_id": item.get("id"),
+                               "output_index": idx, "content_index": ci, "part": part})
+                events.append({"type": "response." + delta_key, "item_id": item.get("id"),
+                               "output_index": idx, "content_index": ci, "delta": part.get("text", "")})
+                events.append({"type": "response." + done_key, "item_id": item.get("id"),
+                               "output_index": idx, "content_index": ci, "text": part.get("text", "")})
+                events.append({"type": "response.content_part.done", "item_id": item.get("id"),
+                               "output_index": idx, "content_index": ci, "part": part})
+        events.append({"type": "response.output_item.done", "output_index": idx, "item": item})
+    events.append({"type": "response.completed", "response": resp})
+    events.append({"type": "response.done", "response": resp})
+    return b"".join(sse(e) for e in events)
+
+
+def post_responses_json(url, req, headers, timeout=180):
+    """POST a Responses-API request, return the parsed JSON response."""
+    up = urllib.request.Request(url, data=json.dumps(req).encode(), headers=headers, method="POST")
+    with urllib.request.urlopen(up, context=ssl_context(), timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def complete_tool_calls_relay(upstream_url, req, headers, response, max_rounds=2):
+    """Loop until the model answers in text: each round answers pending
+    function_calls with 'tool unavailable' and re-asks the model."""
+    for _ in range(max_rounds):
+        if not has_function_calls(response):
+            return response
+        req = append_synthetic_tool_results(req, response)
+        response = post_responses_json(upstream_url + "/v1/responses", req, headers)
+    return response
 
 
 def responses_to_anthropic(body):
@@ -470,10 +540,27 @@ class AnthropicStreamTranslator:
 # HTTP handler
 # ---------------------------------------------------------------------------
 
+def complete_tool_calls_anthropic(req, hdrs, resp_object, max_rounds=2):
+    """Answer pending function_calls with 'tool unavailable' (Anthropic path)."""
+    for _ in range(max_rounds):
+        if not has_function_calls(resp_object):
+            return resp_object
+        req = append_synthetic_tool_results(req, resp_object)
+        anth = responses_to_anthropic(req)
+        anth["stream"] = False
+        up = urllib.request.Request(
+            anthropic_messages_url(), data=json.dumps(anth).encode(), headers=hdrs, method="POST")
+        with urllib.request.urlopen(up, context=ssl_context(), timeout=180) as r:
+            anth_resp = json.loads(r.read().decode("utf-8"))
+        resp_object = anthropic_to_responses(anth_resp, req.get("model"), resp_object.get("id"))
+    return resp_object
+
+
 def do_anthropic_request(body_bytes, headers, stream):
     """POST /v1/responses translated to the Anthropic-compatible /v1/messages."""
     req = json.loads(body_bytes.decode("utf-8"))
-    req = apply_no_tools_note(req, len(req.get("tools") or []))
+    tools_count = len(req.get("tools") or [])
+    req = apply_no_tools_note(req, tools_count)
     anth = responses_to_anthropic(req)
     if stream:
         anth["stream"] = True
@@ -482,13 +569,26 @@ def do_anthropic_request(body_bytes, headers, stream):
     hdrs["Content-Type"] = "application/json"
     up = urllib.request.Request(url, data=json.dumps(anth).encode(), headers=hdrs, method="POST")
     try:
-        resp = urllib.request.urlopen(up, context=ssl_context())
+        resp = urllib.request.urlopen(up, context=ssl_context(), timeout=180)
     except urllib.error.HTTPError as e:
         return e.code, e.read(), "application/json"
-    if stream:
+    if stream and tools_count > 0:
         return 200, _stream(resp, req.get("model")), "text/event-stream"
+    if stream:
+        translator = AnthropicStreamTranslator(req.get("model"))
+        for raw in resp:
+            for line in raw.decode("utf-8", "replace").split("\n"):
+                translator.feed(line)
+        final = translator.response
+        if req and has_function_calls(final):
+            final = complete_tool_calls_anthropic(req, hdrs, final)
+        final["id"] = final.get("id") or f"resp_{uuid.uuid4().hex[:24]}"
+        final["status"] = "completed"
+        return 200, emit_stream_from_response(final), "text/event-stream"
     body = json.loads(resp.read().decode("utf-8"))
     out = anthropic_to_responses(body, req.get("model"))
+    if req and has_function_calls(out):
+        out = complete_tool_calls_anthropic(req, hdrs, out)
     return 200, json.dumps(out).encode(), "application/json"
 
 
@@ -575,35 +675,65 @@ class Handler(BaseHTTPRequestHandler):
         if body_bytes is None:
             length = int(self.headers.get("Content-Length") or 0)
             body_bytes = self.rfile.read(length) if length else None
+        tools_count = 0
+        req = None
         if body_bytes and self.path.startswith("/v1/responses"):
             try:
                 req = json.loads(body_bytes)
-                req = apply_no_tools_note(req, len(req.get("tools") or []))
+                tools_count = len(req.get("tools") or [])
+                req = apply_no_tools_note(req, tools_count)
                 body_bytes = json.dumps(req).encode()
             except Exception:
-                pass
+                req = None
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "accept-encoding", "content-length", "transfer-encoding")}
-        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=self.command)
         try:
-            with urllib.request.urlopen(req, context=ssl_context()) as resp:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, data=body_bytes, headers=headers, method=self.command),
+                    context=ssl_context(), timeout=180) as resp:
                 ctype = resp.headers.get("Content-Type", "")
-                self.send_response(resp.status)
-                for k, v in resp.headers.items():
-                    if k.lower() in ("content-type", "content-length", "connection"):
-                        self.send_header(k, v)
-                self.end_headers()
-                if "event-stream" in ctype:
-                    # Stream SSE chunks as they arrive: the client must see
-                    # tokens incrementally, not wait for the full response.
+                if "event-stream" in ctype and tools_count > 0:
+                    # CLI sessions: live streaming, untouched.
+                    self.send_response(resp.status)
+                    for k, v in resp.headers.items():
+                        if k.lower() in ("content-type", "content-length", "connection"):
+                            self.send_header(k, v)
+                    self.end_headers()
                     while True:
                         chunk = resp.read(4096)
                         if not chunk:
                             break
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                    return
+                body = resp.read()
+                if "event-stream" in ctype:
+                    # Desktop (tools=0): buffer the stream, extract the final
+                    # response object, complete pending tool calls, re-emit.
+                    completed = None
+                    for line in body.decode("utf-8", "replace").split("\n"):
+                        if line.startswith("data: "):
+                            try:
+                                event = json.loads(line[6:])
+                            except Exception:
+                                continue
+                            if event.get("type") == "response.completed":
+                                completed = event.get("response")
+                    final = completed or {}
                 else:
-                    self.wfile.write(resp.read())
+                    final = json.loads(body.decode("utf-8"))
+                if req and has_function_calls(final):
+                    final = complete_tool_calls_relay(url, req, headers, final)
+                    final["id"] = final.get("id") or f"resp_{uuid.uuid4().hex[:24]}"
+                    final["object"] = "response"
+                    final["status"] = "completed"
+                payload = (emit_stream_from_response(final)
+                           if "event-stream" in ctype else json.dumps(final).encode())
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
         except urllib.error.HTTPError as e:
             body = e.read()
             self.send_response(e.code)
