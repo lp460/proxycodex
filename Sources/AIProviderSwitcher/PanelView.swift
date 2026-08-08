@@ -23,6 +23,9 @@ struct PanelView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     providerSection
+                    if state.catalogConflict {
+                        catalogConflictNotice
+                    }
                     keySection
                     relaunchSection
                 }
@@ -54,7 +57,7 @@ struct PanelView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("AI Provider Switcher")
                     .font(.headline)
-                Text("Codex natif par défaut · \(state.keyStore.providerIDs.count) clé(s) injectée(s)")
+                Text("Codex natif par défaut · \(state.keyCount) clé(s) injectée(s)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -67,12 +70,16 @@ struct PanelView: View {
     private var statusBadge: some View {
         HStack(spacing: 5) {
             Circle().fill(statusColor).frame(width: 8, height: 8)
+                .accessibilityHidden(true)
             Text(statusLabel)
                 .font(.caption.weight(.medium))
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 4)
         .background(Capsule().fill(statusColor.opacity(0.14)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("État de la configuration")
+        .accessibilityValue(statusLabel)
     }
 
     private var statusColor: Color {
@@ -102,15 +109,17 @@ struct PanelView: View {
                         provider: provider,
                         isActive: provider.id == state.snapshot.activeProviderID,
                         status: state.snapshot.compatibility(for: provider.id),
-                        hasKey: provider.isKeyless || state.keyStore.hasKey(provider.id)
-                    ) {
-                        Task { await state.select(providerID: provider.id) }
-                    } keyTap: {
-                        draftKey = ""
-                        state.editingKey = true
-                        Task { await state.select(providerID: provider.id) }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { keyFieldFocused = true }
-                    }
+                        hasKey: provider.isKeyless || state.hasKey(for: provider.id),
+                        tap: {
+                            Task { await state.select(providerID: provider.id) }
+                        },
+                        keyTap: {
+                            draftKey = ""
+                            state.presentKeySheet(for: provider.id)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { keyFieldFocused = true }
+                        },
+                        isInteractionDisabled: state.isScreenshotMode
+                    )
                 }
             }
             modelPicker
@@ -135,34 +144,50 @@ struct PanelView: View {
             }
             .pickerStyle(.menu)
             .labelsHidden()
+            .disabled(state.isScreenshotMode)
         }
+    }
+
+    private var catalogConflictNotice: some View {
+        Label("Catalogue Codex personnalisé détecté : la liste générée n’est pas active.", systemImage: "exclamationmark.triangle.fill")
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .accessibilityLabel("Avertissement : catalogue Codex personnalisé détecté")
+
     }
 
     // MARK: Keys
 
     private var keySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            panelTitle("Clés API")
-            if state.editingKey {
+            panelTitle(state.editingKey ? "Clé API · \(state.keyEditingProvider?.displayName ?? "Provider")" : "Clés API")
+            if state.editingKey && !state.isScreenshotMode {
                 keyEditor
             } else {
                 HStack(spacing: 8) {
-                    Image(systemName: state.hasKeyForActive ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(state.hasKeyForActive ? .green : .orange)
-                    Text(state.hasKeyForActive
-                         ? "Clé enregistrée pour \(state.activeProvider?.displayName ?? "ce provider")"
-                         : (state.activeProvider?.isKeyless == true || state.isActiveNative
-                            ? "Aucune clé requise"
+                    Image(systemName: state.activeProvider?.isKeyless == true || state.isActiveNative
+                          ? "checkmark.seal.fill"
+                          : (state.hasKeyForActive ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"))
+                        .foregroundStyle(state.activeProvider?.isKeyless == true || state.isActiveNative || state.hasKeyForActive ? .green : .orange)
+                    Text(state.activeProvider?.isKeyless == true || state.isActiveNative
+                         ? "Aucune clé requise"
+                         : (state.hasKeyForActive
+                            ? "Clé enregistrée pour \(state.activeProvider?.displayName ?? "ce provider")"
                             : "Aucune clé pour \(state.activeProvider?.displayName ?? "ce provider")"))
                         .font(.callout)
                     Spacer()
                     Button("Saisir une clé…") {
                         draftKey = ""
-                        state.presentKeySheet()
+                        state.presentKeySheet(for: state.snapshot.activeProviderID)
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { keyFieldFocused = true }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(state.isScreenshotMode)
                 }
             }
         }
@@ -175,7 +200,7 @@ struct PanelView: View {
             HStack(spacing: 8) {
                 Image(systemName: "lock.fill")
                     .foregroundStyle(.secondary)
-                TextField(state.hasKeyForActive ? "Clé existante — tapez pour remplacer" : "sk-…", text: $draftKey)
+                TextField(state.keyEditingProvider.map { state.hasKey(for: $0.id) ? "Clé existante — tapez pour remplacer" : "sk-…" } ?? "sk-…", text: $draftKey)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                     .textContentType(.none)
@@ -185,7 +210,7 @@ struct PanelView: View {
             HStack(spacing: 8) {
                 Button("Coller") { pasteKey() }
                     .controlSize(.small)
-                if state.hasKeyForActive {
+                if let provider = state.keyEditingProvider, state.hasKey(for: provider.id) {
                     Button("Voir la clé") { showExistingKey() }
                         .controlSize(.small)
                 }
@@ -195,7 +220,7 @@ struct PanelView: View {
                     .disabled(trimmedKey.isEmpty)
                 Button("Annuler") {
                     draftKey = ""
-                    state.editingKey = false
+                    state.dismissKeyEditor()
                 }
                 .controlSize(.small)
             }
@@ -215,6 +240,7 @@ struct PanelView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .help("Lance Codex dans Terminal avec le provider actif et sa clé (chemin fiable pour DeepSeek/GLM/OpenRouter)")
+                .disabled(state.isScreenshotMode)
 
                 Button {
                     Task { await state.relaunchChatGPT() }
@@ -224,13 +250,22 @@ struct PanelView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .help("Redémarre l'app ChatGPT pour appliquer les clés injectées au sélecteur de modèles")
+                .disabled(state.isScreenshotMode)
             }
 
             HStack(spacing: 8) {
-                Button("Tester tous") { Task { await state.runAllTests() } }
+                Button {
+                    Task { await state.runAllTests() }
+                } label: {
+                    if state.testing {
+                        Label("Test en cours…", systemImage: "hourglass")
+                    } else {
+                        Label("Tester tous", systemImage: "checkmark.shield")
+                    }
+                }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .disabled(state.testing)
+                    .disabled(state.testing || state.isScreenshotMode)
                 Text(state.testing ? "Test en cours…"
                      : "Les modèles DeepSeek/GLM/OpenRouter s'exécutent via Codex CLI. L'app ChatGPT les affiche mais ne les exécute pas avec un compte ChatGPT (restriction OpenAI).")
                     .font(.caption2)
@@ -244,11 +279,20 @@ struct PanelView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let message = state.statusMessage {
-                Text(message)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                Label {
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(Color.accentColor.opacity(0.85))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             HStack {
                 Toggle("Clé locale (0600)", isOn: Binding(
@@ -257,6 +301,7 @@ struct PanelView: View {
                 ))
                 .font(.caption)
                 .toggleStyle(.checkbox)
+                .disabled(state.isScreenshotMode)
                 Spacer()
                 Button("Quitter") { NSApplication.shared.terminate(nil) }
                     .keyboardShortcut("q")
@@ -279,15 +324,16 @@ struct PanelView: View {
     }
 
     private func showExistingKey() {
-        guard let provider = state.activeProvider else { return }
+        guard let provider = state.keyEditingProvider else { return }
         draftKey = state.keyStore.secret(for: provider.id)?.asString() ?? ""
     }
 
     private func injectKey() {
         guard !trimmedKey.isEmpty else { return }
-        Task { await state.setSessionKey(trimmedKey) }
+        let providerID = state.keyEditingProvider?.id
+        Task { await state.setSessionKey(trimmedKey, for: providerID) }
         draftKey = ""
-        state.editingKey = false
+        state.dismissKeyEditor()
     }
 
     private func panelTitle(_ s: String) -> some View {
@@ -306,27 +352,39 @@ struct ProviderCard: View {
     let hasKey: Bool
     let tap: () -> Void
     let keyTap: () -> Void
+    let isInteractionDisabled: Bool
+    @State private var isHovered = false
 
     var body: some View {
         HStack(spacing: 6) {
             Button(action: tap) { cardBody }
                 .buttonStyle(.plain)
+                .accessibilityAddTraits(.isButton)
+                .help(isActive ? "Provider actif : \(provider.displayName)" : "Activer \(provider.displayName)")
+                .disabled(isInteractionDisabled)
 
             if provider.requiresKey {
                 Button(action: keyTap) { keyIcon }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(hasKey ? "Modifier la clé" : "Saisir la clé")
                     .help(hasKey ? "Modifier la clé \(provider.displayName)" : "Saisir la clé \(provider.displayName)")
+                    .disabled(isInteractionDisabled)
             }
         }
         .padding(8)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isActive ? provider.brandColor.opacity(0.10) : Color(nsColor: .windowBackgroundColor))
+                .fill(isActive
+                      ? provider.brandColor.opacity(isHovered ? 0.16 : 0.10)
+                      : Color(nsColor: .windowBackgroundColor).opacity(isHovered ? 0.72 : 1))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(isActive ? provider.brandColor.opacity(0.6) : Color.clear, lineWidth: 1)
+                        .strokeBorder(isActive ? provider.brandColor.opacity(0.6) : Color.secondary.opacity(isHovered ? 0.28 : 0), lineWidth: 1)
                 )
         )
+        .onHover { isHovered = $0 }
+        .animation(.easeOut(duration: 0.16), value: isHovered)
+        .accessibilityElement(children: .contain)
     }
 
     private var cardBody: some View {

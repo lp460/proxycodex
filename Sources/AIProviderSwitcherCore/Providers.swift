@@ -26,6 +26,10 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
     public let wireAPI: WireAPI
     public let authScheme: AuthScheme
     public let supportsResponses: Bool     // claimed; verified at runtime by CompatibilityChecker
+    public let supportsTools: Bool         // function tools can be forwarded by the adapter
+    public let supportsImages: Bool        // provider/model accepts image input
+    public let supportsWebSearch: Bool     // provider/model declares web-search capability
+    public let supportsParallelToolCalls: Bool
     public let requiresKey: Bool
     public let configProviderIDDirect: String // model_provider id used in direct (no-proxy) config
 
@@ -39,6 +43,10 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
         wireAPI: WireAPI = .responses,
         authScheme: AuthScheme = .bearer,
         supportsResponses: Bool = true,
+        supportsTools: Bool = false,
+        supportsImages: Bool = false,
+        supportsWebSearch: Bool = false,
+        supportsParallelToolCalls: Bool = false,
         requiresKey: Bool = true,
         configProviderIDDirect: String
     ) {
@@ -52,6 +60,10 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
         self.wireAPI = wireAPI
         self.authScheme = authScheme
         self.supportsResponses = supportsResponses
+        self.supportsTools = supportsTools
+        self.supportsImages = supportsImages
+        self.supportsWebSearch = supportsWebSearch
+        self.supportsParallelToolCalls = supportsParallelToolCalls
         self.requiresKey = requiresKey
         self.configProviderIDDirect = configProviderIDDirect
     }
@@ -77,6 +89,10 @@ public struct ProviderCatalog: Sendable, Equatable {
             models: ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
                      "gpt-5.3-codex-spark", "gpt-5.5"],
             defaultModel: "gpt-5.6",
+            supportsTools: true,
+            supportsImages: true,
+            supportsWebSearch: true,
+            supportsParallelToolCalls: true,
             requiresKey: false,
             configProviderIDDirect: "openai"
         ),
@@ -88,6 +104,7 @@ public struct ProviderCatalog: Sendable, Equatable {
             environmentVariable: "DEEPSEEK_API_KEY",
             models: ["deepseek-v4-flash", "deepseek-v4-pro"],
             defaultModel: "deepseek-v4-flash",
+            supportsTools: true,
             configProviderIDDirect: "deepseek"
         ),
         Provider(
@@ -98,6 +115,7 @@ public struct ProviderCatalog: Sendable, Equatable {
             environmentVariable: "ZAI_API_KEY",
             models: ["glm-5.2", "glm-4.6", "glm-4.5"],
             defaultModel: "glm-5.2",
+            supportsTools: true,
             configProviderIDDirect: "glm"
         ),
         Provider(
@@ -109,6 +127,9 @@ public struct ProviderCatalog: Sendable, Equatable {
             models: ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol", "openai/gpt-5.6-terra",
                      "deepseek/deepseek-v4-flash", "z-ai/glm-5.2"],
             defaultModel: "openai/gpt-5.6-luna",
+            supportsTools: true,
+            supportsImages: true,
+            supportsParallelToolCalls: true,
             configProviderIDDirect: "openrouter"
         ),
         Provider(
@@ -120,6 +141,7 @@ public struct ProviderCatalog: Sendable, Equatable {
             models: ["gpt-oss:120b", "gpt-oss:20b", "qwen3-coder", "llama3.3"],
             defaultModel: "gpt-oss:120b",
             authScheme: .none,
+            supportsTools: true,
             requiresKey: false,
             configProviderIDDirect: "ollama"
         ),
@@ -137,6 +159,8 @@ public struct ProviderCatalog: Sendable, Equatable {
                      "claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"],
             // haiku-4-5: seul modèle non rate-limité sur le compte actuel.
             defaultModel: "claude-haiku-4-5",
+            supportsTools: true,
+            supportsImages: true,
             requiresKey: false,
             configProviderIDDirect: "claude"
         )

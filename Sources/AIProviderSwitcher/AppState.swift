@@ -27,6 +27,8 @@ final class AppState: ObservableObject {
     let configStore = CodexConfigStore()
 
     private(set) var router: ProviderRouter?
+    private let screenshotMode: Bool
+    private let screenshotKeyIDs: Set<String> = ["deepseek", "glm", "openrouter"]
 
     @Published var snapshot = RouterSnapshot(activeProviderID: "openai", activeModel: "gpt-5.6")
     @Published var statusMessage: String?
@@ -35,7 +37,9 @@ final class AppState: ObservableObject {
     @Published var persistenceEnabled = false
     @Published var nativeConfigDetected = false
     @Published var providersInstalled = false
+    @Published var catalogConflict = false
     @Published var editingKey = false
+    @Published var editingProviderID: String?
     @Published private(set) var logs: [LogEntry] = []
 
     private var observationTask: Task<Void, Never>?
@@ -45,25 +49,54 @@ final class AppState: ObservableObject {
     private var configFixTask: Task<Void, Never>?
 
     init() {
-        // Keep keys across restarts: persistence is ON by default (0600 file,
-        // excluded from iCloud). Keys are loaded back into memory at launch so
-        // they never have to be re-entered; the footer toggle can disable it.
-        _ = try? keyStore.enablePersistence(at: KeyStore.defaultPersistentURL())
-        persistenceEnabled = keyStore.persistenceEnabled
-        _ = try? keyStore.loadFromDisk()
-        // Build the router/detect native config as soon as the app launches, so the
-        // menu actions (select, key, launch) are wired before the user clicks.
-        Task { await self.bootstrap() }
-        // Debug: `--panel-screenshot` shows the real panel in a window so it can
-        // be captured for the README (no menu bar interaction required).
-        if CommandLine.arguments.contains("--panel-screenshot") {
+        screenshotMode = CommandLine.arguments.contains("--panel-screenshot")
+
+        if screenshotMode {
+            // Deterministic, secret-free demo state used only to refresh the
+            // README screenshots. It never touches ~/.codex or the key file.
+            snapshot = RouterSnapshot(
+                activeProviderID: "deepseek",
+                activeModel: "deepseek-v4-flash",
+                compatibilities: [
+                    "openai": .compatible,
+                    "deepseek": .compatible,
+                    "glm": .compatible,
+                    "openrouter": .untested,
+                    "ollama": .compatible,
+                    "claude": .compatible
+                ]
+            )
+            router = try? ProviderRouter(
+                catalog: catalog,
+                keyResolver: keyStore,
+                initialProviderID: "deepseek"
+            )
+            nativeConfigDetected = true
+            providersInstalled = true
+            statusMessage = "Démonstration prête · aucun secret réel utilisé."
+        } else {
+            // Keep keys across restarts: persistence is ON by default (0600 file,
+            // excluded from iCloud). Keys are loaded back into memory at launch so
+            // they never have to be re-entered; the footer toggle can disable it.
+            _ = try? keyStore.enablePersistence(at: KeyStore.defaultPersistentURL())
+            persistenceEnabled = keyStore.persistenceEnabled
+            _ = try? keyStore.loadFromDisk()
+            // Build the router/detect native config as soon as the app launches, so the
+            // menu actions (select, key, launch) are wired before the user clicks.
+            Task { await self.bootstrap() }
+        }
+
+        // `--panel-screenshot` shows the real panel in a window so it can be
+        // captured for the README (no menu bar interaction required).
+        if screenshotMode {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 guard let self else { return }
                 let host = NSHostingController(rootView: PanelView(state: self))
                 let win = NSWindow(contentViewController: host)
                 win.styleMask = [.titled, .closable]
-                win.titleVisibility = .hidden
-                win.setContentSize(NSSize(width: 372, height: 660))
+                win.appearance = NSAppearance(named: .darkAqua)
+                win.title = "AI Provider Switcher"
+                win.setContentSize(NSSize(width: 388, height: 680))
                 win.center()
                 win.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
@@ -139,27 +172,43 @@ final class AppState: ObservableObject {
     var activeProvider: Provider? { catalog[id: snapshot.activeProviderID] }
     var activeModel: String { snapshot.activeModel }
     var isActiveNative: Bool { snapshot.activeProviderID == "openai" }
+    var keyEditingProvider: Provider? {
+        catalog[id: editingProviderID ?? snapshot.activeProviderID]
+    }
+    var isScreenshotMode: Bool { screenshotMode }
+    var keyCount: Int {
+        screenshotMode ? screenshotKeyIDs.count : keyStore.providerIDs.count
+    }
+    func hasKey(for providerID: String) -> Bool {
+        screenshotMode ? screenshotKeyIDs.contains(providerID) : keyStore.hasKey(providerID)
+    }
     var hasKeyForActive: Bool {
         guard let p = activeProvider else { return false }
-        return p.isKeyless || p.id == "openai" || keyStore.hasKey(p.id)
+        return p.isKeyless || p.id == "openai" || hasKey(for: p.id)
     }
 
     // MARK: Install (once, additive)
 
     func installProviders(activeProviderID: String? = nil) {
+        guard !screenshotMode else { return }
         do {
+            let selectedProviderID = activeProviderID ?? snapshot.activeProviderID
             let report = try configStore.install(
                 providers: catalog.providers,
-                activeProviderID: activeProviderID ?? snapshot.activeProviderID
+                activeProviderID: selectedProviderID
             )
             providersInstalled = true
-            log("Providers ajoutés (additif): \(report.providersAdded.joined(separator: ", ")). OpenAI inchangé.")
+            catalogConflict = !report.catalogInstalled && selectedProviderID != "openai"
+            log(catalogConflict
+                ? "Providers installés, mais le catalogue Codex existant est conservé : vérifiez model_catalog_json."
+                : "Providers ajoutés (additif): \(report.providersAdded.joined(separator: ", ")). OpenAI inchangé.")
         } catch {
             log("Install échouée: \(error.localizedDescription)")
         }
     }
 
     func uninstall() {
+        guard !screenshotMode else { return }
         do {
             _ = try configStore.uninstall()
             providersInstalled = computeInstalled()
@@ -175,7 +224,8 @@ final class AppState: ObservableObject {
     /// ChatGPT/Codex so the new provider + injected keys apply immediately.
     /// OpenAI = revert override (native ChatGPT).
     func select(providerID: String) async {
-        guard let router else { return }
+        guard !screenshotMode, let router else { return }
+        dismissKeyEditor()
         let provider = catalog[id: providerID]
         let model = provider?.defaultModel ?? snapshot.activeModel
         do {
@@ -186,9 +236,9 @@ final class AppState: ObservableObject {
                 log("OpenAI natif : override supprimé, relance de ChatGPT/Codex…")
             } else {
                 guard let provider else { return }
-                if provider.requiresKey && keyStore.secret(for: provider.id) == nil {
+                if provider.requiresKey && !hasKey(for: provider.id) {
                     log("Saisissez d'abord la clé pour \(provider.displayName), puis cliquez sa carte à nouveau.")
-                    presentKeySheet()
+                    presentKeySheet(for: provider.id)
                     return
                 }
                 installProviders(activeProviderID: providerID)
@@ -209,7 +259,7 @@ final class AppState: ObservableObject {
     /// Switches the active model: writes the config override and relaunches
     /// ChatGPT/Codex so the new model applies in the Desktop.
     func setModel(_ model: String) async {
-        guard let router, let provider = activeProvider else { return }
+        guard !screenshotMode, let router, let provider = activeProvider else { return }
         do {
             _ = try await router.setActive(providerID: provider.id, model: model)
             if provider.id != "openai" {
@@ -225,42 +275,52 @@ final class AppState: ObservableObject {
         }
     }
 
-    func setSessionKey(_ value: String) async {
-        guard let provider = activeProvider else { return }
+    func setSessionKey(_ value: String, for providerID: String? = nil) async {
+        guard !screenshotMode else { return }
+        let targetID = providerID ?? editingProviderID ?? snapshot.activeProviderID
+        guard let provider = catalog[id: targetID] else { return }
         keyStore.setKey(value, for: provider.id)
         log("Clé injectée en mémoire pour \(provider.displayName).")
-        await runTest()
+        await runTest(providerID: provider.id)
     }
 
-    func clearKey() {
-        guard let provider = activeProvider else { return }
+    func clearKey(for providerID: String? = nil) {
+        guard !screenshotMode else { return }
+        let targetID = providerID ?? editingProviderID ?? snapshot.activeProviderID
+        guard let provider = catalog[id: targetID] else { return }
         keyStore.clear(providerID: provider.id)
         log("Clé effacée pour \(provider.displayName).")
     }
 
-    /// Shows the key editor. Presented inline in the panel (a `.sheet` from a
-    /// MenuBarExtra window closes the window on macOS 26, so no sheet is used).
-    func presentKeySheet() {
+    /// Shows the key editor for a specific provider. Presented inline in the
+    /// panel (a `.sheet` from a MenuBarExtra window closes the window on macOS 26).
+    func presentKeySheet(for providerID: String? = nil) {
+        editingProviderID = providerID ?? snapshot.activeProviderID
         editingKey = true
+    }
+
+    func dismissKeyEditor() {
+        editingKey = false
+        editingProviderID = nil
     }
 
     // MARK: Compatibility test
 
-    func runTest() async {
-        guard let router, let provider = activeProvider else { return }
+    func runTest(providerID: String? = nil) async {
+        guard !screenshotMode, let router, let provider = catalog[id: providerID ?? snapshot.activeProviderID] else { return }
         if provider.id == "openai" {
             // OpenAI auth is handled by Codex natively; nothing to test from here.
-            await router.setCompatibility(.compatible, error: nil)
+            await router.setCompatibility(for: provider.id, state: .compatible, error: nil)
             return
         }
         testing = true
         defer { testing = false }
         do {
             let result = try await checker.check(provider: provider, secret: keyStore.secret(for: provider.id))
-            await router.setCompatibility(result.state, error: result.errorDescription)
+            await router.setCompatibility(for: provider.id, state: result.state, error: result.errorDescription)
             log(result.errorDescription ?? "\(provider.displayName) /v1/responses OK.")
         } catch {
-            await router.setCompatibility(.incompatible(reason: error.localizedDescription), error: error.localizedDescription)
+            await router.setCompatibility(for: provider.id, state: .incompatible(reason: error.localizedDescription), error: error.localizedDescription)
             log(error.localizedDescription)
         }
     }
@@ -268,7 +328,7 @@ final class AppState: ObservableObject {
     /// Tests every non-native provider and records its own status, so the panel
     /// shows a per-provider health overview (not just the active one's).
     func runAllTests() async {
-        guard let router else { return }
+        guard !screenshotMode, let router else { return }
         testing = true
         defer { testing = false }
         let testable = catalog.providers.filter { $0.id != "openai" }
@@ -304,7 +364,7 @@ final class AppState: ObservableObject {
     /// staged in a 0600 temp env file sourced then immediately deleted — it
     /// never appears in the process arguments or ps output. OpenAI = bare codex.
     func launchCodexCLI() {
-        guard let provider = activeProvider else { return }
+        guard !screenshotMode, let provider = activeProvider else { return }
         let key = keyStore.secret(for: provider.id)
         if provider.requiresKey && provider.id != "openai" && key == nil {
             log("Saisir d'abord la clé pour \(provider.displayName).")
@@ -351,6 +411,7 @@ final class AppState: ObservableObject {
     // MARK: Persistence (optional local key file)
 
     func enablePersistence() {
+        guard !screenshotMode else { return }
         do {
             _ = try keyStore.enablePersistence(at: KeyStore.defaultPersistentURL())
             persistenceEnabled = true
@@ -361,6 +422,7 @@ final class AppState: ObservableObject {
     }
 
     func disablePersistence() {
+        guard !screenshotMode else { return }
         keyStore.disablePersistence()
         persistenceEnabled = false
     }
@@ -393,6 +455,7 @@ final class AppState: ObservableObject {
     /// memory is injected into the relaunched process' environment — without
     /// them the desktop model picker can only offer ChatGPT/OpenAI.
     func relaunchChatGPT() async {
+        guard !screenshotMode else { return }
         let bundleID = "com.openai.codex"
         let env = keyEnv
         let ws = NSWorkspace.shared
@@ -429,12 +492,27 @@ final class AppState: ObservableObject {
     /// third-party provider is routed through a tiny local proxy that translates
     /// `/v1/models` and relays everything else (see Resources/provider-proxy.py).
     private var proxyProcesses: [Int32] = []
+    private let proxyVersion = "2026-08-08-tools-v2"
 
     func ensureProxiesRunning() {
         for provider in catalog.providers {
             guard let port = CodexConfigGenerator.proxyPort(for: provider.id) else { continue }
-            if isPortOpen(port) { continue }
             let script = proxyScriptURL()
+            if isPortOpen(port) {
+                if restartStaleManagedProxyIfNeeded(
+                    port: port,
+                    provider: provider,
+                    script: script
+                ) {
+                    usleep(150_000)
+                } else {
+                    let metadataURL = proxyMetadataURL(for: port)
+                    if !FileManager.default.fileExists(atPath: metadataURL.path) {
+                        log("Port proxy \(port) déjà occupé pour \(provider.displayName) : processus externe conservé, redémarrage manuel nécessaire.")
+                    }
+                    continue
+                }
+            }
             guard FileManager.default.fileExists(atPath: script.path) else {
                 log("Proxy manquant pour \(provider.displayName): \(script.path)")
                 continue
@@ -447,11 +525,24 @@ final class AppState: ObservableObject {
                 provider.baseURL.absoluteString,
                 provider.displayName,
                 provider.models.joined(separator: ","),
-                provider.id == "claude" ? "anthropic" : "relay"
+                provider.id == "claude" ? "anthropic" : "relay",
+                provider.supportsTools ? "1" : "0",
+                provider.supportsImages ? "1" : "0",
+                provider.supportsWebSearch ? "1" : "0",
+                provider.supportsParallelToolCalls ? "1" : "0"
             ]
+            var environment = ProcessInfo.processInfo.environment
+            environment["AI_PROVIDER_SWITCHER_PROXY_VERSION"] = proxyVersion
+            environment["AI_PROVIDER_SWITCHER_PROXY_STATE"] = proxyMetadataURL(for: port).path
+            proc.environment = environment
             do {
                 try proc.run()
                 proxyProcesses.append(proc.processIdentifier)
+                writeProxyMetadata(
+                    port: port,
+                    provider: provider,
+                    pid: proc.processIdentifier
+                )
                 log("Proxy local \(provider.displayName) démarré (port \(port)).")
             } catch {
                 log("Proxy \(provider.displayName) échoué: \(error.localizedDescription)")
@@ -477,6 +568,74 @@ final class AppState: ObservableObject {
         return dst
     }
 
+    private func proxyMetadataURL(for port: Int) -> URL {
+        KeyStore.defaultPersistentURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("proxy-\(port).json")
+    }
+
+    private func writeProxyMetadata(port: Int, provider: Provider, pid: Int32) {
+        let values: [String: Any] = [
+            "version": proxyVersion,
+            "port": port,
+            "provider": provider.id,
+            "pid": pid,
+            "supports_tools": provider.supportsTools,
+            "supports_images": provider.supportsImages,
+            "supports_web_search": provider.supportsWebSearch,
+            "supports_parallel_tools": provider.supportsParallelToolCalls
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted]) else { return }
+        let url = proxyMetadataURL(for: port)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: [.atomic])
+    }
+
+    private func restartStaleManagedProxyIfNeeded(port: Int, provider: Provider, script: URL) -> Bool {
+        let url = proxyMetadataURL(for: port)
+        guard let data = try? Data(contentsOf: url),
+              let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pidNumber = metadata["pid"] as? NSNumber,
+              let version = metadata["version"] as? String else {
+            return false
+        }
+        let expected: [String: Any] = [
+            "version": proxyVersion,
+            "provider": provider.id,
+            "supports_tools": provider.supportsTools,
+            "supports_images": provider.supportsImages,
+            "supports_web_search": provider.supportsWebSearch,
+            "supports_parallel_tools": provider.supportsParallelToolCalls
+        ]
+        let stale = version != expected["version"] as? String
+            || (metadata["provider"] as? String) != expected["provider"] as? String
+            || (metadata["supports_tools"] as? Bool) != expected["supports_tools"] as? Bool
+            || (metadata["supports_images"] as? Bool) != expected["supports_images"] as? Bool
+            || (metadata["supports_web_search"] as? Bool) != expected["supports_web_search"] as? Bool
+            || (metadata["supports_parallel_tools"] as? Bool) != expected["supports_parallel_tools"] as? Bool
+        guard stale else { return false }
+
+        let pid = pidNumber.int32Value
+        let command = Process()
+        let output = Pipe()
+        command.executableURL = URL(fileURLWithPath: "/bin/ps")
+        command.arguments = ["-p", String(pid), "-o", "command="]
+        command.standardOutput = output
+        do {
+            try command.run()
+            command.waitUntilExit()
+            let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            guard command.terminationStatus == 0,
+                  text.contains(script.path),
+                  text.contains(" \(port) ") else { return false }
+            kill(pid, SIGTERM)
+            try? FileManager.default.removeItem(at: url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func isPortOpen(_ port: Int) -> Bool {
         let s = socket(AF_INET, SOCK_STREAM, 0)
         guard s >= 0 else { return false }
@@ -498,7 +657,7 @@ final class AppState: ObservableObject {
     /// models would fall back to the ChatGPT backend (400 "not supported").
     /// Watch config.toml and repair `model_provider` when needed.
     private func startConfigWatcher() {
-        guard configWatcher == nil else { return }
+        guard !screenshotMode, configWatcher == nil else { return }
         let fd = open(configStore.paths.configToml.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
@@ -532,7 +691,9 @@ final class AppState: ObservableObject {
     }
 
     func fixModelProviderFromConfig() async {
-        guard let model = configStore.topLevelValue(of: "model"), !model.isEmpty else { return }
+        guard !screenshotMode,
+              let model = configStore.topLevelValue(of: "model"),
+              !model.isEmpty else { return }
         let provider = catalog.providers.first { !$0.isReserved && $0.models.contains(model) }
         let current = configStore.topLevelValue(of: "model_provider")
         if let provider {

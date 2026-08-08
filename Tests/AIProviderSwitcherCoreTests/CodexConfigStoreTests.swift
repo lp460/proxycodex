@@ -61,6 +61,8 @@ final class CodexConfigStoreTests: XCTestCase {
         // Native content preserved.
         XCTAssertTrue(config.contains("[mcp_servers.github]"))
         XCTAssertTrue(config.contains("# My native Codex/OpenAI config"))
+        XCTAssertTrue(config.contains("web_search = true"))
+        XCTAssertTrue(config.contains("# >>> provider-switcher tools >>>"))
 
         // No key anywhere.
         XCTAssertFalse(CodexConfigGenerator.containsKeyLikeField(config))
@@ -140,6 +142,7 @@ final class CodexConfigStoreTests: XCTestCase {
         let config = try store.readConfig()
         XCTAssertFalse(config.contains("[model_providers.deepseek]"))
         XCTAssertFalse(config.contains("provider-switcher"))
+        XCTAssertFalse(config.contains("web_search = true"))
         // Native config restored.
         XCTAssertTrue(config.contains("model = \"gpt-5.6\""))
         XCTAssertTrue(config.contains("[mcp_servers.github]"))

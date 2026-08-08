@@ -41,6 +41,10 @@ public enum CodexConfigGenerator {
         if provider.requiresKey && !provider.environmentVariable.isEmpty {
             lines.append("env_key = \(toml(provider.environmentVariable))")
         }
+        // Third-party endpoints must not be forced through Codex's native
+        // ChatGPT/OAuth authentication flow. The key, when required, comes
+        // from env_key; local/keyless providers simply ignore this setting.
+        lines.append("requires_openai_auth = false")
         lines.append("wire_api = \(toml(provider.wireAPI.rawValue))")
         return lines.joined(separator: "\n") + "\n"
     }
@@ -67,7 +71,17 @@ public enum CodexConfigGenerator {
             "default_reasoning_level": "low",
             "supported_reasoning_levels": [["effort": "low", "description": ""]],
             "shell_type": "shell_command", "visibility": "list",
-            "supported_in_api": true, "priority": 1
+            "supported_in_api": true, "priority": 1,
+            "apply_patch_tool_type": NSNull(),
+            "web_search_tool_type": NSNull(),
+            "supports_parallel_tool_calls": false,
+            "supports_search_tool": false,
+            "tool_mode": NSNull(),
+            "input_modalities": ["text"],
+            "supports_image_detail_original": false,
+            "truncation_policy": ["mode": "tokens", "limit": 10000],
+            "experimental_supported_tools": [],
+            "use_responses_lite": false
         ]
         let tpl = template ?? fallback
         guard let provider = providers.first(where: { $0.id == activeProviderID }),
@@ -81,6 +95,19 @@ public enum CodexConfigGenerator {
             e["display_name"] = "\(provider.displayName) · \(model)"
             e["description"] = "\(provider.displayName) model \(model)."
             e["priority"] = priority
+            // Advertise only the capabilities declared by this provider. The
+            // proxy forwards function tools when the client sends them; it never
+            // invents tools or promises upstream features it cannot verify.
+            e["apply_patch_tool_type"] = provider.supportsTools ? "freeform" : NSNull()
+            e["web_search_tool_type"] = provider.supportsWebSearch ? "text_and_image" : NSNull()
+            e["supports_parallel_tool_calls"] = provider.supportsParallelToolCalls
+            e["supports_search_tool"] = provider.supportsWebSearch
+            e["tool_mode"] = provider.supportsTools ? "code_mode_only" : NSNull()
+            e["input_modalities"] = provider.supportsImages ? ["text", "image"] : ["text"]
+            e["supports_image_detail_original"] = provider.supportsImages
+            e["truncation_policy"] = ["mode": "tokens", "limit": 10000]
+            e["experimental_supported_tools"] = []
+            e["use_responses_lite"] = false
             priority += 1
             models.append(e)
         }

@@ -1,86 +1,122 @@
 # AI Provider Switcher
 
-Barre de menus macOS qui injecte les providers tiers (**DeepSeek, GLM (Z.ai), OpenRouter, Ollama, Claude Code**) dans **Codex Desktop** (app ChatGPT) et les sessions **Codex CLI** — tout en gardant Codex natif ChatGPT pleinement fonctionnel.
+Barre de menus macOS pour piloter les providers compatibles avec **Codex** depuis un panneau unique : DeepSeek, GLM (Z.ai), OpenRouter, Ollama et Claude Code, tout en conservant le provider OpenAI natif.
 
-![Panneau de la barre de menus](docs/screenshots/panel.png)
+![Panneau de la barre de menus — fournisseurs, modèles et actions](docs/screenshots/panel.png)
 
-## Fonctionnalités
+> Capture du panneau en mode démonstration. Les statuts et présences de clés sont fictifs ; aucun secret n’est affiché.
 
-- **Statuts en direct** : pastille de connexion + présence de clé pour chaque provider
-- **Un clic = switch complet** : cliquer un fournisseur écrit la config (`model` + `model_provider`), injecte les clés et **relance ChatGPT/Codex** avec la bonne configuration
-- **Sélecteur « Modèle actif »** dans la barre (les modèles du provider actif)
-- **Gestion des clés intégrée** : saisie, collage, modification (« Voir la clé »), effacement — **persistées par défaut** (fichier 0600, hors iCloud) et rechargées au démarrage
-- **Proxies locaux d'adaptation** : traduction de la liste `/models` et de l'API Responses pour chaque provider tiers (streaming, outils)
-- **« Toujours une réponse »** : quand le modèle tente un outil non exécutable (Desktop), le proxy complète l'appel automatiquement et force une réponse texte
-- **Claude Code via sa session** : jeton OAuth Anthropic du Trousseau (pas de clé API à saisir)
-- **Codex CLI** : lancement dans Terminal avec la clé injectée (jamais dans les arguments)
+![Icône de la barre de menus avec son état](docs/screenshots/menubar.png)
 
-![Icône dans la barre de menus](docs/screenshots/menubar.png)
+## Ce que fait l’application
 
-## Principe de fonctionnement
+- Affiche l’état de connexion et la présence d’une clé pour chaque provider.
+- Change le provider et le modèle actifs depuis la barre.
+- Met à jour `model` et `model_provider` dans `~/.codex/config.toml` avec un override réversible.
+- Relance Codex Desktop/ChatGPT lorsque cela est nécessaire pour recharger la configuration.
+- Lance Codex CLI dans Terminal avec `--profile` et une clé injectée uniquement dans l’environnement.
+- Génère un catalogue de modèles compatible avec le schéma Codex, limité au provider actif.
+- Démarre des proxies locaux pour adapter les providers qui n’exposent pas directement l’API Responses.
+- Préserve les sections utilisateur, notamment MCP, et crée des sauvegardes avant les modifications.
 
-1. **Barre de menus ⚡** : statuts, clés, modèle actif, actions.
-2. **Un clic sur un fournisseur** : `model` + `model_provider` écrits dans `~/.codex/config.toml` (override réversible), clés injectées dans l'environnement, **ChatGPT/Codex relancé**.
-3. **Carte OpenAI** : retour au natif (override supprimé).
-4. **Choix des modèles** : dans la barre (« Modèle actif ») ou dans le sélecteur de Codex pour le provider actif.
-5. **Watcher de config** : si le modèle change dans Codex Desktop, `model_provider` est resynchronisé automatiquement.
+## Providers disponibles
 
-```
-   ┌─────────────┐   clic DeepSeek   ┌──────────────────────────────┐
-   │  Barre ⚡    │ ─────────────────►│ config.toml: model_provider  │
-   │  statuts    │   + relance       │        = "deepseek"          │
-   │  clés       │                   └──────────────┬───────────────┘
-   └─────────────┘                                  ▼
-                                       ┌──────────────────────────────┐
-                                       │  ChatGPT/Codex relancé avec   │
-                                       │  clés injectées (env)         │
-                                       └──────────────┬───────────────┘
-                                                      ▼
-                                       ┌──────────────────────────────┐
-                                       │  Proxy local 127.0.0.1:18888  │
-                                       │  /models traduit + API relay  │
-                                       └──────────────┬───────────────┘
-                                                      ▼
-                                       ┌──────────────────────────────┐
-                                       │  api.deepseek.com (responses) │
-                                       └──────────────────────────────┘
+| Provider | Transport utilisé par Codex | Authentification | Adapter local |
+|---|---|---|---:|
+| OpenAI | Natif Codex | Session Codex | Non |
+| DeepSeek | Responses via proxy | `DEEPSEEK_API_KEY` | `127.0.0.1:18888` |
+| GLM (Z.ai) | Responses via proxy | `ZAI_API_KEY` | `127.0.0.1:18889` |
+| OpenRouter | Responses via proxy | `OPENROUTER_API_KEY` | `127.0.0.1:18890` |
+| Claude Code | Responses ↔ Anthropic Messages | Session Claude Code / Trousseau | `127.0.0.1:18891` |
+| Ollama | Provider local Codex | Aucune | Non |
+
+Les providers tiers sont déclarés dans `[model_providers.<id>]` avec :
+
+```toml
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "http://127.0.0.1:18888/v1"
+env_key = "DEEPSEEK_API_KEY"
+requires_openai_auth = false
+wire_api = "responses"
 ```
 
-## Providers et proxies locaux
+`requires_openai_auth = false` est important : Codex ne doit pas essayer d’appliquer le flux d’authentification OpenAI à un endpoint tiers. Les clés ne sont jamais écrites dans `config.toml`.
 
-Codex Desktop exige : (1) la liste de modèles dans **son** schéma (`{"models": [...]}` — les endpoints OpenAI-compatibles renvoient `{"data": [...]}` et sont rejetés) et (2) l'**API Responses** (`/v1/responses`). Chaque provider tiers passe donc par un petit **proxy d'adaptation local** (`Resources/provider-proxy.py`, démarré automatiquement par l'app) :
+## Comment un changement de provider fonctionne
 
-| Provider | Port | Adaptateur | Rôle |
-|---|---|---|---|
-| DeepSeek | 18888 | relay | traduit `/models`, relaie l'API |
-| GLM (Z.ai) | 18889 | relay | idem |
-| OpenRouter | 18890 | relay | idem |
-| Claude Code | 18891 | anthropic | traduit Responses ↔ Messages (streaming + outils) |
-| Ollama | — | natif | local, sans clé |
+1. L’application vérifie la clé ou le mode sans clé.
+2. Elle rafraîchit le bloc du provider et son profil `~/.codex/<id>.config.toml`.
+3. Elle génère `~/.codex/catalog.json` pour le provider actif uniquement.
+4. Elle applique un override réversible de `model` et `model_provider`.
+5. Elle teste le endpoint `/v1/responses` via le proxy lorsque nécessaire.
+6. Elle relance Codex Desktop/ChatGPT avec les variables d’environnement disponibles.
 
-### Comportements du proxy (côté Desktop, `tools=0`)
+La carte OpenAI supprime l’override et revient à la configuration native. Les paramètres utilisateur et les serveurs MCP ne sont pas supprimés lors d’un changement de provider.
 
-- **Note « pas d'outils »** injectée dans le prompt : le modèle répond en texte au lieu de décrire des appels impossibles.
-- **Complétion automatique des appels d'outils** : si le modèle émet un `function_call`, le proxy y répond par « outil indisponible » et relance le modèle (max 2 tours) jusqu'à une réponse texte. L'objectif : **toujours une réponse au problème**.
-- **Streaming** : les réponses stream sont bufferisées, complétées si besoin, puis ré-émises en SSE valide. Les sessions CLI (`tools>0`) passent en streaming live sans aucune modification.
-- **Log par requête** : modèle, nombre d'outils, stream (utile pour diagnostiquer).
+## Tools : ce qui est réellement pris en charge
+
+Il faut distinguer **la capacité annoncée** et **l’exécution effective** :
+
+| Situation | Tools envoyés par Codex | Résultat |
+|---|---:|---|
+| Codex CLI | Oui, selon le modèle et la session | Le proxy transmet les function tools ; Codex peut exécuter ses tools et MCP |
+| Codex Desktop avec provider tiers, comportement observé | Non (`tools=0`) | Le proxy demande une réponse texte et évite les appels impossibles |
+| Client qui envoie des tools au proxy | Oui | Les appels de fonctions sont conservés et retournés au client |
+| Model provider qui émet un tool call sans tools reçus | Non | Le proxy ajoute un résultat synthétique « outil indisponible » et demande une réponse texte |
+
+Le catalogue généré déclare les capacités attendues par le contrat Codex :
+
+- `apply_patch_tool_type = "freeform"`
+- `web_search_tool_type = "text_and_image"`
+- `supports_parallel_tool_calls = true`
+- `supports_search_tool = true`
+- `tool_mode = "code_mode_only"`
+- modalités texte et image
+
+Ces champs aident Codex à considérer le modèle comme compatible avec son contrat d’agent ; ils ne constituent pas une certification des capacités réelles de chaque endpoint upstream. Ils ne peuvent toutefois pas forcer une version de Codex Desktop à ajouter des tools à une requête qui part avec `tools=[]`. Dans ce cas, l’application conserve le comportement sûr : réponse texte plutôt qu’un faux appel d’outil.
+
+Le flag natif suivant est également ajouté de façon marquée et réversible :
+
+```toml
+[tools]
+web_search = true
+```
+
+Si l’utilisateur possède déjà une valeur `web_search`, elle est conservée. Les blocs MCP existants sont conservés. Pour une exécution fiable de shell, édition de fichiers, `apply_patch` et MCP avec un provider tiers, le chemin recommandé reste **Codex CLI**.
+
+## Proxy local
+
+`Resources/provider-proxy.py` expose un endpoint local compatible avec Codex :
+
+- transforme `GET /v1/models` vers le catalogue attendu par Codex ;
+- relaie les requêtes Responses vers les providers OpenAI-compatible ;
+- traduit Responses ↔ Anthropic Messages pour Claude Code ;
+- traduit les tools Responses vers les tools Anthropic ;
+- transmet les function calls lorsque le client a réellement envoyé des tools ;
+- bufferise uniquement les sessions Desktop `tools=0` afin de terminer proprement une réponse ;
+- conserve un log technique par requête : provider, modèle, nombre de tools et streaming.
+
+Le proxy ne reçoit pas automatiquement les tools MCP. MCP est exécuté par Codex, principalement dans les sessions CLI, puis les définitions de tools sont envoyées au model provider lorsque le client les active. Il faut donc vérifier la compatibilité réelle du provider avec les schémas d’arguments et les résultats d’outils.
 
 ## Claude Code
 
-Aucune clé API à saisir — l'adaptateur utilise **l'environnement de Claude Code** dans cet ordre :
+Claude Code n’utilise pas une clé saisie dans le panneau. Le proxy cherche, dans cet ordre :
 
-1. **Trousseau macOS** (`Claude Code-credentials` → `claudeAiOauth.accessToken`, jeton OAuth `sk-ant-oat01-…`) → `api.anthropic.com` avec `anthropic-beta: oauth-2025-04-20` (comme le CLI), **refresh automatique** du jeton ;
-2. sinon `~/.claude/settings.json` (`ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`) ;
-3. sinon une clé API passée dans la requête.
+1. le jeton OAuth Claude Code dans le Trousseau macOS (`Claude Code-credentials`) ;
+2. `ANTHROPIC_AUTH_TOKEN` et `ANTHROPIC_BASE_URL` dans `~/.claude/settings.json` ;
+3. une clé éventuellement fournie par la requête.
 
-Modèles : `claude-sonnet-4-6` (défaut de la famille), `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4-5` (seul non rate-limité sur certains comptes).
+Le proxy convertit les messages, les images texte et les function tools entre le format Responses de Codex et le format Messages d’Anthropic.
 
-## Clés API
+## Clés et sécurité
 
-- Saisie/mise à jour dans le panneau (champ + « Coller », « Voir la clé » pour modifier, « Effacer »).
-- **Persistées par défaut** dans `~/Library/Application Support/AI Provider Switcher/providers.json` (0600, hors iCloud) et **rechargées au démarrage**.
-- Toggle « Clé locale (0600) » pour désactiver la persistance.
-- Injectées **uniquement** dans l'environnement des processus relancés — jamais dans `config.toml`, jamais dans les arguments de processus, jamais dans les logs.
+- Les clés sont gardées en mémoire pendant la session.
+- La persistance locale est activée par défaut dans `~/Library/Application Support/AI Provider Switcher/providers.json`.
+- Le fichier est limité à `0600`, son dossier à `0700`, et exclu des sauvegardes iCloud/Time Machine.
+- Les clés ne sont pas écrites dans `config.toml`, les profils, le catalogue ou les arguments de processus.
+- Au lancement de ChatGPT/Codex, les clés sont injectées dans l’environnement du processus.
+- Chaque modification de `config.toml` crée une sauvegarde dans `~/.codex/backup-provider-switcher/`.
 
 ## Installation
 
@@ -88,46 +124,103 @@ Modèles : `claude-sonnet-4-6` (défaut de la famille), `claude-opus-4-6`, `clau
 ./scripts/build-app.sh --open
 ```
 
-L'app est ad-hoc signée (Hardened Runtime), non sandboxée (elle doit lancer Codex). Depuis Xcode : schéma `AIProviderSwitcher` (les messages `linkd.autoShortcut` dans la console sont du bruit macOS sans conséquence).
+L’application est construite en release, signée ad hoc avec Hardened Runtime et non sandboxée afin de pouvoir lancer Codex et Terminal.
+
+Pour générer une capture reproductible du panneau :
+
+```bash
+./scripts/build-app.sh --no-sign
+.build/release/AIProviderSwitcher --panel-screenshot
+```
+
+Le mode `--panel-screenshot` utilise des données fictives, désactive les actions mutantes et ne touche ni `~/.codex` ni les clés locales.
+
+## Fichiers générés
+
+```text
+~/.codex/config.toml                         configuration additive et override actif
+~/.codex/<provider>.config.toml              profil CLI sans secret
+~/.codex/catalog.json                        catalogue du provider actif
+~/.codex/provider-switcher-state.json       état réversible de l’override
+~/.codex/backup-provider-switcher/           sauvegardes avant modification
+~/Library/Application Support/AI Provider Switcher/providers.json
+                                             clés locales optionnelles, mode 0600
+```
+
+Les blocs gérés sont encadrés par `provider-switcher`. La désinstallation retire uniquement les blocs, profils et catalogues gérés par l’application, puis restaure la configuration native et préserve les sections utilisateur.
+
+## Diagnostic
+
+Vérifier le provider actif :
+
+```bash
+awk '/^(model|model_provider) =/{print}' ~/.codex/config.toml
+```
+
+Vérifier le catalogue et ses capacités :
+
+```bash
+python3 -m json.tool ~/.codex/catalog.json | grep -E 'slug|tool|patch|search|parallel'
+```
+
+Vérifier les proxies :
+
+```bash
+curl -s http://127.0.0.1:18888/v1/models | python3 -m json.tool
+curl -s http://127.0.0.1:18889/v1/models | python3 -m json.tool
+curl -s http://127.0.0.1:18890/v1/models | python3 -m json.tool
+```
+
+Si le Desktop affiche le provider mais n’exécute pas les tools, inspecter le log du proxy :
+
+```text
+[proxy DeepSeek] POST /v1/responses model=... tools=0 stream=True
+```
+
+`tools=0` signifie que la limitation vient du client Codex Desktop ou de la session active, pas du modèle upstream. Avec `tools>0`, les function calls sont conservés par le proxy.
 
 ## Architecture
 
-```
+```text
 Sources/
-├── AIProviderSwitcher/            # App (barre de menus, panneau, état)
-│   ├── AIProviderSwitcherApp.swift
-│   ├── AppState.swift             # bootstrap, select, clés, proxies, watcher config
-│   ├── PanelView.swift            # panneau minimal : statuts + clés + modèle + actions
-│   └── Brand.swift                # identité visuelle par provider
-└── AIProviderSwitcherCore/        # Bibliothèque (41 tests)
-    ├── Providers.swift            # catalogue (OpenAI, DeepSeek, GLM, OpenRouter, Ollama, Claude)
-    ├── CodexConfigGenerator.swift # blocs TOML, ports proxies, catalogue JSON
-    ├── CodexConfigStore.swift     # install/uninstall/override réversible + catalogue
-    ├── CompatibilityChecker.swift # test de connexion (via proxy)
-    ├── KeyStore.swift             # clés en mémoire + persistance 0600
-    └── ProviderRouter.swift       # état actif (provider/modèle)
-Resources/
-└── provider-proxy.py              # proxy d'adaptation (relay / anthropic)
+├── AIProviderSwitcher/
+│   ├── AIProviderSwitcherApp.swift       MenuBarExtra et icône
+│   ├── AppState.swift                    bootstrap, sélection, clés, proxies, watcher
+│   ├── PanelView.swift                   panneau et interactions
+│   └── Brand.swift                       identité visuelle des providers
+└── AIProviderSwitcherCore/
+    ├── Providers.swift                   catalogue providers/modèles
+    ├── CodexConfigGenerator.swift        TOML et catalogue avec capacités tools
+    ├── CodexConfigStore.swift             installation, override et réversibilité
+    ├── CompatibilityChecker.swift         test de `/v1/responses`
+    ├── KeyStore.swift                     mémoire et persistance 0600
+    └── ProviderRouter.swift               état actif provider/modèle
+
+Resources/provider-proxy.py               relay Responses et adaptateur Anthropic
+docs/screenshots/                         captures utilisées dans ce README
 ```
 
-### Fichiers générés dans `~/.codex/`
-
-- `config.toml` : blocs `[model_providers.<id>]` (additifs, balisés `provider-switcher`) + override `model`/`model_provider` (réversible) + `model_catalog_json`.
-- `<id>.config.toml` : profils pour `codex --profile <id>`.
-- `catalog.json` : catalogue des modèles du provider actif (supprimé en natif OpenAI).
-- `provider-switcher-state.json` : état de l'override (restauré au démarrage).
-
-## Tests
+## Tests et build
 
 ```bash
-swift test        # 41 tests
-./scripts/build-app.sh   # build du bundle
+swift test
+swift build -c release
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile Resources/provider-proxy.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest Tests/ProxyBehaviorTests.py
+./scripts/build-app.sh --no-sign
 ```
 
 ## Limites connues
 
-- **Codex Desktop n'attache aucun outil aux providers tiers** (`tools=0` dans les requêtes — vérifié) : les skills/instructions arrivent au modèle mais l'exécution d'outils n'est possible qu'en **Codex CLI**. Le proxy compense en garantissant une réponse texte.
-- Le sélecteur de modèles du Desktop n'affiche qu'un provider à la fois (comportement de l'app OpenAI) et sa liste dépend du backend du compte (quota « Codex et Work » : la liste ChatGPT peut rester vide tant que le quota est épuisé).
-- L'app ChatGPT affiche ses propres messages système dans la conversation (non masquables depuis l'extérieur).
-- DeepSeek renvoie parfois des 503 transitoires sous charge ; les modèles Claude sonnet/opus peuvent être en rate-limit horaire selon le plan.
-- Les proxies tournent tant que l'app de la barre de menus est active.
+- Codex Desktop peut afficher un provider tiers sans lui envoyer de tools ; les métadonnées du catalogue ne suffisent pas à modifier ce comportement du client.
+- Les tools et MCP dépendent de la version de Codex, du modèle et de la session ; Codex CLI est le chemin le plus complet pour l’exécution agentique.
+- Les providers OpenAI-compatible n’implémentent pas tous Responses, le streaming, les images ou les tools de façon identique.
+- Les proxies tournent tant que l’application de la barre de menus est active.
+- Les modèles, quotas et noms de modèles peuvent évoluer côté provider.
+
+## Références
+
+- [Codex configuration](https://github.com/openai/codex/blob/main/docs/config.md)
+- [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json)
+- [Codex model metadata implementation](https://github.com/openai/codex/blob/main/codex-rs/models-manager/src/model_info.rs)
+- [Codex configuration reference discussion](https://github.com/openai/codex/issues/2760)

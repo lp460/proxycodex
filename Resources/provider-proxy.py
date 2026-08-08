@@ -10,7 +10,7 @@ Codex Desktop expects provider model lists in its own catalog schema
                  (Responses API <-> Anthropic Messages API), including SSE
                  streaming and tool calls.
 
-Usage: provider-proxy.py <port> <upstream_base> <display_name> <model1,model2...> [relay|anthropic]
+Usage: provider-proxy.py <port> <upstream_base> <display_name> <model1,model2...> [relay|anthropic] [tools] [images] [web_search] [parallel_tools]
 """
 import json
 import os
@@ -30,6 +30,10 @@ if UPSTREAM.endswith("/v1"):
 DISPLAY = sys.argv[3]
 MODELS = [m for m in sys.argv[4].split(",") if m]
 ADAPTER = sys.argv[5] if len(sys.argv) > 5 else "relay"
+SUPPORTS_TOOLS = len(sys.argv) > 6 and sys.argv[6] == "1"
+SUPPORTS_IMAGES = len(sys.argv) > 7 and sys.argv[7] == "1"
+SUPPORTS_WEB_SEARCH = len(sys.argv) > 8 and sys.argv[8] == "1"
+SUPPORTS_PARALLEL_TOOLS = len(sys.argv) > 9 and sys.argv[9] == "1"
 
 ENTRY_TEMPLATE = {
     "slug": "x",
@@ -55,20 +59,20 @@ ENTRY_TEMPLATE = {
     "default_reasoning_summary": None,
     "support_verbosity": None,
     "default_verbosity": None,
-    "apply_patch_tool_type": None,
-    "web_search_tool_type": None,
-    "truncation_policy": None,
-    "supports_parallel_tool_calls": None,
-    "supports_image_detail_original": None,
+    "apply_patch_tool_type": "freeform" if SUPPORTS_TOOLS else None,
+    "web_search_tool_type": "text_and_image" if SUPPORTS_WEB_SEARCH else None,
+    "truncation_policy": {"mode": "tokens", "limit": 10000},
+    "supports_parallel_tool_calls": SUPPORTS_PARALLEL_TOOLS,
+    "supports_image_detail_original": SUPPORTS_IMAGES,
     "context_window": None,
     "max_context_window": None,
     "comp_hash": None,
     "effective_context_window_percent": None,
-    "experimental_supported_tools": None,
-    "input_modalities": None,
-    "supports_search_tool": None,
-    "use_responses_lite": None,
-    "tool_mode": None,
+    "experimental_supported_tools": [],
+    "input_modalities": ["text", "image"] if SUPPORTS_IMAGES else ["text"],
+    "supports_search_tool": SUPPORTS_WEB_SEARCH,
+    "use_responses_lite": False,
+    "tool_mode": "code_mode_only" if SUPPORTS_TOOLS else None,
     "multi_agent_version": None,
 }
 
@@ -340,6 +344,15 @@ def responses_to_anthropic(body):
                             })
                 if blocks:
                     messages.append({"role": role, "content": blocks})
+            elif t == "function_call_output":
+                # Responses API places tool results as top-level input items.
+                # Anthropic expects them in a user message after the assistant
+                # tool_use block.
+                messages.append({"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": item.get("call_id", ""),
+                    "content": item.get("output", ""),
+                }]})
             elif t == "function_call":
                 args = item.get("arguments", "{}")
                 try:
@@ -363,13 +376,17 @@ def responses_to_anthropic(body):
         out["system"] = system
     tools = []
     for t in body.get("tools") or []:
-        if t.get("type") == "function":
-            fn = t.get("function", {})
-            tools.append({
-                "name": fn.get("name", "unknown"),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
-            })
+        if t.get("type") != "function":
+            continue
+        # Responses tools are flat (`name`, `description`, `parameters`),
+        # while Chat Completions nests them under `function`. Accept both so
+        # Codex and other OpenAI-compatible clients use the same adapter.
+        fn = t.get("function") or t
+        tools.append({
+            "name": fn.get("name", "unknown"),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        })
     if tools:
         out["tools"] = tools
     return out
@@ -464,16 +481,19 @@ class AnthropicStreamTranslator:
             block = event.get("content_block", {})
             if block.get("type") == "text":
                 self.text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+                self.response["output"].append({
+                    "type": "message", "id": self.text_item_id, "status": "in_progress",
+                    "role": "assistant", "content": [{"type": "output_text", "text": ""}],
+                })
                 chunks.append(sse({
                     "type": "response.output_item.added",
-                    "output_index": len(self.response["output"]),
-                    "item": {"type": "message", "id": self.text_item_id, "status": "in_progress",
-                             "role": "assistant", "content": []},
+                    "output_index": len(self.response["output"]) - 1,
+                    "item": dict(self.response["output"][-1]),
                 }))
                 chunks.append(sse({
                     "type": "response.content_part.added",
                     "item_id": self.text_item_id,
-                    "output_index": len(self.response["output"]),
+                    "output_index": len(self.response["output"]) - 1,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": ""},
                 }))
@@ -486,43 +506,59 @@ class AnthropicStreamTranslator:
                     "arguments": "",
                     "status": "in_progress",
                 }
+                self.response["output"].append(self.current_tool)
                 chunks.append(sse({
                     "type": "response.output_item.added",
-                    "output_index": len(self.response["output"]),
+                    "output_index": len(self.response["output"]) - 1,
                     "item": dict(self.current_tool),
                 }))
         elif etype == "content_block_delta":
             delta = event.get("delta", {})
             if delta.get("type") == "text_delta":
                 text = delta.get("text", "")
+                if self.response["output"] and self.response["output"][-1].get("id") == self.text_item_id:
+                    self.response["output"][-1]["content"][0]["text"] += text
                 chunks.append(sse({"type": "response.output_text.delta",
                                    "item_id": self.text_item_id,
-                                   "output_index": len(self.response["output"]),
+                                   "output_index": len(self.response["output"]) - 1,
                                    "content_index": 0,
                                    "delta": text}))
             elif delta.get("type") == "input_json_delta" and self.current_tool:
-                self.current_tool["arguments"] += delta.get("partial_json", "")
+                partial = delta.get("partial_json", "")
+                self.current_tool["arguments"] += partial
+                chunks.append(sse({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": self.current_tool["id"],
+                    "output_index": len(self.response["output"]) - 1,
+                    "delta": partial,
+                }))
         elif etype == "content_block_stop":
             if self.current_tool is not None:
+                self.current_tool["status"] = "completed"
+                chunks.append(sse({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": self.current_tool["id"],
+                    "output_index": len(self.response["output"]) - 1,
+                    "arguments": self.current_tool["arguments"],
+                }))
                 chunks.append(sse({
                     "type": "response.output_item.done",
-                    "output_index": len(self.response["output"]),
-                    "item": {**self.current_tool, "status": "completed"},
+                    "output_index": len(self.response["output"]) - 1,
+                    "item": dict(self.current_tool),
                 }))
                 self.current_tool = None
             elif self.text_item_id is not None:
                 chunks.append(sse({
                     "type": "response.content_part.done",
                     "item_id": self.text_item_id,
-                    "output_index": len(self.response["output"]),
+                    "output_index": len(self.response["output"]) - 1,
                     "content_index": 0,
-                    "part": {"type": "output_text", "text": ""},
+                    "part": dict(self.response["output"][-1]["content"][0]),
                 }))
                 chunks.append(sse({
                     "type": "response.output_item.done",
-                    "output_index": len(self.response["output"]),
-                    "item": {"type": "message", "id": self.text_item_id, "status": "completed",
-                             "role": "assistant", "content": []},
+                    "output_index": len(self.response["output"]) - 1,
+                    "item": dict(self.response["output"][-1]),
                 }))
                 self.text_item_id = None
         elif etype == "message_delta":
@@ -586,8 +622,10 @@ def do_anthropic_request(body_bytes, headers, stream):
         final["status"] = "completed"
         return 200, emit_stream_from_response(final), "text/event-stream"
     body = json.loads(resp.read().decode("utf-8"))
-    out = anthropic_to_responses(body, req.get("model"))
-    if req and has_function_calls(out):
+    out = anthropic_to_responses(body, req.get("model"))    # When the client supplied tools, return function calls to that client so
+    # Codex can execute them. Synthetic "tool unavailable" completion is only
+    # for Desktop requests that explicitly supplied no tools.
+    if tools_count == 0 and req and has_function_calls(out):
         out = complete_tool_calls_anthropic(req, hdrs, out)
     return 200, json.dumps(out).encode(), "application/json"
 
@@ -722,8 +760,10 @@ class Handler(BaseHTTPRequestHandler):
                     final = completed or {}
                 else:
                     final = json.loads(body.decode("utf-8"))
-                if req and has_function_calls(final):
-                    final = complete_tool_calls_relay(url, req, headers, final)
+                # Preserve real tool calls whenever the client supplied tools;
+                # only Desktop's tools=0 fallback may synthesize tool results.
+                if tools_count == 0 and req and has_function_calls(final):
+                    final = complete_tool_calls_relay(UPSTREAM, req, headers, final)
                     final["id"] = final.get("id") or f"resp_{uuid.uuid4().hex[:24]}"
                     final["object"] = "response"
                     final["status"] = "completed"

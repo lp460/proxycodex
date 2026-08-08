@@ -52,6 +52,7 @@ public struct InstallReport: Equatable, Sendable {
     public let providersAdded: [String]      // ids whose [model_providers.<id>] was appended
     public let providersAlreadyPresent: [String]
     public let profilesWritten: [String]
+    public let catalogInstalled: Bool       // false when a user-owned catalog key wins
     public let backupWritten: URL?
 }
 
@@ -144,12 +145,14 @@ public final class CodexConfigStore: Sendable {
         }
         _ = present
         // Static catalog for the active provider: the Desktop picker then only
-        // lists that provider's models.
-        try installCatalog(providers: providers, activeProviderID: activeProviderID)
+        // lists that provider's models. A user-owned model_catalog_json is
+        // preserved and reported instead of being silently overridden.
+        let catalogInstalled = try installCatalog(providers: providers, activeProviderID: activeProviderID)
         return InstallReport(
             providersAdded: added,
             providersAlreadyPresent: present,
             profilesWritten: profiles,
+            catalogInstalled: catalogInstalled,
             backupWritten: backupURL
         )
     }
@@ -161,30 +164,45 @@ public final class CodexConfigStore: Sendable {
     public func installCatalog(providers: [Provider], activeProviderID: String) throws -> Bool {
         var config = try readConfig()
         var changed = false
+        var catalogInstalled = false
         let active = providers.first { $0.id == activeProviderID }
         if let active, !active.isReserved || active.id == "ollama" {
-            let json = CodexConfigGenerator.catalogJSON(
-                providers: providers,
-                activeProviderID: activeProviderID,
-                cacheURL: paths.modelsCacheJson
-            )
-            try json.write(to: paths.catalogJson, atomically: true, encoding: .utf8)
+            let hadUserCatalog = config.contains("model_catalog_json")
+                && !config.contains("# >>> provider-switcher catalog >>>")
             config = removeManagedBlocksNamed("catalog", in: config)
-            if !config.contains("model_catalog_json") {
+            if !hadUserCatalog && !config.contains("model_catalog_json") {
+                let json = CodexConfigGenerator.catalogJSON(
+                    providers: providers,
+                    activeProviderID: activeProviderID,
+                    cacheURL: paths.modelsCacheJson
+                )
+                try json.write(to: paths.catalogJson, atomically: true, encoding: .utf8)
                 let body = "model_catalog_json = \(quote(paths.catalogJson.path))\n"
                 config = prependBlock(config, wrappedBlock(name: "catalog", body: body))
                 changed = true
+                catalogInstalled = true
             }
         } else {
-            // Native OpenAI: remove the static catalog.
+            // Native OpenAI: remove only the catalog managed by this app.
+            let hadUserCatalog = config.contains("model_catalog_json")
+                && !config.contains("# >>> provider-switcher catalog >>>")
+            let hadManagedCatalog = config.contains("# >>> provider-switcher catalog >>>")
             config = removeManagedBlocksNamed("catalog", in: config)
-            if FileManager.default.fileExists(atPath: paths.catalogJson.path) {
+            if hadManagedCatalog, FileManager.default.fileExists(atPath: paths.catalogJson.path) {
                 try? FileManager.default.removeItem(at: paths.catalogJson)
             }
-            changed = true
+            changed = hadManagedCatalog
+            catalogInstalled = !hadUserCatalog
         }
+        // Codex's native web search flag is independent from the model catalog.
+        // Enable it only when the user's config does not already define it;
+        // preserve user-owned [tools] values and make our addition reversible.
+        let withTools = installToolsConfig(in: config)
+        changed = changed || withTools != config
+        config = withTools
         if changed { try writeConfig(config) }
-        return true
+        return catalogInstalled
+
     }
 
     /// Removes every block/profile this app added and reverts any active override.
@@ -192,6 +210,7 @@ public final class CodexConfigStore: Sendable {
     public func uninstall() throws -> Bool {
         var changed = try revertOverride()
         var config = try readConfig()
+        let hadManagedCatalog = config.contains("# >>> provider-switcher catalog >>>")
         let cleaned = removeManagedBlocks(in: config)
         if cleaned != config {
             try writeConfig(cleaned)
@@ -206,8 +225,9 @@ public final class CodexConfigStore: Sendable {
                 changed = true
             }
         }
-        // Remove the static model catalog we wrote.
-        if FileManager.default.fileExists(atPath: paths.catalogJson.path) {
+        // Remove only the static model catalog managed by this app. A user-owned
+        // model_catalog_json may point to the same path and must survive.
+        if hadManagedCatalog, FileManager.default.fileExists(atPath: paths.catalogJson.path) {
             try? FileManager.default.removeItem(at: paths.catalogJson)
             changed = true
         }
@@ -383,7 +403,7 @@ public final class CodexConfigStore: Sendable {
 
     private func removeManagedBlocks(in config: String) -> String {
         var t = config
-        for name in ["override", "catalog", "provider:deepseek", "provider:glm", "provider:openrouter", "provider:ollama", "provider:lmstudio"] {
+        for name in ["override", "catalog", "tools", "provider:deepseek", "provider:glm", "provider:openrouter", "provider:ollama", "provider:lmstudio"] {
             t = removeManagedBlocksNamed(name, in: t)
         }
         // Also strip any provider block for catalog ids (custom) generically.
@@ -391,6 +411,31 @@ public final class CodexConfigStore: Sendable {
             t = removeManagedBlocksNamed("provider:\(provider.id)", in: t)
         }
         return t
+    }
+
+    private func installToolsConfig(in config: String) -> String {
+        let clean = removeManagedBlocksNamed("tools", in: config)
+        var lines = clean.components(separatedBy: "\n")
+        if let toolsIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "[tools]" }) {
+            var end = lines.count
+            if toolsIndex + 1 < lines.count {
+                for index in (toolsIndex + 1)..<lines.count {
+                    if lines[index].trimmingCharacters(in: .whitespaces).hasPrefix("[") {
+                        end = index
+                        break
+                    }
+                }
+            }
+            let ownsWebSearch = lines[(toolsIndex + 1)..<end].contains {
+                $0.range(of: #"^\\s*web_search\\s*="#, options: .regularExpression) != nil
+            }
+            guard !ownsWebSearch else { return clean }
+            lines.insert("# >>> \(beginToken) tools >>>", at: toolsIndex + 1)
+            lines.insert("web_search = true", at: toolsIndex + 2)
+            lines.insert("# <<< \(beginToken) tools <<<", at: toolsIndex + 3)
+            return lines.joined(separator: "\n")
+        }
+        return appendBlock(clean, wrappedBlock(name: "tools", body: "[tools]\nweb_search = true\n"))
     }
 
     private func removeManagedBlocksNamed(_ name: String, in config: String) -> String {
