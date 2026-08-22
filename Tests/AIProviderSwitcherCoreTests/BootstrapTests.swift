@@ -4,7 +4,19 @@ import XCTest
 final class BootstrapTests: XCTestCase {
     func testCatalogHasExpectedProviders() {
         let ids = ProviderCatalog.default.providers.map(\.id)
-        XCTAssertEqual(ids, ["openai", "deepseek", "glm", "openrouter", "ollama", "claude"])
+        XCTAssertEqual(ids, ["openai", "deepseek", "glm", "openrouter", "ollama", "opencode", "claude"])
+    }
+
+    func testOpenCodeUsesTheZenGatewayWithoutAKey() {
+        let opencode = ProviderCatalog.default[id: "opencode"]!
+        // The CLI is an agent; the provider talks to the OpenAI-compatible
+        // gateway behind it, whose free tier needs no key from the user.
+        XCTAssertEqual(opencode.baseURL.absoluteString, "https://opencode.ai/zen/v1")
+        XCTAssertTrue(opencode.isKeyless)
+        XCTAssertEqual(opencode.environmentVariable, "")
+        XCTAssertEqual(opencode.wireAPI, .responses)
+        XCTAssertEqual(CodexConfigGenerator.proxyPort(for: "opencode"), 18892)
+        XCTAssertTrue(opencode.models.contains("big-pickle"))
     }
 
     func testEveryProviderHasModelsAndValidDefault() {

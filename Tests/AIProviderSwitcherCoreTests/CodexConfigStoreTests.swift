@@ -73,6 +73,167 @@ final class CodexConfigStoreTests: XCTestCase {
         XCTAssertNotNil(report.backupWritten)
     }
 
+    /// A user-owned `[tools] web_search` must win: a second assignment in the
+    /// same table makes Codex reject config.toml, which would take MCP servers
+    /// and every other user section down with it.
+    func testExistingWebSearchValueIsNeverDuplicated() throws {
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try """
+        model = "gpt-5.6"
+
+        [tools]
+        web_search = false
+
+        [mcp_servers.github]
+        command = "npx"
+        """.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "claude")
+        let config = try store.readConfig()
+
+        XCTAssertEqual(config.components(separatedBy: "web_search").count - 1, 1)
+        XCTAssertTrue(config.contains("web_search = false"))
+        XCTAssertFalse(config.contains("# >>> provider-switcher tools >>>"))
+        XCTAssertTrue(config.contains("[mcp_servers.github]"))
+    }
+
+    func testSwitchingFromLegacyGeneratedCatalogRefreshesActiveProvider() throws {
+        try writeNative()
+        let openAI = try XCTUnwrap(ProviderCatalog.default[id: "openai"])
+        let legacyEntries: [[String: Any]] = openAI.models.map { model in
+            [
+                "slug": model,
+                "display_name": "OpenAI · \(model)",
+                "description": "OpenAI model \(model).",
+                "visibility": "list",
+                "supported_in_api": true
+            ]
+        }
+        let legacyData = try JSONSerialization.data(withJSONObject: ["models": legacyEntries])
+        try legacyData.write(to: paths.catalogJson, options: [.atomic])
+        var config = try store.readConfig()
+        config = config.replacingOccurrences(
+            of: "model_provider = \"openai\"\n",
+            with: "model_provider = \"openai\"\nmodel_catalog_json = \"\(paths.catalogJson.path)\"\n"
+        )
+        try config.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        _ = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "claude")
+
+        let catalogData = try Data(contentsOf: paths.catalogJson)
+        let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: catalogData) as? [String: Any])
+        let models = try XCTUnwrap(catalog["models"] as? [[String: Any]])
+        let claude = try XCTUnwrap(ProviderCatalog.default[id: "claude"])
+        XCTAssertEqual(models.map { $0["slug"] as? String },
+                       ModelMasquerade.aliases(for: claude, cacheURL: paths.modelsCacheJson).map { $0.slug })
+        XCTAssertEqual(store.topLevelValue(of: "model_catalog_json"), paths.catalogJson.path)
+    }
+
+    func testSwitchingBetweenProvidersRefreshesTheSameCatalog() throws {
+        try writeNative()
+        let selectable = ProviderCatalog.default.providers.filter { !$0.isReserved }
+        for provider in selectable {
+            _ = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: provider.id)
+
+            let data = try Data(contentsOf: paths.catalogJson)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+            // Every routed provider is exposed under Codex's own slugs, while the
+            // display name still names the provider answering.
+            XCTAssertEqual(models.map { $0["slug"] as? String },
+                           ModelMasquerade.aliases(for: provider, cacheURL: paths.modelsCacheJson).map { $0.slug },
+                           provider.id)
+            XCTAssertTrue(models.allSatisfy {
+                ($0["display_name"] as? String)?.hasSuffix(" · \(provider.displayName)") == true
+            }, provider.id)
+        }
+    }
+
+    func testSelectionOrderKeepsOverrideAndCatalogInSync() throws {
+        try writeNative()
+        let selectable = ProviderCatalog.default.providers.filter { !$0.isReserved }
+
+        for provider in selectable {
+            let model = provider.defaultModel
+            _ = try store.applyOverride(provider: provider, model: model)
+            _ = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: provider.id)
+
+            let exposed = ModelMasquerade.slug(for: model, provider: provider, cacheURL: paths.modelsCacheJson)
+            XCTAssertEqual(store.topLevelValue(of: "model"), exposed, provider.id)
+            XCTAssertEqual(store.topLevelValue(of: "model_provider"), provider.id, provider.id)
+            XCTAssertEqual(store.overrideState()?.model, model, provider.id)
+            XCTAssertEqual(store.overrideState()?.exposedModel, exposed, provider.id)
+            let data = try Data(contentsOf: paths.catalogJson)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+            // The slug written to config.toml must exist in the catalog Codex reads.
+            XCTAssertTrue(models.contains { $0["slug"] as? String == exposed }, provider.id)
+        }
+    }
+
+    func testUserOwnedCatalogAfterTomlSectionIsPreserved() throws {
+        try writeNative()
+        let userCatalog = home.appendingPathComponent("user-models.json")
+        let userJSON = "{\"models\":[{\"slug\":\"user-model\"}]}"
+        try userJSON.write(to: userCatalog, atomically: true, encoding: .utf8)
+        var config = try store.readConfig()
+        config += "\nmodel_catalog_json = \"\(userCatalog.path)\"\n"
+        try config.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        let report = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "openrouter")
+
+        XCTAssertFalse(report.catalogInstalled)
+        XCTAssertEqual(try String(contentsOf: userCatalog, encoding: .utf8), userJSON)
+        let resultingConfig = try store.readConfig()
+        XCTAssertNil(store.topLevelValue(of: "model_catalog_json"))
+        XCTAssertTrue(resultingConfig.contains("model_catalog_json = \"\(userCatalog.path)\""))
+        XCTAssertEqual(resultingConfig.components(separatedBy: "model_catalog_json = ").count - 1, 1)
+        XCTAssertFalse(resultingConfig.contains("# >>> provider-switcher catalog >>>"))
+    }
+
+    func testOpenAISelectionRemovesManagedCatalogAfterTomlSection() throws {
+        try writeNative()
+        let configPath = paths.catalogJson.path
+        let catalog = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "deepseek",
+            cacheURL: paths.modelsCacheJson
+        )
+        try catalog.write(to: paths.catalogJson, atomically: true, encoding: .utf8)
+        var config = try store.readConfig()
+        config += "\n# >>> provider-switcher catalog >>>\n"
+        config += "model_catalog_json = \"\(configPath)\"\n"
+        config += "# <<< provider-switcher catalog >>>\n"
+        try config.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(try store.installCatalog(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "openai"
+        ))
+        let resultingConfig = try store.readConfig()
+        XCTAssertFalse(resultingConfig.contains("model_catalog_json = \"\(configPath)\""))
+        XCTAssertFalse(resultingConfig.contains("# >>> provider-switcher catalog >>>"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.catalogJson.path))
+    }
+
+    func testUserOwnedCatalogAtDefaultPathIsPreserved() throws {
+        try writeNative()
+        let userCatalog = paths.catalogJson
+        try "{\"models\":[{\"slug\":\"my-model\"}]}".write(to: userCatalog, atomically: true, encoding: .utf8)
+        var config = try store.readConfig()
+        config = config.replacingOccurrences(
+            of: "model_provider = \"openai\"\n",
+            with: "model_provider = \"openai\"\nmodel_catalog_json = \"\(userCatalog.path)\"\n"
+        )
+        try config.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        let report = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "claude")
+
+        XCTAssertFalse(report.catalogInstalled)
+        XCTAssertEqual(try String(contentsOf: userCatalog, encoding: .utf8), "{\"models\":[{\"slug\":\"my-model\"}]}")
+        XCTAssertTrue((try store.readConfig()).contains("model_catalog_json = \"\(userCatalog.path)\""))
+    }
+
     func testInstallIsIdempotent() throws {
         try writeNative()
         _ = try store.install(providers: ProviderCatalog.default.providers)
@@ -84,6 +245,24 @@ final class CodexConfigStoreTests: XCTestCase {
         XCTAssertEqual(config.components(separatedBy: "[model_providers.deepseek]").count - 1, 1)
     }
 
+    func testUserOwnedCatalogAtDifferentPathIsPreserved() throws {
+        try writeNative()
+        let userCatalog = home.appendingPathComponent("my-models.json")
+        try "{\"models\":[{\"slug\":\"my-model\"}]}".write(to: userCatalog, atomically: true, encoding: .utf8)
+        var config = try store.readConfig()
+        config = config.replacingOccurrences(
+            of: "model_provider = \"openai\"\n",
+            with: "model_provider = \"openai\"\nmodel_catalog_json = \"\(userCatalog.path)\"\n"
+        )
+        try config.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        let report = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "claude")
+
+        XCTAssertFalse(report.catalogInstalled)
+        XCTAssertTrue((try store.readConfig()).contains("model_catalog_json = \"\(userCatalog.path)\""))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: userCatalog.path))
+    }
+
     // MARK: Override (reversible)
 
     func testApplyOverrideEditsOnlyTopLevelAndPreservesRest() throws {
@@ -93,8 +272,14 @@ final class CodexConfigStoreTests: XCTestCase {
         let state = try store.applyOverride(provider: deepseek, model: "deepseek-v4-flash")
 
         let config = try store.readConfig()
-        XCTAssertTrue(config.contains("model = \"deepseek-v4-flash\""))
+        // Codex reads one of its own slugs; the real model lives in the sidecar.
+        let exposed = ModelMasquerade.slug(for: "deepseek-v4-flash", provider: deepseek,
+                                           cacheURL: paths.modelsCacheJson)
+        XCTAssertNotEqual(exposed, "deepseek-v4-flash")
+        XCTAssertTrue(config.contains("model = \"\(exposed)\""))
         XCTAssertTrue(config.contains("model_provider = \"deepseek\""))
+        XCTAssertEqual(state.model, "deepseek-v4-flash")
+        XCTAssertEqual(state.exposedModel, exposed)
         XCTAssertTrue(config.contains("[mcp_servers.github]"))           // preserved
         XCTAssertTrue(config.contains("[model_providers.deepseek]"))      // preserved
         // Native model line is replaced by the override.
@@ -127,6 +312,25 @@ final class CodexConfigStoreTests: XCTestCase {
         try writeNative()
         let result = try store.revertOverride()
         XCTAssertFalse(result)
+    }
+
+    func testRevertRemovesLegacyManagedOverrideWithoutSidecar() throws {
+        try writeNative()
+        let legacy = """
+        # >>> provider-switcher override >>>
+        model = "deepseek-v4-flash"
+        model_provider = "deepseek"
+        # <<< provider-switcher override <<<
+
+        """
+        try legacy.write(to: paths.configToml, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(try store.revertOverride())
+        let config = try store.readConfig()
+        XCTAssertTrue(config.contains("model = \"gpt-5.6\""))
+        XCTAssertTrue(config.contains("model_provider = \"openai\""))
+        XCTAssertFalse(config.contains("deepseek-v4-flash"))
+        XCTAssertFalse(config.contains("# >>> provider-switcher override >>>"))
     }
 
     // MARK: Uninstall (full reversibility)

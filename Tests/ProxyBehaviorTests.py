@@ -4,6 +4,7 @@ import json
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -17,7 +18,15 @@ class ProxyBehaviorTests(unittest.TestCase):
         cls.proxy = importlib.util.module_from_spec(spec)
         old_argv = sys.argv
         try:
-            sys.argv = [str(PROXY), "18888", "https://example.test/v1", "Test", "model", "relay", "1", "1", "0", "1"]
+            # Third-party fixture: full tool set (tools, apply_patch, images,
+            # parallel calls) but no native custom-tool wire format, so every
+            # Codex tool flavor must be bridged to function tools. The provider
+            # also masquerades: Codex sees gpt-5.6-sol / gpt-5.5, the provider
+            # answers as real-model-pro / real-model-lite.
+            sys.argv = [str(PROXY), "18888", "https://example.test/v1", "Test",
+                        "gpt-5.6-sol,gpt-5.5",
+                        "relay", "1", "1", "1", "0", "1", "0",
+                        "real-model-pro,real-model-lite"]
             spec.loader.exec_module(cls.proxy)
         finally:
             sys.argv = old_argv
@@ -50,12 +59,353 @@ class ProxyBehaviorTests(unittest.TestCase):
         self.assertEqual(anthropic["messages"][1]["content"][0]["type"], "tool_result")
         self.assertEqual(anthropic["messages"][1]["content"][0]["content"], "contents")
 
+    def test_model_catalog_omits_null_fields(self):
+        model = json.loads(self.proxy.models_response())["models"][0]
+        self.assertNotIn("upgrade", model)
+        self.assertNotIn("context_window", model)
+        self.assertNotIn("web_search_tool_type", model)
+
     def test_model_catalog_uses_declared_capabilities(self):
         model = json.loads(self.proxy.models_response())["models"][0]
-        self.assertEqual(model["apply_patch_tool_type"], "freeform")
+        # `code_mode_only` would replace the classic tool set (shell,
+        # apply_patch, MCP function tools) with a single freeform code tool.
+        self.assertNotIn("tool_mode", model)
         self.assertTrue(model["supports_parallel_tool_calls"])
         self.assertFalse(model["supports_search_tool"])
         self.assertEqual(model["input_modalities"], ["text", "image"])
+        self.assertTrue(model["include_plugin_usage_instructions"])
+
+    def test_every_codex_tool_flavor_is_bridged_to_a_function_tool(self):
+        tools = [
+            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "exec", "format": {"type": "grammar"}},
+            {"type": "custom", "name": "apply_patch", "format": {"type": "text"}},
+            {"type": "local_shell"},
+            {"type": "web_search"},
+        ]
+        bridged, bridge = self.proxy.bridge_tools(tools)
+        self.assertEqual([tool["type"] for tool in bridged], ["function"] * 4)
+        self.assertEqual([tool["name"] for tool in bridged],
+                         ["shell", "exec", "apply_patch", "local_shell"])
+        self.assertEqual(bridge["exec"], {"kind": "custom", "name": "exec"})
+        self.assertEqual(bridge["local_shell"], {"kind": "local_shell", "name": "local_shell"})
+        # Freeform tools travel through a single string property.
+        exec_tool = next(t for t in bridged if t["name"] == "exec")
+        self.assertEqual(exec_tool["parameters"]["required"], ["input"])
+        self.assertTrue(self.proxy.bridge_needs_restore(bridge))
+
+    def test_hosted_web_search_is_dropped_when_the_provider_cannot_run_it(self):
+        bridged, bridge = self.proxy.bridge_tools([{"type": "web_search"}])
+        self.assertEqual(bridged, [])
+        self.assertEqual(bridge, {})
+
+    def test_native_tool_flavors_are_forwarded_untouched_for_openai(self):
+        original = self.proxy.SUPPORTS_CUSTOM_TOOLS
+        try:
+            self.proxy.SUPPORTS_CUSTOM_TOOLS = True
+            tools = [{"type": "custom", "name": "apply_patch", "format": {"type": "text"}},
+                     {"type": "local_shell"}]
+            bridged, bridge = self.proxy.bridge_tools(tools)
+            self.assertEqual(bridged, tools)
+            self.assertEqual(bridge, {})
+            self.assertFalse(self.proxy.bridge_needs_restore(bridge))
+        finally:
+            self.proxy.SUPPORTS_CUSTOM_TOOLS = original
+
+    def test_mcp_tool_names_are_sanitized_and_restored(self):
+        tools = [{"type": "function", "name": "mcp.node_repl/run",
+                  "parameters": {"type": "object"}}]
+        bridged, bridge = self.proxy.bridge_tools(tools)
+        upstream_name = bridged[0]["name"]
+        self.assertEqual(upstream_name, "mcp_node_repl_run")
+        self.assertTrue(self.proxy.bridge_needs_restore(bridge))
+        restored = self.proxy.restore_output_items(
+            [{"type": "function_call", "call_id": "c1", "name": upstream_name,
+              "arguments": "{}"}], bridge)
+        self.assertEqual(restored[0]["name"], "mcp.node_repl/run")
+
+    def test_bridged_calls_are_restored_to_codex_item_shapes(self):
+        bridge = {"apply_patch": {"kind": "custom", "name": "apply_patch"},
+                  "local_shell": {"kind": "local_shell", "name": "local_shell"}}
+        output = [
+            {"type": "function_call", "id": "fc1", "call_id": "c1", "name": "apply_patch",
+             "arguments": json.dumps({"input": "*** Begin Patch"})},
+            {"type": "function_call", "id": "fc2", "call_id": "c2", "name": "local_shell",
+             "arguments": json.dumps({"command": ["ls", "-l"], "workdir": "/tmp"})},
+        ]
+        patch_call, shell_call = self.proxy.restore_output_items(output, bridge)
+        self.assertEqual(patch_call["type"], "custom_tool_call")
+        self.assertEqual(patch_call["input"], "*** Begin Patch")
+        self.assertEqual(patch_call["call_id"], "c1")
+        self.assertEqual(shell_call["type"], "local_shell_call")
+        self.assertEqual(shell_call["action"],
+                         {"type": "exec", "command": ["ls", "-l"], "workdir": "/tmp"})
+
+    def test_raw_arguments_survive_when_the_model_ignores_the_wrapper(self):
+        bridge = {"apply_patch": {"kind": "custom", "name": "apply_patch"}}
+        restored = self.proxy.restore_output_items(
+            [{"type": "function_call", "call_id": "c1", "name": "apply_patch",
+              "arguments": "*** Begin Patch"}], bridge)
+        self.assertEqual(restored[0]["input"], "*** Begin Patch")
+
+    def test_bridged_history_is_rewritten_for_the_provider(self):
+        bridge = {"apply_patch": {"kind": "custom", "name": "apply_patch"},
+                  "local_shell": {"kind": "local_shell", "name": "local_shell"}}
+        history = [
+            {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
+             "input": "*** Begin Patch"},
+            {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
+            {"type": "local_shell_call", "call_id": "c2",
+             "action": {"type": "exec", "command": ["ls"]}},
+            {"type": "local_shell_call_output", "call_id": "c2", "output": "README.md"},
+        ]
+        rewritten = self.proxy.bridge_input_items(history, bridge)
+        self.assertEqual([item["type"] for item in rewritten],
+                         ["function_call", "function_call_output",
+                          "function_call", "function_call_output"])
+        self.assertEqual(json.loads(rewritten[0]["arguments"]), {"input": "*** Begin Patch"})
+        self.assertEqual(json.loads(rewritten[2]["arguments"]), {"command": ["ls"]})
+
+    def test_masquerade_swaps_the_model_name_on_the_wire(self):
+        req, _, _, slug = self.proxy.prepare_upstream_request(
+            {"model": "gpt-5.6-sol", "input": "hi"})
+        # The fixture exposes gpt-5.6-sol as the provider's real model.
+        self.assertEqual(slug, "gpt-5.6-sol")
+        self.assertEqual(req["model"], "real-model-pro")
+        # A real model name (compatibility probe) is left untouched.
+        self.assertEqual(self.proxy.upstream_model("real-model-pro"), "real-model-pro")
+        # Unknown slugs are not invented away either.
+        self.assertEqual(self.proxy.upstream_model("gpt-9"), "gpt-9")
+
+    def test_masquerade_catalog_uses_native_slugs_and_flavor(self):
+        models = json.loads(self.proxy.models_response())["models"]
+        self.assertEqual([m["slug"] for m in models], ["gpt-5.6-sol", "gpt-5.5"])
+        # Native apply_patch flavor: the bridge restores the custom_tool_call.
+        self.assertEqual(models[0]["apply_patch_tool_type"], "freeform")
+        # The display name still says which provider really answers.
+        self.assertEqual(models[0]["display_name"], "gpt-5.6-sol · Test")
+        self.assertIn("real-model-pro", models[0]["description"])
+
+    def test_response_reports_the_slug_codex_asked_for(self):
+        body = json.dumps({"model": "gpt-5.6-sol",
+                           "input": [{"type": "message", "role": "user", "content": "hi"}]}).encode()
+
+        class FakeResponse:
+            def read(self):
+                return json.dumps({"content": [{"type": "text", "text": "ok"}],
+                                   "model": "real-model-pro", "usage": {}}).encode()
+
+        captured = {}
+        def fake_urlopen(request, **kwargs):
+            captured["body"] = json.loads(request.data.decode())
+            return FakeResponse()
+
+        with mock.patch.object(self.proxy, "_anthropic_oauth_token", return_value=None), \
+             mock.patch.object(self.proxy.urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, payload, _ = self.proxy.do_anthropic_request(
+                body, {"Authorization": "Bearer test"}, stream=False)
+
+        self.assertEqual(code, 200)
+        self.assertEqual(captured["body"]["model"], "real-model-pro")
+        self.assertEqual(json.loads(payload)["model"], "gpt-5.6-sol")
+
+    def test_opencode_auth_falls_back_to_the_public_free_tier_key(self):
+        # Codex sends no Authorization for a keyless provider.
+        with mock.patch.object(self.proxy, "opencode_stored_key", return_value=None):
+            self.assertEqual(self.proxy.opencode_authorization(None), "Bearer public")
+            self.assertEqual(self.proxy.opencode_authorization(""), "Bearer public")
+
+    def test_opencode_prefers_its_own_stored_credential(self):
+        with mock.patch.object(self.proxy, "opencode_stored_key", return_value="zen-key"):
+            self.assertEqual(self.proxy.opencode_authorization(None), "Bearer zen-key")
+        # A key supplied by the request still wins over both.
+        with mock.patch.object(self.proxy, "opencode_stored_key", return_value="zen-key"):
+            self.assertEqual(self.proxy.opencode_authorization("Bearer paid"), "Bearer paid")
+
+    def test_opencode_stored_key_reads_the_cli_auth_file(self):
+        import tempfile, pathlib
+        for payload, expected in [({"opencode": {"key": "k1"}}, "k1"),
+                                  ({"opencode": {"apiKey": "k2"}}, "k2"),
+                                  ({"opencode": "k3"}, "k3"),
+                                  ({"deepseek": {"key": "other"}}, None),
+                                  ({}, None)]:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "auth.json"
+                path.write_text(json.dumps(payload))
+                with mock.patch.object(self.proxy, "OPENCODE_AUTH_PATH", str(path)):
+                    self.assertEqual(self.proxy.opencode_stored_key(), expected, payload)
+
+    def test_openai_only_request_fields_are_stripped(self):
+        req = self.proxy.sanitize_upstream_request({
+            "model": "model", "service_tier": "priority", "prompt_cache_key": "abc",
+            "reasoning": {"effort": "xhigh"},
+        })
+        self.assertNotIn("service_tier", req)
+        self.assertNotIn("prompt_cache_key", req)
+        self.assertEqual(req["reasoning"]["effort"], "high")
+
+    def test_tool_filter_deduplicates_flat_and_nested_function_names(self):
+        tools = [
+            {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+            {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
+            {"type": "function", "name": "write_file", "parameters": {"type": "object"}},
+        ]
+        filtered = self.proxy.bridge_tools(tools)[0]
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(self.proxy._tool_name(filtered[0]), "read_file")
+        self.assertEqual(self.proxy._tool_name(filtered[1]), "write_file")
+
+    def test_probe_shape_has_no_tools_but_real_requests_are_deduplicated(self):
+        probe = {"model": "model", "input": "ping", "stream": False}
+        self.assertNotIn("tools", probe)
+        request = {
+            "model": "model",
+            "input": "ping",
+            "stream": False,
+            "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "exec"},
+            ],
+        }
+        bridged = self.proxy.bridge_tools(request["tools"])[0]
+        self.assertEqual([tool["name"] for tool in bridged], ["read_file", "exec"])
+
+    def test_anthropic_request_sends_unique_bridged_tools(self):
+        body = json.dumps({
+            "model": "model",
+            "input": [{"type": "message", "role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "exec", "format": {"type": "text"}},
+            ],
+        }).encode()
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return json.dumps({"content": [{"type": "text", "text": "ok"}], "usage": {}}).encode()
+
+        captured = {}
+        def fake_urlopen(request, **kwargs):
+            captured["body"] = json.loads(request.data.decode())
+            return FakeResponse()
+
+        with mock.patch.object(self.proxy, "_anthropic_oauth_token", return_value=None), \
+             mock.patch.object(self.proxy.urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, _, _ = self.proxy.do_anthropic_request(
+                body, {"Authorization": "Bearer test"}, stream=False
+            )
+
+        self.assertEqual(code, 200)
+        names = [tool["name"] for tool in captured["body"]["tools"]]
+        self.assertEqual(names, ["read_file", "exec"])
+
+    def test_anthropic_translation_deduplicates_tool_names(self):
+        body = {
+            "model": "model",
+            "input": [{"type": "message", "role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
+                {"type": "function", "name": "write_file", "parameters": {"type": "object"}},
+            ],
+        }
+        anthropic = self.proxy.responses_to_anthropic(body)
+        self.assertEqual([tool["name"] for tool in anthropic["tools"]], ["read_file", "write_file"])
+
+    def test_native_apply_patch_tool_is_bridged_once(self):
+        bridged, bridge = self.proxy.bridge_tools([{"type": "apply_patch"},
+                                                   {"type": "apply_patch"}])
+        self.assertEqual([tool["name"] for tool in bridged], ["apply_patch"])
+        self.assertEqual(bridge["apply_patch"]["kind"], "custom")
+
+    def test_apply_patch_is_dropped_when_the_provider_does_not_declare_it(self):
+        original = self.proxy.SUPPORTS_APPLY_PATCH
+        try:
+            self.proxy.SUPPORTS_APPLY_PATCH = False
+            tools = [{"type": "apply_patch"},
+                     {"type": "custom", "name": "apply_patch", "format": {"type": "text"}},
+                     {"type": "function", "name": "read_file"}]
+            self.assertEqual([t["name"] for t in self.proxy.bridge_tools(tools)[0]],
+                             ["read_file"])
+        finally:
+            self.proxy.SUPPORTS_APPLY_PATCH = original
+
+    def test_tool_bridge_removes_every_tool_when_the_adapter_disables_them(self):
+        original = self.proxy.SUPPORTS_TOOLS
+        try:
+            self.proxy.SUPPORTS_TOOLS = False
+            tools = [{"type": "function", "name": "read_file"}, {"type": "custom", "name": "exec"}]
+            self.assertEqual(self.proxy.bridge_tools(tools)[0], [])
+        finally:
+            self.proxy.SUPPORTS_TOOLS = original
+
+    def test_images_reach_claude_as_image_blocks(self):
+        body = {
+            "model": "model",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ]}],
+        }
+        blocks = self.proxy.responses_to_anthropic(body)["messages"][0]["content"]
+        self.assertEqual(blocks[1], {"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "QUJD"}})
+
+    def test_web_search_maps_to_the_anthropic_server_tool(self):
+        original = self.proxy.SUPPORTS_WEB_SEARCH
+        try:
+            self.proxy.SUPPORTS_WEB_SEARCH = True
+            tools = self.proxy.anthropic_server_tools([{"type": "web_search"}])
+            self.assertEqual(tools[0]["type"], "web_search_20250305")
+            out = self.proxy.anthropic_to_responses({"content": [
+                {"type": "server_tool_use", "id": "srv1", "name": "web_search",
+                 "input": {"query": "codex mcp"}},
+                {"type": "text", "text": "found it"},
+            ], "usage": {}}, "model")
+            self.assertEqual(out["output"][0]["type"], "web_search_call")
+            self.assertEqual(out["output"][0]["action"]["query"], "codex mcp")
+        finally:
+            self.proxy.SUPPORTS_WEB_SEARCH = original
+
+    def test_bridged_apply_patch_comes_back_as_a_custom_tool_call(self):
+        body = json.dumps({
+            "model": "model",
+            "input": [{"type": "message", "role": "user", "content": "fix the typo"}],
+            "tools": [{"type": "custom", "name": "apply_patch", "format": {"type": "text"}}],
+        }).encode()
+
+        class FakeResponse:
+            def read(self):
+                return json.dumps({"content": [{
+                    "type": "tool_use", "id": "toolu_1", "name": "apply_patch",
+                    "input": {"input": "*** Begin Patch"},
+                }], "usage": {}}).encode()
+
+        calls = []
+        def fake_urlopen(request, **kwargs):
+            calls.append(json.loads(request.data.decode()))
+            return FakeResponse()
+
+        with mock.patch.object(self.proxy, "_anthropic_oauth_token", return_value=None), \
+             mock.patch.object(self.proxy.urllib.request, "urlopen", side_effect=fake_urlopen):
+            code, payload, _ = self.proxy.do_anthropic_request(
+                body, {"Authorization": "Bearer test"}, stream=False
+            )
+
+        self.assertEqual(code, 200)
+        out = json.loads(payload)
+        self.assertEqual(out["output"][0]["type"], "custom_tool_call")
+        self.assertEqual(out["output"][0]["input"], "*** Begin Patch")
+        self.assertEqual(out["output"][0]["call_id"], "toolu_1")
+        # The client sent tools, so the call is returned to Codex instead of
+        # being answered with a synthetic "tool unavailable" round trip.
+        self.assertEqual(len(calls), 1)
 
     def test_anthropic_stream_exposes_function_call_arguments(self):
         translator = self.proxy.AnthropicStreamTranslator("model")

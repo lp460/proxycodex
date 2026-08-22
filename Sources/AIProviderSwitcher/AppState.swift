@@ -40,6 +40,9 @@ final class AppState: ObservableObject {
     @Published var catalogConflict = false
     @Published var editingKey = false
     @Published var editingProviderID: String?
+    /// OpenCode CLI found on this machine, if any. Informational: the Zen
+    /// gateway the provider talks to works without the CLI.
+    @Published var openCode: OpenCodeInstallation?
     @Published private(set) var logs: [LogEntry] = []
 
     private var observationTask: Task<Void, Never>?
@@ -63,8 +66,14 @@ final class AppState: ObservableObject {
                     "glm": .compatible,
                     "openrouter": .untested,
                     "ollama": .compatible,
-                    "claude": .compatible
+                    "claude": .compatible,
+                    "opencode": .compatible
                 ]
+            )
+            openCode = OpenCodeInstallation(
+                executable: URL(fileURLWithPath: "/Users/demo/.opencode/bin/opencode"),
+                version: "1.18.21",
+                hasZenCredential: false
             )
             router = try? ProviderRouter(
                 catalog: catalog,
@@ -152,7 +161,21 @@ final class AppState: ObservableObject {
             log("Init error: \(error.localizedDescription)")
         }
         refreshRunningApps()
+        await detectOpenCode()
         log("Catalogue chargé : \(catalog.providers.map(\.displayName).joined(separator: ", ")).")
+    }
+
+    /// Looks for the OpenCode CLI. Runs `opencode --version`, so it stays off
+    /// the main actor.
+    func detectOpenCode() async {
+        guard !screenshotMode else { return }
+        openCode = await Task.detached(priority: .utility) { OpenCodeCLI.detect() }.value
+        guard let install = openCode else {
+            log("OpenCode CLI absent : la passerelle Zen publique reste utilisable.")
+            return
+        }
+        let credential = install.hasZenCredential ? "clé Zen OpenCode" : "palier gratuit (clé publique)"
+        log("OpenCode CLI \(install.version ?? "?") détecté (\(install.executable.path)) · \(credential).")
     }
 
     private func observeRouter() async {
@@ -181,6 +204,17 @@ final class AppState: ObservableObject {
     }
     func hasKey(for providerID: String) -> Bool {
         screenshotMode ? screenshotKeyIDs.contains(providerID) : keyStore.hasKey(providerID)
+    }
+    /// Slug Codex believes it is talking to, when the active provider is exposed
+    /// under one of Codex's own models. `nil` when no masquerading happens.
+    var exposedModel: String? {
+        guard let provider = activeProvider, ModelMasquerade.masquerades(provider) else { return nil }
+        let slug = ModelMasquerade.slug(
+            for: snapshot.activeModel,
+            provider: provider,
+            cacheURL: configStore.paths.modelsCacheJson
+        )
+        return slug == snapshot.activeModel ? nil : slug
     }
     var hasKeyForActive: Bool {
         guard let p = activeProvider else { return false }
@@ -225,14 +259,16 @@ final class AppState: ObservableObject {
     /// OpenAI = revert override (native ChatGPT).
     func select(providerID: String) async {
         guard !screenshotMode, let router else { return }
+        stopConfigWatcher()
+        defer { startConfigWatcher() }
         dismissKeyEditor()
         let provider = catalog[id: providerID]
         let model = provider?.defaultModel ?? snapshot.activeModel
         do {
             if providerID == "openai" {
-                _ = try configStore.revertOverride()
+                _ = try configStore.revertOverride(allowLegacyUnmarked: true)
                 installProviders(activeProviderID: "openai")
-                _ = try await router.setActive(providerID: "openai", model: model)
+                snapshot = try await router.setActive(providerID: "openai", model: model)
                 log("OpenAI natif : override supprimé, relance de ChatGPT/Codex…")
             } else {
                 guard let provider else { return }
@@ -241,9 +277,12 @@ final class AppState: ObservableObject {
                     presentKeySheet(for: provider.id)
                     return
                 }
-                installProviders(activeProviderID: providerID)
+                // Write the new model/provider first. The config watcher can
+                // then never observe a Claude catalog paired with the previous
+                // GPT model and revert the selection to OpenAI.
                 _ = try configStore.applyOverride(provider: provider, model: model)
-                _ = try await router.setActive(providerID: providerID, model: model)
+                installProviders(activeProviderID: providerID)
+                snapshot = try await router.setActive(providerID: providerID, model: model)
                 log("Sélection : \(provider.displayName) · \(model). Relance de ChatGPT/Codex…")
             }
             await runTest()
@@ -260,11 +299,15 @@ final class AppState: ObservableObject {
     /// ChatGPT/Codex so the new model applies in the Desktop.
     func setModel(_ model: String) async {
         guard !screenshotMode, let router, let provider = activeProvider else { return }
+        stopConfigWatcher()
+        defer { startConfigWatcher() }
         do {
-            _ = try await router.setActive(providerID: provider.id, model: model)
+            snapshot = try await router.setActive(providerID: provider.id, model: model)
             if provider.id != "openai" {
-                installProviders(activeProviderID: provider.id)
+                // Keep model_provider and model in sync before refreshing the
+                // provider catalog, avoiding a transient old-provider state.
                 _ = try configStore.applyOverride(provider: provider, model: model)
+                installProviders(activeProviderID: provider.id)
                 log("Modèle : \(model). Relance de ChatGPT/Codex…")
                 await relaunchChatGPT()
             } else {
@@ -456,20 +499,45 @@ final class AppState: ObservableObject {
     /// them the desktop model picker can only offer ChatGPT/OpenAI.
     func relaunchChatGPT() async {
         guard !screenshotMode else { return }
-        let bundleID = "com.openai.codex"
         let env = keyEnv
         let ws = NSWorkspace.shared
-        for app in ws.runningApplications where app.bundleIdentifier == bundleID {
+        let managedHostIDs: Set<String> = [
+            "com.openai.codex",
+            "com.openai.chatgpt",
+            "com.openai.chat"
+        ]
+        let isCodexHost: (NSRunningApplication) -> Bool = { app in
+            managedHostIDs.contains(app.bundleIdentifier ?? "")
+        }
+        let runningHosts = ws.runningApplications.filter(isCodexHost)
+        for app in runningHosts {
             app.terminate()
         }
-        try? await Task.sleep(nanoseconds: 800_000_000)
+
+        // Do not reopen an existing Codex/ChatGPT process: it may keep the old
+        // GPT catalog in memory and simply bring the old window to the front.
+        // Wait for every matching host to exit, then force-terminate only those
+        // exact app instances if macOS did not honor graceful termination.
+        for _ in 0..<20 {
+            if !ws.runningApplications.contains(where: isCodexHost) { break }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        for app in ws.runningApplications where isCodexHost(app) {
+            app.forceTerminate()
+        }
+        for _ in 0..<10 {
+            if !ws.runningApplications.contains(where: isCodexHost) { break }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        let bundleIDs = ["com.openai.codex", "com.openai.chatgpt", "com.openai.chat"]
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
         if !env.isEmpty {
             config.environment = env
         }
         do {
-            let url = ws.urlForApplication(withBundleIdentifier: bundleID)
+            let url = bundleIDs.lazy.compactMap { ws.urlForApplication(withBundleIdentifier: $0) }.first
                 ?? URL(fileURLWithPath: "/Applications/ChatGPT.app")
             guard FileManager.default.fileExists(atPath: url.path) else {
                 log("ChatGPT introuvable.")
@@ -492,7 +560,33 @@ final class AppState: ObservableObject {
     /// third-party provider is routed through a tiny local proxy that translates
     /// `/v1/models` and relays everything else (see Resources/provider-proxy.py).
     private var proxyProcesses: [Int32] = []
-    private let proxyVersion = "2026-08-08-tools-v2"
+
+    /// Wire dialect the adapter must speak for this provider.
+    static func adapterMode(for provider: Provider) -> String {
+        switch provider.id {
+        case "claude": return "anthropic"     // Responses <-> Anthropic Messages
+        case "opencode": return "opencode"    // relay + OpenCode's own credentials
+        default: return "relay"
+        }
+    }
+
+    /// Slug ↔ model pairing for a provider: Codex only ever sees the slug, so
+    /// its native feature contract applies (see `ModelMasquerade`). Providers
+    /// without an adapter keep their real model names.
+    private func modelAliases(for provider: Provider) -> [ModelAlias] {
+        guard ModelMasquerade.masquerades(provider) else {
+            return provider.models.map { ModelAlias(slug: $0, model: $0, listed: true) }
+        }
+        return ModelMasquerade.aliases(for: provider, cacheURL: configStore.paths.modelsCacheJson)
+    }
+
+    /// Restarts a running proxy when the pairing changes — e.g. Codex refreshed
+    /// `models_cache.json` and now exposes different native slugs.
+    private func modelSignature(for provider: Provider) -> String {
+        modelAliases(for: provider).map { "\($0.slug)=\($0.model)" }.joined(separator: ",")
+    }
+
+    private let proxyVersion = "2026-08-22-tool-bridge-masquerade-v1"
 
     func ensureProxiesRunning() {
         for provider in catalog.providers {
@@ -518,18 +612,23 @@ final class AppState: ObservableObject {
                 continue
             }
             let proc = Process()
+            let aliases = modelAliases(for: provider)
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
             proc.arguments = [
                 script.path,
                 String(port),
                 provider.baseURL.absoluteString,
                 provider.displayName,
-                provider.models.joined(separator: ","),
-                provider.id == "claude" ? "anthropic" : "relay",
+                // Slugs Codex sees, then the provider models answering them.
+                aliases.map(\.slug).joined(separator: ","),
+                AppState.adapterMode(for: provider),
                 provider.supportsTools ? "1" : "0",
+                provider.supportsApplyPatch ? "1" : "0",
                 provider.supportsImages ? "1" : "0",
                 provider.supportsWebSearch ? "1" : "0",
-                provider.supportsParallelToolCalls ? "1" : "0"
+                provider.supportsParallelToolCalls ? "1" : "0",
+                provider.supportsCustomTools ? "1" : "0",
+                aliases.map(\.model).joined(separator: ",")
             ]
             var environment = ProcessInfo.processInfo.environment
             environment["AI_PROVIDER_SWITCHER_PROXY_VERSION"] = proxyVersion
@@ -581,9 +680,12 @@ final class AppState: ObservableObject {
             "provider": provider.id,
             "pid": pid,
             "supports_tools": provider.supportsTools,
+            "supports_apply_patch": provider.supportsApplyPatch,
             "supports_images": provider.supportsImages,
             "supports_web_search": provider.supportsWebSearch,
-            "supports_parallel_tools": provider.supportsParallelToolCalls
+            "supports_parallel_tools": provider.supportsParallelToolCalls,
+            "supports_custom_tools": provider.supportsCustomTools,
+            "models": modelSignature(for: provider)
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted]) else { return }
         let url = proxyMetadataURL(for: port)
@@ -597,22 +699,33 @@ final class AppState: ObservableObject {
               let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let pidNumber = metadata["pid"] as? NSNumber,
               let version = metadata["version"] as? String else {
-            return false
+            // Metadata can be lost when App Support is cleaned while the proxy
+            // keeps running. Identify only our exact script + port, never an
+            // arbitrary process occupying the port, then restart it.
+            guard let pid = managedProxyPID(port: port, script: script) else { return false }
+            kill(pid, SIGTERM)
+            return true
         }
         let expected: [String: Any] = [
             "version": proxyVersion,
             "provider": provider.id,
             "supports_tools": provider.supportsTools,
+            "supports_apply_patch": provider.supportsApplyPatch,
             "supports_images": provider.supportsImages,
             "supports_web_search": provider.supportsWebSearch,
-            "supports_parallel_tools": provider.supportsParallelToolCalls
+            "supports_parallel_tools": provider.supportsParallelToolCalls,
+            "supports_custom_tools": provider.supportsCustomTools,
+            "models": modelSignature(for: provider)
         ]
         let stale = version != expected["version"] as? String
+            || (metadata["models"] as? String) != expected["models"] as? String
             || (metadata["provider"] as? String) != expected["provider"] as? String
             || (metadata["supports_tools"] as? Bool) != expected["supports_tools"] as? Bool
+            || (metadata["supports_apply_patch"] as? Bool) != expected["supports_apply_patch"] as? Bool
             || (metadata["supports_images"] as? Bool) != expected["supports_images"] as? Bool
             || (metadata["supports_web_search"] as? Bool) != expected["supports_web_search"] as? Bool
             || (metadata["supports_parallel_tools"] as? Bool) != expected["supports_parallel_tools"] as? Bool
+            || (metadata["supports_custom_tools"] as? Bool) != expected["supports_custom_tools"] as? Bool
         guard stale else { return false }
 
         let pid = pidNumber.int32Value
@@ -634,6 +747,32 @@ final class AppState: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    private func managedProxyPID(port: Int, script: URL) -> Int32? {
+        let command = Process()
+        let output = Pipe()
+        command.executableURL = URL(fileURLWithPath: "/bin/ps")
+        command.arguments = ["-axo", "pid=,command="]
+        command.standardOutput = output
+        do {
+            try command.run()
+            command.waitUntilExit()
+            guard command.terminationStatus == 0 else { return nil }
+            let listing = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let portToken = String(port)
+            for line in listing.split(separator: "\\n") {
+                let fields = line.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1)
+                guard fields.count == 2,
+                      fields[1].contains(script.path),
+                      fields[1].split(whereSeparator: { $0 == " " || $0 == "\t" }).contains(Substring(portToken)),
+                      let pid = Int32(fields[0]) else { continue }
+                return pid
+            }
+        } catch {
+            return nil
+        }
+        return nil
     }
 
     private func isPortOpen(_ port: Int) -> Bool {
@@ -690,29 +829,56 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Keeps `config.toml`, the sidecar and the panel consistent after Codex has
+    /// written to the file itself.
+    ///
+    /// The Desktop picker only writes `model`. Since a routed provider is exposed
+    /// under Codex's own slugs, that value cannot identify the provider anymore —
+    /// `model_provider` and the sidecar are the source of truth, and the slug is
+    /// resolved back to the real provider model.
     func fixModelProviderFromConfig() async {
-        guard !screenshotMode,
+        guard !screenshotMode, let router,
               let model = configStore.topLevelValue(of: "model"),
               !model.isEmpty else { return }
-        let provider = catalog.providers.first { !$0.isReserved && $0.models.contains(model) }
-        let current = configStore.topLevelValue(of: "model_provider")
-        if let provider {
-            if current != provider.id {
-                if !providersInstalled { installProviders(activeProviderID: provider.id) }
-                do {
-                    _ = try configStore.applyOverride(provider: provider, model: model)
-                    log("Provider auto-synchronisé : \(provider.displayName) (modèle \(model)).")
-                } catch {
-                    log("Sync config échouée: \(error.localizedDescription)")
-                }
-            }
-        } else if let current, current != "openai" {
+        let configProvider = configStore.topLevelValue(of: "model_provider")
+        let state = configStore.overrideState()
+
+        // Codex (or the user) put the native provider back while an override was
+        // still recorded: honor the file and return to native.
+        if configProvider == "openai" || configProvider == nil {
+            guard state != nil else { return }
             do {
                 _ = try configStore.revertOverride()
-                log("Retour au natif : \(model).")
+                snapshot = try await router.setActive(
+                    providerID: "openai",
+                    model: catalog[id: "openai"]?.defaultModel ?? model
+                )
+                log("Retour au natif détecté dans config.toml : \(model).")
             } catch {
                 log("Revert config échoué: \(error.localizedDescription)")
             }
+            return
+        }
+
+        guard let providerID = configProvider,
+              let provider = catalog[id: providerID],
+              provider.id != "openai" else { return }
+        let resolved = ModelMasquerade.model(
+            for: model,
+            provider: provider,
+            cacheURL: configStore.paths.modelsCacheJson
+        )
+        do {
+            if state?.provider != provider.id || state?.model != resolved || state?.exposedModel != model {
+                if !providersInstalled { installProviders(activeProviderID: provider.id) }
+                _ = try configStore.applyOverride(provider: provider, model: resolved)
+            }
+            if snapshot.activeProviderID != provider.id || snapshot.activeModel != resolved {
+                snapshot = try await router.setActive(providerID: provider.id, model: resolved)
+                log("Sélection synchronisée depuis Codex : \(provider.displayName) · \(resolved).")
+            }
+        } catch {
+            log("Sync config échouée: \(error.localizedDescription)")
         }
     }
 

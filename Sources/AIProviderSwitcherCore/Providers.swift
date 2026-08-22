@@ -27,9 +27,16 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
     public let authScheme: AuthScheme
     public let supportsResponses: Bool     // claimed; verified at runtime by CompatibilityChecker
     public let supportsTools: Bool         // function tools can be forwarded by the adapter
+    public let supportsApplyPatch: Bool    // Codex's apply_patch tool (any flavor)
     public let supportsImages: Bool        // provider/model accepts image input
-    public let supportsWebSearch: Bool     // provider/model declares web-search capability
+    public let supportsWebSearch: Bool     // provider/model can really run a web search
     public let supportsParallelToolCalls: Bool
+    /// True only for providers implementing Codex's **native** tool flavors
+    /// (freeform custom tools such as `apply_patch`/`exec`, `local_shell`,
+    /// `code_mode_only`). That wire contract is OpenAI-specific; for every other
+    /// provider the adapter bridges those tools to function tools, so the
+    /// catalog must advertise the `function` flavor instead.
+    public let supportsCustomTools: Bool
     public let requiresKey: Bool
     public let configProviderIDDirect: String // model_provider id used in direct (no-proxy) config
 
@@ -44,9 +51,11 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
         authScheme: AuthScheme = .bearer,
         supportsResponses: Bool = true,
         supportsTools: Bool = false,
+        supportsApplyPatch: Bool = false,
         supportsImages: Bool = false,
         supportsWebSearch: Bool = false,
         supportsParallelToolCalls: Bool = false,
+        supportsCustomTools: Bool = false,
         requiresKey: Bool = true,
         configProviderIDDirect: String
     ) {
@@ -61,9 +70,11 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
         self.authScheme = authScheme
         self.supportsResponses = supportsResponses
         self.supportsTools = supportsTools
+        self.supportsApplyPatch = supportsApplyPatch
         self.supportsImages = supportsImages
         self.supportsWebSearch = supportsWebSearch
         self.supportsParallelToolCalls = supportsParallelToolCalls
+        self.supportsCustomTools = supportsCustomTools
         self.requiresKey = requiresKey
         self.configProviderIDDirect = configProviderIDDirect
     }
@@ -90,9 +101,12 @@ public struct ProviderCatalog: Sendable, Equatable {
                      "gpt-5.3-codex-spark", "gpt-5.5"],
             defaultModel: "gpt-5.6",
             supportsTools: true,
+            supportsApplyPatch: true,
             supportsImages: true,
             supportsWebSearch: true,
             supportsParallelToolCalls: true,
+            // Only OpenAI speaks Codex's native freeform/custom tool wire format.
+            supportsCustomTools: true,
             requiresKey: false,
             configProviderIDDirect: "openai"
         ),
@@ -104,7 +118,11 @@ public struct ProviderCatalog: Sendable, Equatable {
             environmentVariable: "DEEPSEEK_API_KEY",
             models: ["deepseek-v4-flash", "deepseek-v4-pro"],
             defaultModel: "deepseek-v4-flash",
+            // Full agentic set: shell, apply_patch, plan updates and MCP tools
+            // all reach the model as function tools through the adapter bridge.
             supportsTools: true,
+            supportsApplyPatch: true,
+            supportsParallelToolCalls: true,
             configProviderIDDirect: "deepseek"
         ),
         Provider(
@@ -115,7 +133,10 @@ public struct ProviderCatalog: Sendable, Equatable {
             environmentVariable: "ZAI_API_KEY",
             models: ["glm-5.2", "glm-4.6", "glm-4.5"],
             defaultModel: "glm-5.2",
+            // Same bridged agentic set as DeepSeek.
             supportsTools: true,
+            supportsApplyPatch: true,
+            supportsParallelToolCalls: true,
             configProviderIDDirect: "glm"
         ),
         Provider(
@@ -127,7 +148,10 @@ public struct ProviderCatalog: Sendable, Equatable {
             models: ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol", "openai/gpt-5.6-terra",
                      "deepseek/deepseek-v4-flash", "z-ai/glm-5.2"],
             defaultModel: "openai/gpt-5.6-luna",
+            // OpenRouter exposes many upstream function-tool contracts, but not
+            // one universal Codex custom-tool contract: the bridge normalizes it.
             supportsTools: true,
+            supportsApplyPatch: true,
             supportsImages: true,
             supportsParallelToolCalls: true,
             configProviderIDDirect: "openrouter"
@@ -141,9 +165,34 @@ public struct ProviderCatalog: Sendable, Equatable {
             models: ["gpt-oss:120b", "gpt-oss:20b", "qwen3-coder", "llama3.3"],
             defaultModel: "gpt-oss:120b",
             authScheme: .none,
+            // Ollama is a Codex built-in: it has no adapter proxy, so the
+            // catalog must advertise the function flavor of every tool. Local
+            // models are single-call oriented, hence no parallel tool calls.
             supportsTools: true,
+            supportsApplyPatch: true,
             requiresKey: false,
             configProviderIDDirect: "ollama"
+        ),
+        Provider(
+            id: "opencode",
+            displayName: "OpenCode Zen",
+            // The OpenCode CLI is an agent, not an HTTP backend. What it talks
+            // to is OpenCode Zen, an OpenAI-compatible gateway that also serves
+            // /v1/responses. The free tier runs under the documented `public`
+            // key, so no key to enter; the adapter prefers OpenCode's own
+            // credential when `opencode auth login` stored one.
+            baseURL: URL(string: "https://opencode.ai/zen/v1")!,
+            environmentVariable: "",
+            // Free tier, as listed by `opencode models opencode`.
+            models: ["big-pickle", "hy3-free", "mimo-v2.5-free",
+                     "muse-spark-1.2-contributor-free", "nemotron-3-ultra-free",
+                     "nemotron-3.5-lightning-free", "x-preview-f-free"],
+            defaultModel: "big-pickle",
+            supportsTools: true,
+            supportsApplyPatch: true,
+            // Free-tier models are small: no image input, one tool call at a time.
+            requiresKey: false,
+            configProviderIDDirect: "opencode"
         ),
         Provider(
             id: "claude",
@@ -159,8 +208,14 @@ public struct ProviderCatalog: Sendable, Equatable {
                      "claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"],
             // haiku-4-5: seul modèle non rate-limité sur le compte actuel.
             defaultModel: "claude-haiku-4-5",
+            // The adapter bridges every Codex tool flavor to Anthropic tools and
+            // restores the original items, and maps Codex's hosted web_search to
+            // Anthropic's own server-side web search.
             supportsTools: true,
+            supportsApplyPatch: true,
             supportsImages: true,
+            supportsWebSearch: true,
+            supportsParallelToolCalls: true,
             requiresKey: false,
             configProviderIDDirect: "claude"
         )

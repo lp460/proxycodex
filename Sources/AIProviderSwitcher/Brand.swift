@@ -11,6 +11,7 @@ extension Provider {
         case "openrouter": return .purple
         case "ollama": return .brown
         case "claude": return .red
+        case "opencode": return .indigo
         default: return .accentColor
         }
     }
@@ -23,6 +24,7 @@ extension Provider {
         case "openrouter": return "shuffle"
         case "ollama": return "hare.fill"
         case "claude": return "bubble.left.and.bubble.right.fill"
+        case "opencode": return "chevron.left.forwardslash.chevron.right"
         default: return "key.fill"
         }
     }

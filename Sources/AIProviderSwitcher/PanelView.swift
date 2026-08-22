@@ -126,7 +126,32 @@ struct PanelView: View {
             Text("Un clic sur un fournisseur : config appliquée + ChatGPT/Codex relancé avec les clés.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+            openCodeStatus
         }
+    }
+
+    /// OpenCode is detected, not required: the Zen gateway it talks to answers
+    /// without the CLI, so the line states where models and credential come from.
+    private var openCodeStatus: some View {
+        HStack(spacing: 5) {
+            Image(systemName: state.openCode == nil ? "questionmark.circle" : "checkmark.seal.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(state.openCode == nil ? Color.secondary : Color.green)
+            Text(openCodeStatusText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var openCodeStatusText: String {
+        guard let install = state.openCode else {
+            return "OpenCode CLI non détecté · passerelle Zen publique (palier gratuit)"
+        }
+        let version = install.version.map { "CLI \($0)" } ?? "CLI"
+        return install.hasZenCredential
+            ? "OpenCode \(version) détecté · clé Zen d’OpenCode réutilisée"
+            : "OpenCode \(version) détecté · palier gratuit (clé publique)"
     }
 
     /// Model selector for the active provider. The Desktop picker is fed by
@@ -145,6 +170,12 @@ struct PanelView: View {
             .pickerStyle(.menu)
             .labelsHidden()
             .disabled(state.isScreenshotMode)
+            if let exposed = state.exposedModel {
+                Text("Codex voit « \(exposed) » : contrat natif complet (outils, MCP, plugins).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 

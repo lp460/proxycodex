@@ -46,12 +46,209 @@ final class CodexConfigGeneratorTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let model = try XCTUnwrap((object["models"] as? [[String: Any]])?.first)
 
+        // Exposed under one of Codex's own slugs, with the native apply_patch
+        // flavor: the adapter bridges it and restores the item.
+        XCTAssertEqual(model["slug"] as? String, "gpt-5.6-sol")
         XCTAssertEqual(model["apply_patch_tool_type"] as? String, "freeform")
-        XCTAssertTrue(model["web_search_tool_type"] is NSNull)
-        XCTAssertEqual(model["supports_parallel_tool_calls"] as? Bool, false)
+        XCTAssertEqual(model["shell_type"] as? String, "shell_command")
+        XCTAssertNil(model["tool_mode"])
+        XCTAssertNil(model["web_search_tool_type"])
+        XCTAssertEqual(model["supports_parallel_tool_calls"] as? Bool, true)
         XCTAssertEqual(model["supports_search_tool"] as? Bool, false)
-        XCTAssertEqual(model["tool_mode"] as? String, "code_mode_only")
         XCTAssertTrue((model["experimental_supported_tools"] as? [Any])?.isEmpty == true)
+        // Plugins, MCP servers and skills are executed by Codex itself, so their
+        // instructions must reach third-party providers too.
+        XCTAssertEqual(model["include_plugin_usage_instructions"] as? Bool, true)
+        XCTAssertEqual(model["include_apps_usage_instructions"] as? Bool, true)
+        XCTAssertEqual(model["include_skills_usage_instructions"] as? Bool, true)
+    }
+
+    /// A routed provider must look like one of Codex's own models: the metadata
+    /// Codex fetched for that slug is reused as-is, so its full feature contract
+    /// applies. Only the two OpenAI-internal wire switches are neutralized.
+    func testMasqueradeCatalogCopiesCodexNativeMetadata() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aps-native-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cache: [String: Any] = ["models": [[
+            "slug": "gpt-5.6-sol",
+            "display_name": "GPT-5.6-Sol",
+            "description": "Latest frontier agentic coding model.",
+            "visibility": "list",
+            "supported_in_api": true,
+            "multi_agent_version": "v2",
+            "tool_mode": "code_mode_only",
+            "use_responses_lite": true,
+            "context_window": 272000,
+            "model_messages": ["instructions_template": "You are Codex"],
+            "supported_reasoning_levels": [["effort": "low", "description": ""],
+                                           ["effort": "ultra", "description": ""]]
+        ]]]
+        try JSONSerialization.data(withJSONObject: cache).write(to: url, options: [.atomic])
+
+        let json = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "glm",
+            cacheURL: url
+        )
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let model = try XCTUnwrap((object["models"] as? [[String: Any]])?.first)
+        let glm = try XCTUnwrap(ProviderCatalog.default[id: "glm"])
+
+        XCTAssertEqual(model["slug"] as? String, "gpt-5.6-sol")
+        // Native metadata carried over verbatim.
+        XCTAssertEqual(model["multi_agent_version"] as? String, "v2")
+        XCTAssertEqual(model["context_window"] as? Int, 272000)
+        XCTAssertNotNil(model["model_messages"])
+        let efforts = (model["supported_reasoning_levels"] as? [[String: Any]])?
+            .compactMap { $0["effort"] as? String }
+        XCTAssertEqual(efforts, ["low", "ultra"])   // the adapter clamps the effort
+        // Neutralized: an OpenAI-internal wire shape, and a tool mode that would
+        // replace the classic tool set (shell, apply_patch, MCP) with code mode.
+        XCTAssertEqual(model["use_responses_lite"] as? Bool, false)
+        XCTAssertNil(model["tool_mode"])
+        // The user still sees which provider and model actually answer.
+        XCTAssertEqual(model["display_name"] as? String, "GPT-5.6-Sol · GLM (Z.ai)")
+        XCTAssertEqual((model["description"] as? String)?.contains(glm.defaultModel), true)
+    }
+
+    /// Ollama is a Codex built-in with no adapter to rewrite the model name, so
+    /// it keeps its real slugs and the portable tool flavor.
+    func testOllamaKeepsRealSlugsAndPortableCapabilities() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aps-ollama-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cache: [String: Any] = ["models": [[
+            "slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "description": "",
+            "visibility": "list", "supported_in_api": true, "multi_agent_version": "v2",
+            "supported_reasoning_levels": [["effort": "ultra", "description": ""]]
+        ]]]
+        try JSONSerialization.data(withJSONObject: cache).write(to: url, options: [.atomic])
+
+        let json = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "ollama",
+            cacheURL: url
+        )
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+        let ollama = try XCTUnwrap(ProviderCatalog.default[id: "ollama"])
+
+        XCTAssertEqual(models.map { $0["slug"] as? String }, ollama.models)
+        XCTAssertEqual(models.first?["apply_patch_tool_type"] as? String, "function")
+        XCTAssertNil(models.first?["multi_agent_version"])
+        let efforts = (models.first?["supported_reasoning_levels"] as? [[String: Any]])?
+            .compactMap { $0["effort"] as? String }
+        XCTAssertEqual(efforts, ["low", "medium", "high"])
+    }
+
+    func testEveryProviderGetsTheFullToolSetInAPortableFlavor() {
+        let openAI = ProviderCatalog.default[id: "openai"]!
+        XCTAssertTrue(openAI.supportsTools)
+        XCTAssertTrue(openAI.supportsApplyPatch)
+        XCTAssertTrue(openAI.supportsParallelToolCalls)
+        // Only OpenAI speaks Codex's native freeform/custom tool wire format.
+        XCTAssertTrue(openAI.supportsCustomTools)
+
+        for provider in ProviderCatalog.default.providers where provider.id != "openai" {
+            // Same agentic feature set everywhere: shell, apply_patch, plan
+            // updates and MCP tools, bridged to function tools by the adapter.
+            XCTAssertTrue(provider.supportsTools, provider.id)
+            XCTAssertTrue(provider.supportsApplyPatch, provider.id)
+            XCTAssertFalse(provider.supportsCustomTools, provider.id)
+        }
+    }
+
+    func testCatalogOmitsNullValuesFromCacheTemplate() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aps-null-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cache: [String: Any] = [
+            "models": [[
+                "slug": "cached",
+                "display_name": "Cached",
+                "description": "",
+                "visibility": "list",
+                "supported_in_api": true,
+                "upgrade": NSNull(),
+                "web_search_tool_type": NSNull(),
+                "nested": ["optional": NSNull()]
+            ]]
+        ]
+        try JSONSerialization.data(withJSONObject: cache).write(to: url, options: [.atomic])
+
+        let json = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "deepseek",
+            cacheURL: url
+        )
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let model = try XCTUnwrap((object["models"] as? [[String: Any]])?.first)
+
+        XCTAssertNil(model["upgrade"])
+        XCTAssertNil(model["web_search_tool_type"])
+        XCTAssertNil((model["nested"] as? [String: Any])?["optional"])
+        XCTAssertFalse(json.contains(": null"))
+    }
+
+    func testClaudeCatalogIsExposedUnderCodexNativeSlugs() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aps-claude-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let json = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "claude",
+            cacheURL: url
+        )
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+        let claude = try XCTUnwrap(ProviderCatalog.default[id: "claude"])
+        let aliases = ModelMasquerade.aliases(for: claude, cacheURL: url)
+
+        XCTAssertEqual(models.map { $0["slug"] as? String }, aliases.map { $0.slug })
+        // No Claude model name is exposed to Codex as a slug…
+        XCTAssertFalse(models.contains { ($0["slug"] as? String)?.hasPrefix("claude-") == true })
+        // …but every entry says which one really answers, and only Claude models.
+        XCTAssertTrue(models.allSatisfy { entry in
+            claude.models.contains { (entry["description"] as? String)?.contains($0) == true }
+        })
+        XCTAssertTrue(models.allSatisfy {
+            ($0["display_name"] as? String)?.hasSuffix(" · Claude Code") == true
+        })
+        // Slugs Codex uses internally stay hidden from the picker.
+        XCTAssertEqual(models.filter { ($0["visibility"] as? String) == "hide" }.count,
+                       aliases.filter { !$0.listed }.count)
+    }
+
+    func testGeneratedCatalogDetectionRecognizesPreMasqueradeCatalogs() throws {
+        let claude = try XCTUnwrap(ProviderCatalog.default[id: "claude"])
+        let legacyEntries: [[String: Any]] = claude.models.map { model in
+            [
+                "slug": model,
+                "display_name": "\(claude.displayName) · \(model)",
+                "description": "\(claude.displayName) model \(model).",
+                "visibility": "list",
+                "supported_in_api": true
+            ]
+        }
+        let generated = try JSONSerialization.data(withJSONObject: ["models": legacyEntries])
+        XCTAssertTrue(CodexConfigGenerator.isGeneratedCatalog(
+            generated,
+            providers: ProviderCatalog.default.providers
+        ))
+
+        let custom = """
+        {"models":[{"slug":"custom","display_name":"Custom · custom","description":"Custom model custom.","visibility":"list","supported_in_api":true}]}
+        """
+        XCTAssertFalse(CodexConfigGenerator.isGeneratedCatalog(
+            try XCTUnwrap(custom.data(using: .utf8)),
+            providers: ProviderCatalog.default.providers
+        ))
     }
 
     func testContainsKeyLikeFieldDetectsSecrets() {

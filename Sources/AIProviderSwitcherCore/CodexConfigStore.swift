@@ -44,8 +44,27 @@ public struct OverrideState: Codable, Equatable, Sendable {
     public let nativeModel: String?          // original top-level `model` value (nil if absent)
     public let nativeModelProvider: String?  // original top-level `model_provider` value (nil ⇒ openai default)
     public let provider: String
-    public let model: String
+    public let model: String                 // real provider model (what the panel shows)
+    /// Slug written to `config.toml`, i.e. what Codex believes it is talking to.
+    /// Absent in states written before model masquerading existed.
+    public let exposedModel: String?
     public let appliedAt: Date
+
+    public init(
+        nativeModel: String?,
+        nativeModelProvider: String?,
+        provider: String,
+        model: String,
+        exposedModel: String? = nil,
+        appliedAt: Date
+    ) {
+        self.nativeModel = nativeModel
+        self.nativeModelProvider = nativeModelProvider
+        self.provider = provider
+        self.model = model
+        self.exposedModel = exposedModel
+        self.appliedAt = appliedAt
+    }
 }
 
 public struct InstallReport: Equatable, Sendable {
@@ -134,7 +153,13 @@ public final class CodexConfigStore: Sendable {
             // Profile file for every selectable provider (OpenAI = native, no profile).
             if provider.id != "openai" {
                 let url = paths.codexHome.appendingPathComponent("\(provider.id).config.toml")
-                try CodexConfigGenerator.profileFile(model: provider.defaultModel, providerID: provider.id)
+                // Codex CLI must see the same masqueraded slug as the Desktop.
+                let exposed = ModelMasquerade.slug(
+                    for: provider.defaultModel,
+                    provider: provider,
+                    cacheURL: paths.modelsCacheJson
+                )
+                try CodexConfigGenerator.profileFile(model: exposed, providerID: provider.id)
                     .write(to: url, atomically: true, encoding: .utf8)
                 profiles.append(provider.id)
             }
@@ -167,10 +192,27 @@ public final class CodexConfigStore: Sendable {
         var catalogInstalled = false
         let active = providers.first { $0.id == activeProviderID }
         if let active, !active.isReserved || active.id == "ollama" {
-            let hadUserCatalog = config.contains("model_catalog_json")
-                && !config.contains("# >>> provider-switcher catalog >>>")
+            // Only the explicit managed block proves ownership. A user may
+            // intentionally point Codex at ~/.codex/catalog.json, so the path
+            // alone must never authorize overwriting that file.
+            let catalogMarker = "# >>> provider-switcher catalog >>>"
+            let existingCatalogPath = topLevelValue(of: "model_catalog_json", in: config)
+                ?? catalogAssignmentValue(in: config)
+            let legacyGeneratedCatalog = catalogAssignmentValue(in: config) == paths.catalogJson.path
+                && (try? Data(contentsOf: paths.catalogJson)).map {
+                    CodexConfigGenerator.isGeneratedCatalog($0, providers: providers)
+                } == true
+            let appOwnsCatalog = config.contains(catalogMarker) || legacyGeneratedCatalog
+            let hadUserCatalog = existingCatalogPath != nil && !appOwnsCatalog
             config = removeManagedBlocksNamed("catalog", in: config)
-            if !hadUserCatalog && !config.contains("model_catalog_json") {
+            if appOwnsCatalog {
+                config = removeTopLevelKey("model_catalog_json", in: config)
+                // Older builds could append the managed assignment after a
+                // TOML section. Once ownership is proven by the marker or a
+                // generated legacy file, remove it wherever it occurs.
+                config = removeCatalogAssignment(in: config)
+            }
+            if !hadUserCatalog && topLevelValue(of: "model_catalog_json", in: config) == nil {
                 let json = CodexConfigGenerator.catalogJSON(
                     providers: providers,
                     activeProviderID: activeProviderID,
@@ -184,10 +226,24 @@ public final class CodexConfigStore: Sendable {
             }
         } else {
             // Native OpenAI: remove only the catalog managed by this app.
-            let hadUserCatalog = config.contains("model_catalog_json")
-                && !config.contains("# >>> provider-switcher catalog >>>")
-            let hadManagedCatalog = config.contains("# >>> provider-switcher catalog >>>")
+            let catalogMarker = "# >>> provider-switcher catalog >>>"
+            let existingCatalogPath = topLevelValue(of: "model_catalog_json", in: config)
+                ?? catalogAssignmentValue(in: config)
+            let legacyGeneratedCatalog = catalogAssignmentValue(in: config) == paths.catalogJson.path
+                && (try? Data(contentsOf: paths.catalogJson)).map {
+                    CodexConfigGenerator.isGeneratedCatalog($0, providers: ProviderCatalog.default.providers)
+                } == true
+            let appOwnsCatalog = config.contains(catalogMarker) || legacyGeneratedCatalog
+            let hadUserCatalog = existingCatalogPath != nil && !appOwnsCatalog
+            let hadManagedCatalog = appOwnsCatalog
             config = removeManagedBlocksNamed("catalog", in: config)
+            if appOwnsCatalog {
+                config = removeTopLevelKey("model_catalog_json", in: config)
+                // Older builds could append the managed assignment after a
+                // TOML section. Once ownership is proven by the marker or a
+                // generated legacy file, remove it wherever it occurs.
+                config = removeCatalogAssignment(in: config)
+            }
             if hadManagedCatalog, FileManager.default.fileExists(atPath: paths.catalogJson.path) {
                 try? FileManager.default.removeItem(at: paths.catalogJson)
             }
@@ -278,7 +334,11 @@ public final class CodexConfigStore: Sendable {
         config = removeTopLevelKey("model", in: config)
         config = removeTopLevelKey("model_provider", in: config)
 
-        let body = "model = \(quote(model))\nmodel_provider = \(quote(provider.id))\n"
+        // Codex reads the slug, not the provider's real model name: a routed
+        // provider is exposed under one of Codex's own slugs so its full native
+        // feature contract applies (see ModelMasquerade).
+        let exposed = ModelMasquerade.slug(for: model, provider: provider, cacheURL: paths.modelsCacheJson)
+        let body = "model = \(quote(exposed))\nmodel_provider = \(quote(provider.id))\n"
         config = prependBlock(config, wrappedBlock(name: "override", body: body))
 
         try backup()
@@ -289,6 +349,7 @@ public final class CodexConfigStore: Sendable {
             nativeModelProvider: nativeProvider,
             provider: provider.id,
             model: model,
+            exposedModel: exposed,
             appliedAt: Date()
         )
         try JSONEncoder().encode(state).write(to: paths.stateJson, options: [.atomic])
@@ -297,17 +358,48 @@ public final class CodexConfigStore: Sendable {
     }
 
     /// Restores the native top-level model/model_provider and clears the sidecar.
+    ///
+    /// Older builds could write the managed override block before the sidecar
+    /// state file. In that case, OpenAI must still be able to remove the stale
+    /// managed block instead of returning early and leaving DeepSeek active.
     @discardableResult
-    public func revertOverride() throws -> Bool {
-        guard let state = overrideState() else { return false }
+    public func revertOverride(allowLegacyUnmarked: Bool = false) throws -> Bool {
+        let state = overrideState()
         var config = try readConfig()
+        let hadManagedBlock = config.contains("# >>> \(beginToken) override >>>")
+        let currentModel = topLevelValue(of: "model", in: config)
+        let currentProvider = topLevelValue(of: "model_provider", in: config)
+        let hadLegacyUnmarkedOverride = allowLegacyUnmarked && state == nil && !hadManagedBlock
+            && currentProvider.map { providerID in
+                guard providerID != "openai",
+                      let provider = ProviderCatalog.default[id: providerID],
+                      let currentModel else { return false }
+                if provider.models.contains(currentModel) { return true }
+                // A masqueraded selection stores one of Codex's own slugs in
+                // `model`, so the real model name is not in config.toml.
+                return ModelMasquerade.masquerades(provider)
+                    && ModelMasquerade.aliases(for: provider, cacheURL: paths.modelsCacheJson)
+                        .contains { $0.slug == currentModel }
+            } == true
+        guard state != nil || hadManagedBlock || hadLegacyUnmarkedOverride else { return false }
+
         config = removeOverrideBlock(in: config)
         config = removeTopLevelKey("model", in: config)
         config = removeTopLevelKey("model_provider", in: config)
 
         var restore: [String] = []
-        if let m = state.nativeModel { restore.append("model = \(quote(m))") }
-        if let p = state.nativeModelProvider { restore.append("model_provider = \(quote(p))") }
+        if let m = state?.nativeModel {
+            restore.append("model = \(quote(m))")
+        } else if hadManagedBlock || hadLegacyUnmarkedOverride {
+            // Safe fallback for overrides written by pre-sidecar builds.
+            let nativeModel = ProviderCatalog.default[id: "openai"]?.defaultModel ?? "gpt-5.6"
+            restore.append("model = \(quote(nativeModel))")
+        }
+        if let p = state?.nativeModelProvider {
+            restore.append("model_provider = \(quote(p))")
+        } else if hadManagedBlock || hadLegacyUnmarkedOverride {
+            restore.append("model_provider = \"openai\"")
+        }
         if !restore.isEmpty {
             config = prependBlock(config, restore.joined(separator: "\n") + "\n")
         }
@@ -355,6 +447,29 @@ public final class CodexConfigStore: Sendable {
             }
         }
         return nil
+    }
+
+    /// Finds a quoted assignment anywhere in the file. Used only for
+    /// migrating legacy app-owned catalog entries that were written after a
+    /// TOML section by older versions.
+    private func catalogAssignmentValue(in config: String) -> String? {
+        for line in config.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.hasPrefix("#"), trimmed.hasPrefix("model_catalog_json") else { continue }
+            let parts = trimmed.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "model_catalog_json" else { continue }
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+            guard value.count >= 2, value.first == "\"", value.last == "\"" else { continue }
+            return String(value.dropFirst().dropLast())
+        }
+        return nil
+    }
+
+    private func removeCatalogAssignment(in config: String) -> String {
+        config.components(separatedBy: "\n").filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("#") || !trimmed.hasPrefix("model_catalog_json")
+        }.joined(separator: "\n")
     }
 
     /// Removes top-level `key = ...` lines (before the first `[section]`).
@@ -426,8 +541,10 @@ public final class CodexConfigStore: Sendable {
                     }
                 }
             }
+            // A user-owned `web_search` must win: inserting a second assignment
+            // in the same table makes Codex reject config.toml entirely.
             let ownsWebSearch = lines[(toolsIndex + 1)..<end].contains {
-                $0.range(of: #"^\\s*web_search\\s*="#, options: .regularExpression) != nil
+                $0.range(of: #"^\s*web_search\s*="#, options: .regularExpression) != nil
             }
             guard !ownsWebSearch else { return clean }
             lines.insert("# >>> \(beginToken) tools >>>", at: toolsIndex + 1)
