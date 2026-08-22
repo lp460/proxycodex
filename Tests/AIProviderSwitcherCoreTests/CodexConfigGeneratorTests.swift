@@ -46,10 +46,10 @@ final class CodexConfigGeneratorTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let model = try XCTUnwrap((object["models"] as? [[String: Any]])?.first)
 
-        // Exposed under one of Codex's own slugs, with the native apply_patch
-        // flavor: the adapter bridges it and restores the item.
-        XCTAssertEqual(model["slug"] as? String, "gpt-5.6-sol")
-        XCTAssertEqual(model["apply_patch_tool_type"] as? String, "freeform")
+        // No models_cache.json here, so masquerading is off: real slug and the
+        // portable tool flavor, which is the safe fallback.
+        XCTAssertEqual(model["slug"] as? String, "deepseek-v4-flash")
+        XCTAssertEqual(model["apply_patch_tool_type"] as? String, "function")
         XCTAssertEqual(model["shell_type"] as? String, "shell_command")
         XCTAssertNil(model["tool_mode"])
         XCTAssertNil(model["web_search_tool_type"])
@@ -111,6 +111,57 @@ final class CodexConfigGeneratorTests: XCTestCase {
         // The user still sees which provider and model actually answer.
         XCTAssertEqual(model["display_name"] as? String, "GPT-5.6-Sol · GLM (Z.ai)")
         XCTAssertEqual((model["description"] as? String)?.contains(glm.defaultModel), true)
+    }
+
+    /// Regression: an entry Codex could not parse made it discard the entire
+    /// `config.toml` — providers, MCP servers, sandbox policy, everything. Every
+    /// masqueraded entry must therefore carry the full field set of the cache
+    /// entry it came from.
+    func testMasqueradedEntriesCarryEveryFieldCodexRequires() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aps-complete-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        func entry(_ slug: String, _ visibility: String) -> [String: Any] {
+            [
+                "slug": slug, "display_name": slug.uppercased(), "description": "",
+                "visibility": visibility, "supported_in_api": true,
+                "support_verbosity": true, "default_verbosity": "low",
+                "default_reasoning_summary": "none", "context_window": 272000,
+                "shell_type": "shell_command", "priority": 1
+            ]
+        }
+        try JSONSerialization.data(withJSONObject: ["models": [
+            entry("gpt-5.6-sol", "list"), entry("gpt-5.6-terra", "list"), entry("gpt-reserve", "hide")
+        ]]).write(to: url, options: [.atomic])
+
+        // claude declares more models than this cache has slugs.
+        let json = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers, activeProviderID: "claude", cacheURL: url)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: try XCTUnwrap(json.data(using: .utf8))) as? [String: Any])
+        let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+
+        XCTAssertEqual(models.count, 3, "no slug may be invented to pad the list")
+        for model in models {
+            for field in ["support_verbosity", "default_verbosity", "default_reasoning_summary",
+                          "context_window", "shell_type", "visibility", "supported_in_api"] {
+                XCTAssertNotNil(model[field], "\(model["slug"] ?? "?") lacks \(field)")
+            }
+        }
+    }
+
+    func testIncompleteCatalogIsRefusedBeforeItReachesCodex() {
+        let native = ["gpt-5.6-sol": ["slug": "gpt-5.6-sol", "support_verbosity": true,
+                                      "visibility": "list"] as [String: Any]]
+        XCTAssertTrue(CodexConfigGenerator.catalogIsComplete(
+            [["slug": "gpt-5.6-sol", "support_verbosity": true, "visibility": "list"]],
+            comparedTo: native))
+        XCTAssertFalse(CodexConfigGenerator.catalogIsComplete(
+            [["slug": "gpt-5.6-sol", "visibility": "list"]], comparedTo: native))
+        // Fields Codex treats as optional may legitimately be absent.
+        XCTAssertTrue(CodexConfigGenerator.catalogIsComplete(
+            [["slug": "gpt-5.6-sol", "support_verbosity": true, "visibility": "list"]],
+            comparedTo: ["a": native["gpt-5.6-sol"]!.merging(["tool_mode": "code_mode_only"]) { $1 }]))
     }
 
     /// Ollama is a Codex built-in with no adapter to rewrite the model name, so
@@ -198,6 +249,15 @@ final class CodexConfigGeneratorTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("aps-claude-cache-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }
+        // Masquerading mirrors the slugs Codex fetched, so a cache is required.
+        try JSONSerialization.data(withJSONObject: ["models": [
+            ["slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list",
+             "supported_in_api": true, "support_verbosity": true],
+            ["slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list",
+             "supported_in_api": true, "support_verbosity": true],
+            ["slug": "codex-auto-review", "display_name": "Codex Auto Review",
+             "visibility": "hide", "supported_in_api": true, "support_verbosity": true]
+        ]]).write(to: url, options: [.atomic])
 
         let json = CodexConfigGenerator.catalogJSON(
             providers: ProviderCatalog.default.providers,

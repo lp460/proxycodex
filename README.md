@@ -69,7 +69,9 @@ gpt-5.6-sol  ──────────►  model = "gpt-5.6-sol"  ──►
 ```
 
 - Le panneau continue d’afficher les vrais modèles (`claude-haiku-4-5`) ; il indique en légende le slug vu par Codex.
-- Le modèle par défaut du provider prend le slug principal (`gpt-5.6-sol`), puis chaque modèle reçoit le suivant : le sélecteur affiche autant d’entrées que le provider a de modèles.
+- Les slugs proviennent **exclusivement** de `models_cache.json` : rien n’est inventé. Sans ce fichier, le masquage est désactivé et les vrais noms de modèles sont utilisés.
+- Le modèle par défaut du provider prend le slug principal (`gpt-5.6-sol`), puis chaque modèle reçoit le suivant. La liste de slugs de Codex étant finie, un provider déclarant plus de modèles que Codex n’a de slugs n’expose que les premiers ; le sélecteur n’affiche que ceux-là.
+- Avant écriture, le catalogue est vérifié champ par champ contre les entrées du cache. S’il manque quoi que ce soit, il n’est pas écrit et l’application retombe sur les vrais slugs — un catalogue invalide ne dégrade pas le provider, il fait **rejeter tout `config.toml`** par Codex : providers, serveurs MCP, sandbox, tout.
 - Les slugs internes de Codex (`gpt-reserve`, `codex-auto-review`) sont mappés sur le modèle par défaut, pour que les requêtes internes (revue automatique, délégation) aboutissent aussi.
 - Le nom affiché reste explicite : `GPT-5.6-Sol · Claude Code`, description `Claude Code · claude-haiku-4-5`. Le slug seul est masqué, pas l’information.
 - `~/.codex/<provider>.config.toml` utilise le même slug, donc Codex CLI (`--profile`) bénéficie du même contrat.
@@ -244,6 +246,12 @@ Vérifier le catalogue et ses capacités :
 python3 -m json.tool ~/.codex/catalog.json | grep -E 'slug|tool|patch|search|parallel'
 ```
 
+Vérifier que **Codex** accepte ce catalogue — c'est le contrôle qui compte : refusé, il repart sur ses défauts natifs et ignore providers tiers comme sections utilisateur.
+
+```bash
+/Applications/ChatGPT.app/Contents/Resources/codex debug models
+```
+
 Vérifier les proxies :
 
 ```bash
@@ -325,7 +333,8 @@ indique en revanche que le binaire a été lancé hors de son bundle `.app`.
 - Le pontage garantit le transport des outils, pas la qualité du modèle : un provider qui suit mal un schéma d’arguments produira des appels `apply_patch` ou MCP invalides.
 - Lorsqu’une réponse doit être reconstruite (`apply_patch`, `local_shell`, nom MCP assaini), le streaming est bufferisé : la réponse arrive d’un bloc au lieu d’être affichée token par token.
 - Les tools hébergés côté OpenAI autres que `web_search` (`file_search`, `image_generation`, `code_interpreter`) sont retirés : aucun provider tiers ne peut les exécuter.
-- Un slug natif ne peut être attribué qu’une fois : un provider offrant plus de modèles que Codex n’a de slugs verrait les derniers inaccessibles depuis le sélecteur.
+- Un slug natif ne peut être attribué qu’une fois : un provider offrant plus de modèles que Codex n’a de slugs n’expose que les premiers dans le sélecteur.
+- La liste de slugs de Codex change avec ses versions — `gpt-reserve` en a disparu en cours de route. Le masquage suit le cache, donc le nombre de modèles exposés peut varier après une mise à jour de Codex.
 - Le journal et la télémétrie locale de Codex attribuent la requête au slug natif, pas au provider réel.
 - Le palier gratuit d'OpenCode Zen est limité par modèle : une réponse `FreeUsageLimitError` vient du quota de la passerelle, pas de l'application. Une clé Zen dans `opencode auth login` la lève.
 - Les noms des modèles gratuits d'OpenCode Zen sont des préversions et changent régulièrement ; ils sont déclarés en dur et se vérifient avec `opencode models opencode`.

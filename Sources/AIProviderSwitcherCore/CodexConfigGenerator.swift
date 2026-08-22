@@ -109,8 +109,13 @@ public enum CodexConfigGenerator {
               !provider.isReserved || provider.id == "ollama" else {
             return "{\"models\": []}"
         }
-        if ModelMasquerade.masquerades(provider) {
-            return masqueradeCatalogJSON(provider: provider, nativeEntries: nativeEntries, cacheURL: cacheURL)
+        // Masquerading needs the real metadata Codex fetched: without it, entries
+        // would be missing fields its catalog schema requires, and Codex answers
+        // by discarding the whole config. No cache, no masquerade.
+        if ModelMasquerade.masquerades(provider), !nativeEntries.isEmpty,
+           let masqueraded = masqueradeCatalogJSON(
+               provider: provider, nativeEntries: nativeEntries, cacheURL: cacheURL) {
+            return masqueraded
         }
         var priority = 50
         for model in provider.models {
@@ -168,15 +173,21 @@ public enum CodexConfigGenerator {
     /// Codex therefore applies its full native feature contract — tools, MCP,
     /// plugins, apps, skills — while the adapter proxy swaps the model name on
     /// the wire (see `ModelMasquerade`).
+    /// Returns nil when the result could not be trusted, so the caller falls back
+    /// to the provider's real model names instead of writing a catalog Codex
+    /// would reject.
     private static func masqueradeCatalogJSON(
         provider: Provider,
         nativeEntries: [String: [String: Any]],
         cacheURL: URL
-    ) -> String {
+    ) -> String? {
         var models: [[String: Any]] = []
         var priority = 1
         for alias in ModelMasquerade.aliases(for: provider, cacheURL: cacheURL) {
-            var entry = nativeEntries[alias.slug] ?? syntheticNativeEntry(slug: alias.slug, provider: provider)
+            // Only slugs Codex actually described can be reproduced. A slug that
+            // vanished from the cache (they come and go with releases) must not
+            // be rebuilt by hand: a single missing field invalidates the config.
+            guard var entry = nativeEntries[alias.slug] else { continue }
             let nativeName = entry["display_name"] as? String ?? alias.slug
             entry["slug"] = alias.slug
             // The slug is what Codex checks; the display name is only shown to
@@ -213,32 +224,32 @@ public enum CodexConfigGenerator {
             priority += 1
             models.append(entry)
         }
+        guard !models.isEmpty, catalogIsComplete(models, comparedTo: nativeEntries) else { return nil }
         let clean = removingJSONNulls(["models": models]) as? [String: Any] ?? ["models": []]
         let data = try? JSONSerialization.data(withJSONObject: clean, options: [.prettyPrinted])
-        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "{\"models\": []}"
+        return data.flatMap { String(data: $0, encoding: .utf8) }
     }
 
-    /// Native-looking entry for a slug absent from `models_cache.json` (the cache
-    /// may be missing, or a provider may expose more models than it has slugs).
-    private static func syntheticNativeEntry(slug: String, provider: Provider) -> [String: Any] {
-        [
-            "slug": slug,
-            "display_name": slug,
-            "description": "",
-            "default_reasoning_level": "medium",
-            "supported_reasoning_levels": portableReasoningLevels,
-            "shell_type": "shell_command",
-            "visibility": "list",
-            "supported_in_api": true,
-            "priority": 50,
-            "additional_speed_tiers": [],
-            "service_tiers": [],
-            "truncation_policy": ["mode": "tokens", "limit": 10000],
-            "experimental_supported_tools": [],
-            "include_plugin_usage_instructions": true,
-            "include_apps_usage_instructions": true,
-            "include_skills_usage_instructions": true
-        ]
+    /// Last line of defence before a catalog reaches Codex.
+    ///
+    /// Codex's catalog schema has required fields (`support_verbosity`,
+    /// `default_verbosity`, …) and it reacts to a missing one by rejecting
+    /// `config.toml` entirely — third-party providers, MCP servers and every user
+    /// setting go down with it. So every entry must carry at least the fields the
+    /// cache entries carry; a lighter entry means we invented something.
+    static func catalogIsComplete(
+        _ models: [[String: Any]],
+        comparedTo nativeEntries: [String: [String: Any]]
+    ) -> Bool {
+        // Optional fields are legitimately dropped when null or not applicable.
+        let optional: Set<String> = ["availability_nux", "upgrade", "tool_mode",
+                                     "web_search_tool_type", "apply_patch_tool_type",
+                                     "multi_agent_version"]
+        let required = nativeEntries.values
+            .map { Set($0.keys) }
+            .reduce(into: Set<String>()) { $0.formUnion($1) }
+            .subtracting(optional)
+        return models.allSatisfy { required.subtracting($0.keys).isEmpty }
     }
 
     /// Removes JSON nulls because Codex's model catalog schema rejects null for

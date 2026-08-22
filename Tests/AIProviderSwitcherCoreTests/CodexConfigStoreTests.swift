@@ -28,6 +28,28 @@ final class CodexConfigStoreTests: XCTestCase {
             modelsCacheJson: home.appendingPathComponent("models_cache.json")
         )
         store = CodexConfigStore(paths: paths)
+        try? writeModelsCache()
+    }
+
+    /// Production-like state: Codex has fetched its model catalog, so providers
+    /// masquerade under its slugs. Without this file masquerading stays off.
+    private func writeModelsCache() throws {
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let entry: ([String: Any]) -> [String: Any] = { extra in
+            var base: [String: Any] = ["display_name": "Native", "description": "",
+                                       "supported_in_api": true, "support_verbosity": true,
+                                       "default_verbosity": "low", "shell_type": "shell_command"]
+            base.merge(extra) { _, new in new }
+            return base
+        }
+        try JSONSerialization.data(withJSONObject: ["models": [
+            entry(["slug": "gpt-5.6-sol", "visibility": "list"]),
+            entry(["slug": "gpt-5.6-terra", "visibility": "list"]),
+            entry(["slug": "gpt-5.6-luna", "visibility": "list"]),
+            entry(["slug": "gpt-5.5", "visibility": "list"]),
+            entry(["slug": "gpt-5.4", "visibility": "list"]),
+            entry(["slug": "codex-auto-review", "visibility": "hide"])
+        ]]).write(to: paths.modelsCacheJson, options: [.atomic])
     }
 
     override func tearDown() {

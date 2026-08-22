@@ -205,6 +205,17 @@ final class AppState: ObservableObject {
     func hasKey(for providerID: String) -> Bool {
         screenshotMode ? screenshotKeyIDs.contains(providerID) : keyStore.hasKey(providerID)
     }
+    /// Models offered for the active provider. While masquerading, only models
+    /// that own a native slug are listed: Codex's slug list is finite, and a
+    /// model without one would end up outside the catalog Codex reads.
+    var selectableModels: [String] {
+        guard let provider = activeProvider else { return [] }
+        return ModelMasquerade.exposableModels(
+            for: provider,
+            cacheURL: configStore.paths.modelsCacheJson
+        )
+    }
+
     /// Slug Codex believes it is talking to, when the active provider is exposed
     /// under one of Codex's own models. `nil` when no masquerading happens.
     var exposedModel: String? {

@@ -71,10 +71,9 @@ final class ModelMasqueradeTests: XCTestCase {
         // No duplicate entries pointing at the same model in the picker.
         XCTAssertEqual(aliases.filter { $0.listed }.count, deepseek.models.count)
         XCTAssertEqual(Set(aliases.filter { $0.listed }.map { $0.model }), Set(deepseek.models))
-        // Hidden slugs come from the cache and from the fallback pool, so an
-        // internal Codex request always resolves.
-        XCTAssertEqual(aliases.filter { !$0.listed }.map { $0.slug },
-                       ["gpt-reserve", "codex-auto-review"])
+        // Hidden slugs the cache declares are kept, so Codex's internal requests
+        // resolve too. Nothing outside the cache is ever added.
+        XCTAssertEqual(aliases.filter { !$0.listed }.map { $0.slug }, ["gpt-reserve"])
     }
 
     func testUnknownSlugFallsBackToTheDefaultModel() throws {
@@ -86,15 +85,40 @@ final class ModelMasqueradeTests: XCTestCase {
         XCTAssertEqual(ModelMasquerade.model(for: "glm-4.6", provider: glm, cacheURL: cache), "glm-4.6")
     }
 
-    func testMissingCacheStillYieldsNativeSlugs() {
+    /// Regression: slugs were once padded from a hard-coded pool. When one of
+    /// them (`gpt-reserve`) disappeared from Codex's catalog, the entry had to be
+    /// written by hand, a required field was missing, and Codex rejected the whole
+    /// config — every provider stopped working at once.
+    func testSlugsOnlyEverComeFromCodexOwnCatalog() throws {
+        try writeCache([("gpt-5.6-sol", "list"), ("gpt-5.6-terra", "list"), ("gpt-reserve", "hide")])
+        let known: Set<String> = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-reserve"]
+        for provider in ProviderCatalog.default.providers where ModelMasquerade.masquerades(provider) {
+            let aliases = ModelMasquerade.aliases(for: provider, cacheURL: cache)
+            XCTAssertTrue(aliases.allSatisfy { known.contains($0.slug) }, provider.id)
+        }
+    }
+
+    func testNoCacheDisablesMasquerading() {
         let deepseek = ProviderCatalog.default[id: "deepseek"]!
-        let aliases = ModelMasquerade.aliases(
-            for: deepseek,
-            cacheURL: URL(fileURLWithPath: "/nonexistent-models-cache.json")
-        )
-        XCTAssertEqual(aliases.first?.slug, "gpt-5.6-sol")
-        XCTAssertTrue(aliases.allSatisfy { $0.slug.hasPrefix("gpt-") || $0.slug.hasPrefix("codex-") })
-        XCTAssertTrue(aliases.allSatisfy { deepseek.models.contains($0.model) })
+        let missing = URL(fileURLWithPath: "/nonexistent-models-cache.json")
+        XCTAssertTrue(ModelMasquerade.nativeModels(cacheURL: missing).isEmpty)
+        XCTAssertTrue(ModelMasquerade.aliases(for: deepseek, cacheURL: missing).isEmpty)
+        // The real model name is then used, which is what worked before.
+        XCTAssertEqual(ModelMasquerade.slug(for: "deepseek-v4-pro", provider: deepseek, cacheURL: missing),
+                       "deepseek-v4-pro")
+    }
+
+    /// Fewer slugs than models: the extra models stay selectable under their real
+    /// name rather than being silently routed to another model.
+    func testModelsWithoutASlugKeepTheirRealName() throws {
+        try writeCache([("gpt-5.6-sol", "list")])
+        let openrouter = try XCTUnwrap(ProviderCatalog.default[id: "openrouter"])
+        let exposable = ModelMasquerade.exposableModels(for: openrouter, cacheURL: cache)
+        XCTAssertEqual(exposable, [openrouter.defaultModel])
+
+        let orphan = try XCTUnwrap(openrouter.models.first { $0 != openrouter.defaultModel })
+        XCTAssertEqual(ModelMasquerade.slug(for: orphan, provider: openrouter, cacheURL: cache), orphan)
+        XCTAssertEqual(ModelMasquerade.model(for: orphan, provider: openrouter, cacheURL: cache), orphan)
     }
 
     func testNonRoutedProviderKeepsItsRealModelNames() {
