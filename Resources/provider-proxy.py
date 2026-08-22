@@ -277,6 +277,105 @@ def opencode_authorization(request_authorization):
     return "Bearer " + (supplied or opencode_stored_key() or OPENCODE_PUBLIC_KEY)
 
 
+# ---------------------------------------------------------------------------
+# Dynamic model discovery
+#
+# The declared model lists go stale as providers ship new models. This asks the
+# provider what it really serves: the adapter is the only component that knows
+# both the upstream URL and how to authenticate to it.
+# ---------------------------------------------------------------------------
+
+OPENCODE_CLI_PATHS = ["~/.opencode/bin/opencode", "/opt/homebrew/bin/opencode",
+                      "/usr/local/bin/opencode", "~/.local/bin/opencode",
+                      "/usr/bin/opencode"]
+
+
+def _get_json(url, headers, timeout=20):
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(request, context=ssl_context(), timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _ids_from_models_payload(payload):
+    """Accepts the OpenAI shape (`{"data": [{"id": …}]}`) and the Codex catalog
+    shape (`{"models": [{"slug": …}]}`)."""
+    items = []
+    if isinstance(payload, dict):
+        items = payload.get("data") or payload.get("models") or []
+    elif isinstance(payload, list):
+        items = payload
+    ids = []
+    for item in items:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict):
+            value = item.get("id") or item.get("slug") or item.get("name")
+            if isinstance(value, str):
+                ids.append(value)
+    # Deduplicate while keeping the provider's own ordering.
+    seen = set()
+    return [i for i in ids if not (i in seen or seen.add(i))]
+
+
+def opencode_cli_models():
+    """`opencode models opencode` lists the free tier the public key can reach,
+    which the gateway's own /v1/models does not distinguish."""
+    for path in OPENCODE_CLI_PATHS:
+        binary = os.path.expanduser(path)
+        if not os.access(binary, os.X_OK):
+            continue
+        try:
+            out = subprocess.run([binary, "models", "opencode"],
+                                 capture_output=True, text=True, timeout=30,
+                                 cwd=os.path.expanduser("~"))
+        except Exception:
+            return []
+        if out.returncode != 0:
+            return []
+        ids = []
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if not line or "/" not in line:
+                continue
+            provider_id, _, model = line.partition("/")
+            if provider_id == "opencode" and model:
+                ids.append(model)
+        return ids
+    return []
+
+
+def upstream_models(request_authorization):
+    """Model ids the provider really serves, with the source used."""
+    if ADAPTER == "opencode":
+        ids = opencode_cli_models()
+        if ids:
+            return ids, "opencode-cli"
+        headers = {"Authorization": opencode_authorization(request_authorization)}
+        return _ids_from_models_payload(_get_json(UPSTREAM + "/v1/models", headers)), "gateway"
+    if ADAPTER == "anthropic":
+        headers = anthropic_headers(request_authorization)
+        base = anthropic_base_url()
+        url = (base + "/models") if base.endswith("/v1") else (base + "/v1/models")
+        return _ids_from_models_payload(_get_json(url, headers)), "anthropic"
+    headers = {"Accept": "application/json"}
+    if request_authorization:
+        headers["Authorization"] = request_authorization
+    # Bases differ: OpenAI-style ones end in /v1, others carry their own version
+    # segment (z.ai: /api/paas/v4). Try both rather than guessing.
+    last_error = None
+    for path in ("/v1/models", "/models"):
+        try:
+            ids = _ids_from_models_payload(_get_json(UPSTREAM + path, headers))
+        except Exception as error:
+            last_error = error
+            continue
+        if ids:
+            return ids, "upstream"
+    if last_error is not None:
+        raise last_error
+    return [], "upstream"
+
+
 def _input_to_text(part):
     t = part.get("type", "")
     if t in ("input_text", "output_text", "text"):
@@ -1143,6 +1242,26 @@ def _stream(upstream_resp, model):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/_switcher/upstream-models"):
+            # Private route, used by the app to refresh the declared model list.
+            # Never exposed to Codex: it returns the provider's real model ids.
+            try:
+                ids, source = upstream_models(self.headers.get("Authorization"))
+                body = json.dumps({"models": ids, "source": source}).encode()
+                status = 200
+            except urllib.error.HTTPError as error:
+                body = json.dumps({"models": [], "error": "http %d" % error.code}).encode()
+                status = 200
+            except Exception as error:
+                body = json.dumps({"models": [], "error": str(error)}).encode()
+                status = 200
+            sys.stderr.write("[proxy %s] upstream-models: %s\n" % (DISPLAY, body[:200].decode()))
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/v1/models") or self.path.startswith("/models"):
             body = models_response()
             self.send_response(200)

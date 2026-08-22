@@ -235,6 +235,48 @@ class ProxyBehaviorTests(unittest.TestCase):
                 with mock.patch.object(self.proxy, "OPENCODE_AUTH_PATH", str(path)):
                     self.assertEqual(self.proxy.opencode_stored_key(), expected, payload)
 
+    def test_model_ids_are_read_from_every_shape_providers_use(self):
+        cases = [
+            ({"data": [{"id": "a"}, {"id": "b"}]}, ["a", "b"]),
+            ({"models": [{"slug": "a"}]}, ["a"]),
+            ({"data": [{"id": "b"}, {"id": "a"}, {"id": "b"}]}, ["b", "a"]),
+            (["a", "b"], ["a", "b"]),
+            ({"error": "nope"}, []),
+        ]
+        for payload, expected in cases:
+            self.assertEqual(self.proxy._ids_from_models_payload(payload), expected, payload)
+
+    def test_opencode_models_come_from_the_cli_listing(self):
+        listing = ("opencode/big-pickle\nopencode/hy3-free\n"
+                   "deepseek/deepseek-v4-pro\n\nollama/qwen3:4b\n")
+
+        class FakeRun:
+            returncode = 0
+            stdout = listing
+
+        with mock.patch.object(self.proxy.os.path, "expanduser", side_effect=lambda p: p), \
+             mock.patch.object(self.proxy.os, "access", return_value=True), \
+             mock.patch.object(self.proxy.subprocess, "run", return_value=FakeRun()):
+            # Only the free tier of the opencode provider is kept.
+            self.assertEqual(self.proxy.opencode_cli_models(), ["big-pickle", "hy3-free"])
+
+    def test_discovery_tries_both_model_paths(self):
+        # z.ai carries its own version segment (/api/paas/v4), so /v1/models 404s.
+        calls = []
+
+        def fake_get(url, headers, timeout=20):
+            calls.append(url)
+            if url.endswith("/v1/models"):
+                raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+            return {"data": [{"id": "glm-5.2"}]}
+
+        import urllib.error
+        with mock.patch.object(self.proxy, "_get_json", side_effect=fake_get):
+            ids, source = self.proxy.upstream_models("Bearer k")
+        self.assertEqual(ids, ["glm-5.2"])
+        self.assertEqual(source, "upstream")
+        self.assertEqual(len(calls), 2)
+
     def test_openai_only_request_fields_are_stripped(self):
         req = self.proxy.sanitize_upstream_request({
             "model": "model", "service_tier": "priority", "prompt_cache_key": "abc",

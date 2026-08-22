@@ -119,6 +119,65 @@ final class CodexConfigStoreTests: XCTestCase {
         XCTAssertTrue(config.contains("[mcp_servers.github]"))
     }
 
+    /// Codex reloads its whole configuration — and drops its websocket — on every
+    /// change of config.toml. A rewrite with identical content is a visible
+    /// reconnection for the user, so it must not happen.
+    func testUnchangedConfigIsNotRewritten() throws {
+        try writeNative()
+        _ = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "deepseek")
+        let firstWrite = try FileManager.default
+            .attributesOfItem(atPath: paths.configToml.path)[.modificationDate] as? Date
+        let backupsAfterFirst = (try? FileManager.default
+            .contentsOfDirectory(atPath: paths.backupDir.path).count) ?? 0
+
+        // Same call again: nothing to change.
+        let report = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "deepseek")
+        let secondWrite = try FileManager.default
+            .attributesOfItem(atPath: paths.configToml.path)[.modificationDate] as? Date
+        let backupsAfterSecond = (try? FileManager.default
+            .contentsOfDirectory(atPath: paths.backupDir.path).count) ?? 0
+
+        XCTAssertEqual(firstWrite, secondWrite, "config.toml was rewritten with identical content")
+        XCTAssertEqual(backupsAfterFirst, backupsAfterSecond, "a no-op write still made a backup")
+        XCTAssertNil(report.backupWritten)
+    }
+
+    /// When Codex itself wrote the selection we would have written (the user
+    /// changed model in the Desktop picker), only the sidecar needs updating.
+    func testRecordSelectionUpdatesTheSidecarWithoutTouchingConfig() throws {
+        try writeNative()
+        let deepseek = try XCTUnwrap(ProviderCatalog.default[id: "deepseek"])
+        _ = try store.install(providers: ProviderCatalog.default.providers, activeProviderID: "deepseek")
+        _ = try store.applyOverride(provider: deepseek, model: deepseek.defaultModel)
+        let exposed = try XCTUnwrap(store.overrideState()?.exposedModel)
+        let before = try FileManager.default
+            .attributesOfItem(atPath: paths.configToml.path)[.modificationDate] as? Date
+
+        XCTAssertTrue(store.selectionMatchesConfig(provider: deepseek, exposedModel: exposed))
+        let other = try XCTUnwrap(deepseek.models.first { $0 != deepseek.defaultModel })
+        let state = try store.recordSelection(provider: deepseek, model: other, exposedModel: exposed)
+
+        XCTAssertEqual(state.model, other)
+        XCTAssertEqual(store.overrideState()?.model, other)
+        // Native values must survive, so "OpenAI" still restores them.
+        XCTAssertEqual(state.nativeModel, "gpt-5.6")
+        XCTAssertEqual(state.nativeModelProvider, "openai")
+        let after = try FileManager.default
+            .attributesOfItem(atPath: paths.configToml.path)[.modificationDate] as? Date
+        XCTAssertEqual(before, after, "config.toml must not be touched")
+    }
+
+    func testSelectionMatchesConfigRejectsADifferentSelection() throws {
+        try writeNative()
+        let deepseek = try XCTUnwrap(ProviderCatalog.default[id: "deepseek"])
+        let glm = try XCTUnwrap(ProviderCatalog.default[id: "glm"])
+        _ = try store.applyOverride(provider: deepseek, model: deepseek.defaultModel)
+        let exposed = try XCTUnwrap(store.overrideState()?.exposedModel)
+
+        XCTAssertFalse(store.selectionMatchesConfig(provider: glm, exposedModel: exposed))
+        XCTAssertFalse(store.selectionMatchesConfig(provider: deepseek, exposedModel: "gpt-9-other"))
+    }
+
     func testSwitchingFromLegacyGeneratedCatalogRefreshesActiveProvider() throws {
         try writeNative()
         let openAI = try XCTUnwrap(ProviderCatalog.default[id: "openai"])

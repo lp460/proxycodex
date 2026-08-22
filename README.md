@@ -18,6 +18,7 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 - Génère un catalogue de modèles compatible avec le schéma Codex, limité au provider actif.
 - Démarre des proxies locaux pour adapter les providers qui n’exposent pas directement l’API Responses.
 - Donne le même jeu de fonctionnalités à tous les providers : MCP, shell, `apply_patch`, plugins et skills.
+- Interroge chaque provider pour connaître les modèles qu'il sert réellement, au lieu d'une liste figée.
 - Préserve les sections utilisateur, notamment MCP, et crée des sauvegardes avant les modifications.
 
 ## Providers disponibles
@@ -73,13 +74,34 @@ gpt-5.6-sol  ──────────►  model = "gpt-5.6-sol"  ──►
 - Le modèle par défaut du provider prend le slug principal (`gpt-5.6-sol`), puis chaque modèle reçoit le suivant. La liste de slugs de Codex étant finie, un provider déclarant plus de modèles que Codex n’a de slugs n’expose que les premiers ; le sélecteur n’affiche que ceux-là.
 - Avant écriture, le catalogue est vérifié champ par champ contre les entrées du cache. S’il manque quoi que ce soit, il n’est pas écrit et l’application retombe sur les vrais slugs — un catalogue invalide ne dégrade pas le provider, il fait **rejeter tout `config.toml`** par Codex : providers, serveurs MCP, sandbox, tout.
 - Les slugs internes de Codex (`gpt-reserve`, `codex-auto-review`) sont mappés sur le modèle par défaut, pour que les requêtes internes (revue automatique, délégation) aboutissent aussi.
-- Le nom affiché reste explicite : `GPT-5.6-Sol · Claude Code`, description `Claude Code · claude-haiku-4-5`. Le slug seul est masqué, pas l’information.
+- Le nom affiché nomme le modèle qui répond vraiment, en premier : `claude-haiku-4-5 · Claude Code`. Seul le slug est masqué, pas l’information.
 - `~/.codex/<provider>.config.toml` utilise le même slug, donc Codex CLI (`--profile`) bénéficie du même contrat.
 - Deux commutateurs natifs ne sont pas hérités : `use_responses_lite` (format de requête interne à OpenAI, non traduit par les adaptateurs) et `tool_mode = "code_mode_only"` (qui remplacerait le jeu d’outils classique — shell, apply_patch, MCP — par un unique outil de code).
 
 Ollama et LM Studio sont des providers intégrés à Codex, sans adapter local : aucun composant ne peut réécrire le nom du modèle, ils gardent donc leurs vrais slugs.
 
 À noter : les requêtes envoyées au provider tiers portent un nom de modèle OpenAI, et le journal local de Codex affichera `gpt-5.6-sol` là où DeepSeek ou Claude a répondu. C’est le prix du contrat natif ; la légende du panneau et la description du catalogue gardent la correspondance visible.
+
+## Découverte des modèles
+
+Les listes déclarées se périment dès qu'un provider sort un modèle. L'application demande donc à chaque provider ce qu'il sert, au lancement et via **Rafraîchir les modèles** dans le panneau.
+
+La requête passe par l'adaptateur local (`GET /_switcher/upstream-models`), seul composant qui connaisse à la fois l'URL upstream et son authentification :
+
+| Provider | Source interrogée |
+|---|---|
+| DeepSeek, GLM, OpenRouter | `/v1/models` de l'upstream, puis `/models` si la base porte déjà sa version (z.ai) |
+| OpenCode Zen | `opencode models opencode` via la CLI détectée — la passerelle ne distingue pas le palier gratuit |
+| Claude Code | `/v1/models` d'Anthropic, avec le jeton de Claude Code |
+| Ollama | interrogé directement, sans adaptateur |
+
+Règles appliquées :
+
+- une liste de plus de 30 modèles n'est pas un sélecteur utilisable (OpenRouter en sert plus de 400) : la liste curée est conservée ;
+- l'ordre du provider est respecté, le modèle par défaut est remonté en tête puisqu'il prend le slug natif principal ;
+- un provider qui ne répond pas — clé absente, authentification cassée — garde sa liste déclarée, sans erreur bloquante ;
+- le résultat est conservé dans `~/Library/Application Support/AI Provider Switcher/discovered-models.json`, donc un relancement repart du dernier état connu ;
+- si la liste du provider actif change, les adaptateurs redémarrent avec le nouvel appariement et le catalogue est régénéré ; sinon `config.toml` n'est pas touché.
 
 ## Parité des fonctionnalités (MCP, shell, apply_patch, plugins)
 
@@ -172,6 +194,16 @@ Les modèles déclarés sont ceux du palier gratuit, tels que listés par `openc
 ```bash
 opencode models opencode
 ```
+
+## Écritures de config.toml
+
+Codex recharge toute sa configuration — et relance sa connexion — à chaque modification de `config.toml`. Trois règles en découlent :
+
+- une sélection complète (blocs providers, catalogue, `[tools]`, override) ne fait **qu'une seule** écriture ;
+- une écriture au contenu identique n'a pas lieu, et ne crée donc pas de sauvegarde ;
+- quand Codex a lui-même écrit la sélection voulue — l'utilisateur change de modèle dans le Desktop — seul l'état sidecar est mis à jour, `config.toml` n'est pas retouché.
+
+La disposition des blocs gérés est déterministe (providers puis `[tools]`, catalogue en tête). Sans cela, chaque installation permutait leur ordre : le fichier différait à chaque fois, Codex rechargeait, et les lignes vides laissées par les retraits s'accumulaient — un `config.toml` observé avait 483 lignes vides consécutives sur 886 lignes.
 
 ## Clés et sécurité
 
@@ -294,6 +326,7 @@ Sources/
     ├── Providers.swift                   catalogue providers/modèles
     ├── ModelMasquerade.swift             slugs natifs Codex ↔ modèles réels
     ├── OpenCodeCLI.swift                 détection de la CLI OpenCode
+    ├── ModelDiscovery.swift              modèles réellement servis + persistance
     ├── CodexConfigGenerator.swift        TOML et catalogue avec capacités tools
     ├── CodexConfigStore.swift             installation, override et réversibilité
     ├── CompatibilityChecker.swift         test de `/v1/responses`

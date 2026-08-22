@@ -297,12 +297,35 @@ struct PanelView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(state.testing || state.isScreenshotMode)
-                Text(state.testing ? "Test en cours…"
-                     : "Les modèles DeepSeek/GLM/OpenRouter s'exécutent via Codex CLI. L'app ChatGPT les affiche mais ne les exécute pas avec un compte ChatGPT (restriction OpenAI).")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+
+                Button {
+                    Task { await state.refreshModels() }
+                } label: {
+                    Label(state.refreshingModels ? "Lecture…" : "Rafraîchir les modèles",
+                          systemImage: "arrow.triangle.2.circlepath")
+                }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Demande à chaque provider la liste des modèles qu'il sert réellement")
+                    .disabled(state.refreshingModels || state.isScreenshotMode)
             }
+
+            Text(modelSourceText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// Where the model list comes from, so a stale picker is never a mystery.
+    private var modelSourceText: String {
+        if state.testing { return "Test en cours…" }
+        guard let date = state.lastModelRefresh else {
+            return "Modèles : listes déclarées. « Rafraîchir » interroge chaque provider."
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return "Modèles lus auprès des providers à \(formatter.string(from: date)). Codex n'expose que ses propres slugs, donc au plus autant de modèles qu'il a de slugs."
     }
 
     // MARK: Footer

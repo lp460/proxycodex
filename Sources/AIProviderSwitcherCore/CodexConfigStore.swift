@@ -123,13 +123,16 @@ public final class CodexConfigStore: Sendable {
     @discardableResult
     public func install(providers: [Provider], activeProviderID: String = "openai") throws -> InstallReport {
         try FileManager.default.createDirectory(at: paths.codexHome, withIntermediateDirectories: true)
-        let backupURL = try backup()
+        var backupURL: URL?
         var config = try readConfig()
         var added: [String] = []
         var present: [String] = []
         var profiles: [String] = []
         var blockChanged = false
 
+        // The tools block is re-appended at the end by installToolsConfig, so it
+        // is dropped here to keep a single deterministic layout.
+        config = removeManagedBlocksNamed("tools", in: config)
         for provider in providers {
             // Never redeclare reserved built-in providers.
             if provider.isReserved {
@@ -165,14 +168,20 @@ public final class CodexConfigStore: Sendable {
             }
         }
 
-        if !added.isEmpty || blockChanged {
-            try writeConfig(config)
-        }
         _ = present
+        _ = blockChanged
         // Static catalog for the active provider: the Desktop picker then only
         // lists that provider's models. A user-owned model_catalog_json is
         // preserved and reported instead of being silently overridden.
-        let catalogInstalled = try installCatalog(providers: providers, activeProviderID: activeProviderID)
+        let (withCatalog, catalogInstalled) = try applyingCatalog(
+            config, providers: providers, activeProviderID: activeProviderID)
+        // Codex's native web search flag is independent from the model catalog.
+        // `[tools]` is re-appended last, always, so the managed layout is stable:
+        // an order that alternates between runs is a real change of the file, and
+        // Codex reloads (and reconnects) on every change.
+        config = installToolsConfig(in: withCatalog)
+        // ONE write for the whole selection: providers, catalog and tools.
+        backupURL = try writeConfig(config)
         return InstallReport(
             providersAdded: added,
             providersAlreadyPresent: present,
@@ -187,8 +196,20 @@ public final class CodexConfigStore: Sendable {
     /// catalog entirely so the picker shows pure ChatGPT.
     @discardableResult
     public func installCatalog(providers: [Provider], activeProviderID: String) throws -> Bool {
-        var config = try readConfig()
-        var changed = false
+        let (config, installed) = try applyingCatalog(
+            try readConfig(), providers: providers, activeProviderID: activeProviderID)
+        try writeConfig(installToolsConfig(in: config))
+        return installed
+    }
+
+    /// Catalog + `[tools]` decisions as a pure text transform, so a whole
+    /// selection can be written in a single change of config.toml.
+    private func applyingCatalog(
+        _ input: String,
+        providers: [Provider],
+        activeProviderID: String
+    ) throws -> (String, Bool) {
+        var config = input
         var catalogInstalled = false
         let active = providers.first { $0.id == activeProviderID }
         if let active, !active.isReserved || active.id == "ollama" {
@@ -221,7 +242,6 @@ public final class CodexConfigStore: Sendable {
                 try json.write(to: paths.catalogJson, atomically: true, encoding: .utf8)
                 let body = "model_catalog_json = \(quote(paths.catalogJson.path))\n"
                 config = prependBlock(config, wrappedBlock(name: "catalog", body: body))
-                changed = true
                 catalogInstalled = true
             }
         } else {
@@ -247,18 +267,9 @@ public final class CodexConfigStore: Sendable {
             if hadManagedCatalog, FileManager.default.fileExists(atPath: paths.catalogJson.path) {
                 try? FileManager.default.removeItem(at: paths.catalogJson)
             }
-            changed = hadManagedCatalog
             catalogInstalled = !hadUserCatalog
         }
-        // Codex's native web search flag is independent from the model catalog.
-        // Enable it only when the user's config does not already define it;
-        // preserve user-owned [tools] values and make our addition reversible.
-        let withTools = installToolsConfig(in: config)
-        changed = changed || withTools != config
-        config = withTools
-        if changed { try writeConfig(config) }
-        return catalogInstalled
-
+        return (config, catalogInstalled)
     }
 
     /// Removes every block/profile this app added and reverts any active override.
@@ -341,7 +352,6 @@ public final class CodexConfigStore: Sendable {
         let body = "model = \(quote(exposed))\nmodel_provider = \(quote(provider.id))\n"
         config = prependBlock(config, wrappedBlock(name: "override", body: body))
 
-        try backup()
         try writeConfig(config)
 
         let state = OverrideState(
@@ -350,6 +360,35 @@ public final class CodexConfigStore: Sendable {
             provider: provider.id,
             model: model,
             exposedModel: exposed,
+            appliedAt: Date()
+        )
+        try JSONEncoder().encode(state).write(to: paths.stateJson, options: [.atomic])
+        try restrict(stateURL: paths.stateJson)
+        return state
+    }
+
+    /// True when config.toml already carries exactly this managed selection, so
+    /// nothing has to be rewritten — Codex changed the model itself and the file
+    /// is already what we would have written.
+    public func selectionMatchesConfig(provider: Provider, exposedModel: String) -> Bool {
+        guard let config = try? readConfig(),
+              config.contains("# >>> \(beginToken) override >>>"),
+              topLevelValue(of: "model", in: config) == exposedModel,
+              topLevelValue(of: "model_provider", in: config) == provider.id else { return false }
+        return true
+    }
+
+    /// Records a selection in the sidecar only, leaving config.toml untouched.
+    /// Used when Codex itself wrote the model we would have written.
+    @discardableResult
+    public func recordSelection(provider: Provider, model: String, exposedModel: String) throws -> OverrideState {
+        let existing = overrideState()
+        let state = OverrideState(
+            nativeModel: existing?.nativeModel ?? topLevelValue(of: "model"),
+            nativeModelProvider: existing?.nativeModelProvider ?? topLevelValue(of: "model_provider"),
+            provider: provider.id,
+            model: model,
+            exposedModel: exposedModel,
             appliedAt: Date()
         )
         try JSONEncoder().encode(state).write(to: paths.stateJson, options: [.atomic])
@@ -410,9 +449,43 @@ public final class CodexConfigStore: Sendable {
 
     // MARK: Low-level line editing
 
-    private func writeConfig(_ text: String) throws {
+    /// Writes config.toml **only** when the content actually changes.
+    ///
+    /// Codex watches the file: every write makes it reload its configuration and
+    /// reconnect, so a rewrite with identical content is a visible hiccup for the
+    /// user (and a useless backup on disk).
+    /// Collapses runs of two or more blank lines.
+    ///
+    /// Managed blocks are removed and re-appended on every install, and each
+    /// removal leaves the blank line that preceded it. Without this, config.toml
+    /// grows by one empty line per provider per install — and, worse, every
+    /// install then differs from the file on disk, so Codex reloads and drops its
+    /// connection each time. Single blank lines, which users write themselves,
+    /// are left alone.
+    private func collapsingBlankRuns(_ text: String) -> String {
+        var out: [String] = []
+        var blanks = 0
+        for line in text.components(separatedBy: "\n") {
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                blanks += 1
+                if blanks > 1 { continue }
+            } else {
+                blanks = 0
+            }
+            out.append(line)
+        }
+        return out.joined(separator: "\n")
+    }
+
+    @discardableResult
+    private func writeConfig(_ rawText: String) throws -> URL? {
+        let text = collapsingBlankRuns(rawText)
+        let current = try? String(contentsOf: paths.configToml, encoding: .utf8)
+        guard current != text else { return nil }
         try FileManager.default.createDirectory(at: paths.codexHome, withIntermediateDirectories: true)
+        let backupURL = current != nil ? try backup() : nil
         try text.write(to: paths.configToml, atomically: true, encoding: .utf8)
+        return backupURL
     }
 
     private func restrict(stateURL: URL) throws {

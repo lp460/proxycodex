@@ -80,6 +80,31 @@ public struct Provider: Sendable, Identifiable, Equatable, Hashable, Codable {
     }
 
     public var isKeyless: Bool { !requiresKey }
+
+    /// Copy declaring a refreshed model list, as answered by the provider.
+    /// Capabilities and identity are unchanged; an empty list is ignored.
+    public func withModels(_ models: [String]) -> Provider {
+        guard !models.isEmpty else { return self }
+        return Provider(
+            id: id,
+            displayName: displayName,
+            baseURL: baseURL,
+            environmentVariable: environmentVariable,
+            models: models,
+            defaultModel: defaultModel,
+            wireAPI: wireAPI,
+            authScheme: authScheme,
+            supportsResponses: supportsResponses,
+            supportsTools: supportsTools,
+            supportsApplyPatch: supportsApplyPatch,
+            supportsImages: supportsImages,
+            supportsWebSearch: supportsWebSearch,
+            supportsParallelToolCalls: supportsParallelToolCalls,
+            supportsCustomTools: supportsCustomTools,
+            requiresKey: requiresKey,
+            configProviderIDDirect: configProviderIDDirect
+        )
+    }
 }
 
 public struct ProviderCatalog: Sendable, Equatable {

@@ -188,11 +188,11 @@ public enum CodexConfigGenerator {
             // vanished from the cache (they come and go with releases) must not
             // be rebuilt by hand: a single missing field invalidates the config.
             guard var entry = nativeEntries[alias.slug] else { continue }
-            let nativeName = entry["display_name"] as? String ?? alias.slug
             entry["slug"] = alias.slug
             // The slug is what Codex checks; the display name is only shown to
-            // the user, so it keeps naming the provider actually answering.
-            entry["display_name"] = "\(nativeName) · \(provider.displayName)"
+            // the user, so it names the model actually answering, first — the
+            // native name would say nothing about what is really running.
+            entry["display_name"] = "\(alias.model) · \(provider.displayName)"
             entry["description"] = "\(provider.displayName) · \(alias.model), via AI Provider Switcher."
             entry["visibility"] = alias.listed ? "list" : "hide"
             entry["priority"] = priority

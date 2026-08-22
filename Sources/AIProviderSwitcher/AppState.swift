@@ -21,10 +21,14 @@ struct LogEntry: Identifiable, Equatable {
 @MainActor
 final class AppState: ObservableObject {
 
-    let catalog = ProviderCatalog.default
+    /// Providers, with model lists refreshed from what each provider answers.
+    @Published private(set) var catalog = ProviderCatalog.default
     let keyStore = KeyStore()
     let checker = CompatibilityChecker()
     let configStore = CodexConfigStore()
+    let discovery = ModelDiscovery()
+    let discoveredStore = DiscoveredModelStore(url: DiscoveredModelStore.defaultURL())
+    private var discovered: [String: DiscoveredModels] = [:]
 
     private(set) var router: ProviderRouter?
     private let screenshotMode: Bool
@@ -43,6 +47,7 @@ final class AppState: ObservableObject {
     /// OpenCode CLI found on this machine, if any. Informational: the Zen
     /// gateway the provider talks to works without the CLI.
     @Published var openCode: OpenCodeInstallation?
+    @Published var refreshingModels = false
     @Published private(set) var logs: [LogEntry] = []
 
     private var observationTask: Task<Void, Never>?
@@ -142,6 +147,8 @@ final class AppState: ObservableObject {
             initial = "openai"
             model = ProviderCatalog.default[id: "openai"]?.defaultModel ?? "gpt-5.6"
         }
+        // Last known model lists, so a relaunch starts where discovery left off.
+        applyDiscovered(discoveredStore.load())
         do {
             let router = try ProviderRouter(catalog: catalog, keyResolver: keyStore, initialProviderID: initial)
             _ = try await router.setActive(providerID: initial, model: model)
@@ -163,6 +170,62 @@ final class AppState: ObservableObject {
         refreshRunningApps()
         await detectOpenCode()
         log("Catalogue chargé : \(catalog.providers.map(\.displayName).joined(separator: ", ")).")
+        // Proxies are up now, so the providers can be asked what they serve.
+        await refreshModels(announce: false)
+    }
+
+    // MARK: Model discovery
+
+    /// Asks every provider for its current model list. Declared lists go stale
+    /// as providers ship new models, so this is what makes a freshly released
+    /// model appear without a new build.
+    func refreshModels(announce: Bool = true) async {
+        guard !screenshotMode, !refreshingModels else { return }
+        refreshingModels = true
+        defer { refreshingModels = false }
+        var found = discovered
+        var changed: [String] = []
+        for provider in ProviderCatalog.default.providers {
+            guard discovery.discoveryURL(for: provider) != nil else { continue }
+            do {
+                guard let result = try await discovery.discover(
+                    provider: provider, secret: keyStore.secret(for: provider.id)) else { continue }
+                let before = ModelDiscovery.resolvedModels(for: provider, discovered: found[provider.id])
+                let after = ModelDiscovery.resolvedModels(for: provider, discovered: result)
+                found[provider.id] = result
+                if before != after { changed.append(provider.displayName) }
+            } catch {
+                continue   // a provider that cannot answer keeps its declared list
+            }
+        }
+        let activeChanged = changed.contains { name in
+            catalog.providers.first { $0.displayName == name }?.id == snapshot.activeProviderID
+        }
+        applyDiscovered(found)
+        try? discoveredStore.save(found)
+        if !changed.isEmpty {
+            log("Modèles rafraîchis : \(changed.joined(separator: ", ")).")
+            // Adapters advertise the list, so they restart with the new pairing.
+            ensureProxiesRunning()
+            // Only the active provider's catalog is on disk; leave config.toml
+            // alone otherwise, every write makes Codex reconnect.
+            if activeChanged { installProviders() }
+        } else if announce {
+            log("Modèles à jour : aucun changement côté providers.")
+        }
+    }
+
+    private func applyDiscovered(_ entries: [String: DiscoveredModels]) {
+        discovered = entries
+        catalog = ProviderCatalog(providers: ProviderCatalog.default.providers.map { provider in
+            provider.withModels(ModelDiscovery.resolvedModels(
+                for: provider, discovered: entries[provider.id]))
+        })
+    }
+
+    /// When the models were last read from the providers.
+    var lastModelRefresh: Date? {
+        discovered.values.map(\.fetchedAt).max()
     }
 
     /// Looks for the OpenCode CLI. Runs `opencode --version`, so it stays off
@@ -597,7 +660,7 @@ final class AppState: ObservableObject {
         modelAliases(for: provider).map { "\($0.slug)=\($0.model)" }.joined(separator: ",")
     }
 
-    private let proxyVersion = "2026-08-22-tool-bridge-masquerade-v1"
+    private let proxyVersion = "2026-08-22-discovery-v2"
 
     func ensureProxiesRunning() {
         for provider in catalog.providers {
@@ -882,7 +945,16 @@ final class AppState: ObservableObject {
         do {
             if state?.provider != provider.id || state?.model != resolved || state?.exposedModel != model {
                 if !providersInstalled { installProviders(activeProviderID: provider.id) }
-                _ = try configStore.applyOverride(provider: provider, model: resolved)
+                // Codex writes config.toml itself when the user changes model or
+                // effort in the Desktop. If the file already says what we would
+                // write, only the sidecar has to catch up: rewriting it would
+                // make Codex reload and drop its connection for nothing.
+                if configStore.selectionMatchesConfig(provider: provider, exposedModel: model) {
+                    _ = try configStore.recordSelection(
+                        provider: provider, model: resolved, exposedModel: model)
+                } else {
+                    _ = try configStore.applyOverride(provider: provider, model: resolved)
+                }
             }
             if snapshot.activeProviderID != provider.id || snapshot.activeModel != resolved {
                 snapshot = try await router.setActive(providerID: provider.id, model: resolved)

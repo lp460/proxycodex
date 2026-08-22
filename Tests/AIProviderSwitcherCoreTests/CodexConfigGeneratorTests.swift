@@ -108,8 +108,9 @@ final class CodexConfigGeneratorTests: XCTestCase {
         // replace the classic tool set (shell, apply_patch, MCP) with code mode.
         XCTAssertEqual(model["use_responses_lite"] as? Bool, false)
         XCTAssertNil(model["tool_mode"])
-        // The user still sees which provider and model actually answer.
-        XCTAssertEqual(model["display_name"] as? String, "GPT-5.6-Sol · GLM (Z.ai)")
+        // The picker must name the model that actually answers, not the slug it
+        // is disguised as: "gpt-5.6-sol · GLM" told the user nothing.
+        XCTAssertEqual(model["display_name"] as? String, "\(glm.defaultModel) · GLM (Z.ai)")
         XCTAssertEqual((model["description"] as? String)?.contains(glm.defaultModel), true)
     }
 
