@@ -20,6 +20,8 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 - Donne le même jeu de fonctionnalités à tous les providers : MCP, shell, `apply_patch`, plugins et skills.
 - Interroge chaque provider pour connaître les modèles qu'il sert réellement, au lieu d'une liste figée.
 - Préserve les sections utilisateur, notamment MCP, et crée des sauvegardes avant les modifications.
+- Surveille `config.toml` dans les deux sens : un modèle choisi dans Codex Desktop resynchronise provider, état et panneau, et un retour au natif y est détecté.
+- Vérifie chaque provider (« Tester tous ») et redémarre seul un adaptateur local devenu obsolète — nouvelle version ou nouvel appariement de slugs.
 
 ## Providers disponibles
 
@@ -159,9 +161,23 @@ Si l’utilisateur possède déjà une valeur `web_search`, elle est conservée 
 - retire les champs propres au compte OpenAI et borne `reasoning.effort` ;
 - transmet les function calls lorsque le client a réellement envoyé des tools ;
 - bufferise les sessions Desktop `tools=0` et les réponses à restituer, afin de terminer proprement ;
-- conserve un log technique par requête : provider, modèle, nombre de tools, streaming et pontages.
+- conserve un log technique par requête : provider, modèle, nombre de tools, streaming et pontages ;
+- injecte une note système quand la session n’envoie aucun outil, pour obtenir une réponse texte au lieu d’appels impossibles à exécuter ;
+- complète automatiquement les appels d’outils orphelins — jusqu’à deux rounds où chaque appel en attente reçoit « outil non disponible » — afin de garantir une réponse texte ;
+- rafraîchit au mieux un jeton OAuth Claude Code expiré avant de renvoyer l’erreur.
 
 MCP est configuré et exécuté par Codex : le proxy voit les tools MCP comme des function tools ordinaires et les transmet. Il faut donc toujours vérifier que le provider gère correctement les schémas d’arguments de vos serveurs MCP.
+
+## Cycle de vie des adaptateurs locaux
+
+Au lancement, `provider-proxy.py` est recopié dans `~/Library/Application Support/AI Provider Switcher/` puis exécuté depuis cet emplacement : l’app installée ne dépend plus du dépôt et une mise à jour du script se propage au prochain démarrage.
+
+Chaque adaptateur laisse une fiche `proxy-<port>.json` (version, provider, capacités, appariement slug ↔ modèle, pid), relue au démarrage suivant :
+
+- port ouvert et fiche conforme à l’état attendu : l’adaptateur en place est conservé ;
+- version du script, provider ou appariement des slugs changés — par exemple parce que Codex a rafraîchi `models_cache.json` : l’adaptateur géré est arrêté puis relancé avec le nouvel appariement ;
+- fiche perdue (App Support nettoyé) alors que le proxy tourne encore : il est identifié par sa ligne de commande complète — script **et** port — jamais par le port seul, avant redémarrage ;
+- port occupé par un processus externe : il est conservé, l’application signale qu’un redémarrage manuel est nécessaire.
 
 ## Claude Code
 
@@ -170,6 +186,8 @@ Claude Code n’utilise pas une clé saisie dans le panneau. Le proxy cherche, d
 1. le jeton OAuth Claude Code dans le Trousseau macOS (`Claude Code-credentials`) ;
 2. `ANTHROPIC_AUTH_TOKEN` et `ANTHROPIC_BASE_URL` dans `~/.claude/settings.json` ;
 3. une clé éventuellement fournie par la requête.
+
+Un jeton Trousseau expiré déclenche d’abord une tentative de rafraîchissement OAuth (`refresh_token`, endpoints `api.anthropic.com` puis `claude.ai`). La base upstream suit la même priorité : jeton OAuth présent → `api.anthropic.com`, sinon `ANTHROPIC_BASE_URL`, sinon `api.anthropic.com`.
 
 Le proxy convertit les messages et les tools entre le format Responses de Codex et le format Messages d’Anthropic. Trois points spécifiques à cet adaptateur :
 
@@ -204,6 +222,17 @@ Codex recharge toute sa configuration — et relance sa connexion — à chaque 
 - quand Codex a lui-même écrit la sélection voulue — l'utilisateur change de modèle dans le Desktop — seul l'état sidecar est mis à jour, `config.toml` n'est pas retouché.
 
 La disposition des blocs gérés est déterministe (providers puis `[tools]`, catalogue en tête). Sans cela, chaque installation permutait leur ordre : le fichier différait à chaque fois, Codex rechargeait, et les lignes vides laissées par les retraits s'accumulaient — un `config.toml` observé avait 483 lignes vides consécutives sur 886 lignes.
+
+## Surveillance de config.toml
+
+L’application observe le fichier (événements filesystem, traitement différé d’1,5 s pour laisser finir une écriture) et resynchronise son état quand **Codex** y écrit lui-même :
+
+- Le sélecteur du Desktop n’écrit que `model`, jamais `model_provider`. Comme les providers routés sont exposés sous les slugs natifs de Codex, cette valeur seule ne suffit plus à identifier le provider : `model_provider` reste la source de vérité, et le slug y est résolu vers le vrai modèle (`provider-switcher-state.json` et panneau mis à jour).
+- Si le fichier porte déjà exactement la sélection voulue, seul l’état sidecar est mis à jour : `config.toml` n’est pas réécrit, donc Codex ne recharge pas sa configuration et ne perd pas sa connexion.
+- Si `model_provider` disparaît ou redevient `openai` alors qu’un override était actif, le fichier est honoré : override révoqué, retour au natif dans le panneau.
+- Un slug que le provider actif ne connaît pas est résolu vers son modèle par défaut plutôt que de faire échouer la requête.
+
+Pendant une sélection faite depuis le panneau, la surveillance est suspendue puis relancée : le watcher ne doit jamais réagir aux écritures de l’application elle-même.
 
 ## Clés et sécurité
 
@@ -254,9 +283,15 @@ Le mode `--panel-screenshot` utilise des données fictives, désactive les actio
 ~/.codex/backup-provider-switcher/           sauvegardes avant modification
 ~/Library/Application Support/AI Provider Switcher/providers.json
                                              clés locales optionnelles, mode 0600
+~/Library/Application Support/AI Provider Switcher/discovered-models.json
+                                             dernières listes de modèles annoncées par les providers
+~/Library/Application Support/AI Provider Switcher/provider-proxy.py
+                                             copie exécutée de l’adaptateur, rafraîchie à chaque lancement
+~/Library/Application Support/AI Provider Switcher/proxy-<port>.json
+                                             fiche d’état de chaque adaptateur (version, capacités, pid)
 ```
 
-Les blocs gérés sont encadrés par `provider-switcher`. La désinstallation retire uniquement les blocs, profils et catalogues gérés par l’application, puis restaure la configuration native et préserve les sections utilisateur.
+Les blocs gérés sont encadrés par `provider-switcher`. La désinstallation retire uniquement les blocs, profils et catalogues gérés par l’application, puis restaure la configuration native et préserve les sections utilisateur. Les emplacements sous `~/.codex` respectent la variable d’environnement `CODEX_HOME`.
 
 ## Diagnostic
 
@@ -291,6 +326,12 @@ curl -s http://127.0.0.1:18888/v1/models | python3 -m json.tool
 curl -s http://127.0.0.1:18889/v1/models | python3 -m json.tool
 curl -s http://127.0.0.1:18890/v1/models | python3 -m json.tool
 curl -s http://127.0.0.1:18892/v1/models | python3 -m json.tool
+```
+
+Vérifier ce qu’un provider sert réellement — route privée utilisée par « Rafraîchir les modèles », qui renvoie ses vrais identifiants :
+
+```bash
+curl -s http://127.0.0.1:18888/_switcher/upstream-models | python3 -m json.tool
 ```
 
 Si le Desktop affiche le provider mais n’exécute pas les tools, inspecter le log du proxy :
@@ -331,7 +372,11 @@ Sources/
     ├── CodexConfigStore.swift             installation, override et réversibilité
     ├── CompatibilityChecker.swift         test de `/v1/responses`
     ├── KeyStore.swift                     mémoire et persistance 0600
-    └── ProviderRouter.swift               état actif provider/modèle
+    ├── ProviderRouter.swift               état actif provider/modèle
+    └── Support/
+        ├── HTTPClient.swift                  client URLSession async
+        ├── Logging.swift                     journal unifié, secrets masqués avant toute écriture
+        └── Secrets.swift                     clé en mémoire effaçable, jamais une String ordinaire
 
 Resources/provider-proxy.py               relay Responses, adaptateur Anthropic, pont d'outils
 docs/screenshots/                         captures utilisées dans ce README
@@ -374,6 +419,8 @@ indique en revanche que le binaire a été lancé hors de son bundle `.app`.
 - Ollama est un provider intégré à Codex, sans adapter local : il reçoit les function tools du catalogue, mais pas le nettoyage de requête du proxy (un `service_tier` global dans `config.toml` lui est transmis tel quel).
 - Les providers OpenAI-compatible n’implémentent pas tous Responses, le streaming, les images ou les tools de façon identique.
 - Les proxies tournent tant que l’application de la barre de menus est active.
+- Un adaptateur dont le port est occupé par un processus externe n’est pas remplacé : l’application le signale et demande un redémarrage manuel.
+- La complétion automatique des tools orphelins effectue au plus deux rounds ; au-delà, la réponse du modèle est renvoyée telle quelle.
 - Les modèles, quotas et noms de modèles peuvent évoluer côté provider.
 
 ## Références
