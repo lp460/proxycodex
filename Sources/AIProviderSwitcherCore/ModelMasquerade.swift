@@ -68,6 +68,13 @@ public enum ModelMasquerade {
         return models
     }
 
+    /// How many provider models Codex can expose while masquerading: one per
+    /// listed native slug. Hidden slugs (`codex-auto-review`, `gpt-reserve`)
+    /// are internal to Codex and never take a provider model of their own.
+    public static func listedSlotCount(cacheURL: URL) -> Int {
+        nativeModels(cacheURL: cacheURL).filter(\.listed).count
+    }
+
     public static func aliases(for provider: Provider, cacheURL: URL) -> [ModelAlias] {
         aliases(for: provider, native: nativeModels(cacheURL: cacheURL))
     }
@@ -102,6 +109,38 @@ public enum ModelMasquerade {
         let map = aliases(for: provider, cacheURL: cacheURL).filter(\.listed)
         guard !map.isEmpty else { return provider.models }
         return provider.models.filter { model in map.contains { $0.model == model } }
+    }
+
+    /// Resolves the user's chosen subset against the provider's current model
+    /// list. When the provider fits in the native slug slots, the full list is
+    /// kept untouched; otherwise the chosen models are kept (bounded by the
+    /// slots), with the provider's default model always guaranteed a slot so
+    /// Codex's internal requests keep resolving. A missing cache disables
+    /// masquerading, so the full list is returned instead.
+    public static func resolvedSelection(
+        for provider: Provider,
+        selection: [String]?,
+        cacheURL: URL
+    ) -> [String] {
+        guard masquerades(provider) else { return provider.models }
+        let slots = listedSlotCount(cacheURL: cacheURL)
+        guard slots > 0, provider.models.count > slots else { return provider.models }
+        let available = Set(provider.models)
+        let picked = Set((selection ?? []).filter { available.contains($0) })
+        // Default model first: it always takes the primary native slug. Without
+        // a user selection, keep the provider's first models (default + the
+        // next ones) so the picker never shrinks to a single model.
+        let ordered = [provider.defaultModel] + provider.models
+        var result: [String] = []
+        var seen: Set<String> = []
+        for model in ordered {
+            // Always keep the default; keep the chosen models when the user made
+            // a choice, or the provider's first models when they did not.
+            guard model == provider.defaultModel || picked.isEmpty || picked.contains(model) else { continue }
+            if seen.insert(model).inserted { result.append(model) }
+        }
+        if result.count > slots { result = Array(result.prefix(slots)) }
+        return result
     }
 
     /// The slug Codex must see for this provider model. Returns `model` itself

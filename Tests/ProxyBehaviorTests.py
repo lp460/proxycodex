@@ -261,7 +261,8 @@ class ProxyBehaviorTests(unittest.TestCase):
             self.assertEqual(self.proxy.opencode_cli_models(), ["big-pickle", "hy3-free"])
 
     def test_discovery_tries_both_model_paths(self):
-        # z.ai carries its own version segment (/api/paas/v4), so /v1/models 404s.
+        # Some upstreams only serve /models (z.ai's legacy /api/paas/v4 base);
+        # discovery falls back when /v1/models is missing.
         calls = []
 
         def fake_get(url, headers, timeout=20):

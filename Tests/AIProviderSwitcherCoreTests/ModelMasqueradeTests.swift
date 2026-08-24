@@ -82,7 +82,7 @@ final class ModelMasqueradeTests: XCTestCase {
         XCTAssertEqual(ModelMasquerade.model(for: "gpt-9-imaginary", provider: glm, cacheURL: cache),
                        glm.defaultModel)
         // A real model name is left alone, so probes keep working.
-        XCTAssertEqual(ModelMasquerade.model(for: "glm-4.6", provider: glm, cacheURL: cache), "glm-4.6")
+        XCTAssertEqual(ModelMasquerade.model(for: "glm-4.7", provider: glm, cacheURL: cache), "glm-4.7")
     }
 
     /// Regression: slugs were once padded from a hard-coded pool. When one of
@@ -106,6 +106,69 @@ final class ModelMasqueradeTests: XCTestCase {
         // The real model name is then used, which is what worked before.
         XCTAssertEqual(ModelMasquerade.slug(for: "deepseek-v4-pro", provider: deepseek, cacheURL: missing),
                        "deepseek-v4-pro")
+    }
+
+    func testListedSlotCountOnlyCountsVisibleSlugs() throws {
+        try writeCache([("gpt-5.6-sol", "list"), ("gpt-5.6-terra", "list"), ("gpt-reserve", "hide")])
+        XCTAssertEqual(ModelMasquerade.listedSlotCount(cacheURL: cache), 2)
+    }
+
+    /// A provider serving more models than listed native slugs keeps only the
+    /// user-chosen subset, bounded by the slots, with the default first.
+    func testResolvedSelectionKeepsChosenModelsWithinSlots() throws {
+        try writeCache([("gpt-5.6-sol", "list"), ("gpt-5.6-terra", "list"), ("gpt-reserve", "hide")])
+        let opencode = try XCTUnwrap(ProviderCatalog.default[id: "opencode"]) // 7 declared models
+        let chosen = ["x-preview-f-free", "hy3-free"]
+        let resolved = ModelMasquerade.resolvedSelection(
+            for: opencode, selection: chosen, cacheURL: cache)
+        // Default hoisted first, then the chosen models, capped at 2 slots.
+        XCTAssertEqual(resolved, [opencode.defaultModel, "hy3-free"])
+    }
+
+    /// The default model always keeps a slot, even if the user never selected it.
+    func testResolvedSelectionAlwaysKeepsDefault() throws {
+        try writeCache([("gpt-5.6-sol", "list")])
+        let opencode = try XCTUnwrap(ProviderCatalog.default[id: "opencode"])
+        let resolved = ModelMasquerade.resolvedSelection(
+            for: opencode, selection: ["hy3-free"], cacheURL: cache)
+        XCTAssertTrue(resolved.contains(opencode.defaultModel))
+        XCTAssertEqual(resolved.count, 1)
+    }
+
+    /// Stale selections (a model the provider stopped serving) are dropped
+    /// instead of resurrecting an unknown model name.
+    func testResolvedSelectionPrunesStaleModels() throws {
+        try writeCache([("gpt-5.6-sol", "list"), ("gpt-5.6-terra", "list")])
+        let opencode = try XCTUnwrap(ProviderCatalog.default[id: "opencode"])
+        let resolved = ModelMasquerade.resolvedSelection(
+            for: opencode, selection: ["hy3-free", "ghost-model"], cacheURL: cache)
+        XCTAssertFalse(resolved.contains("ghost-model"))
+        XCTAssertEqual(resolved.count, 2)
+    }
+
+    /// Without a user selection, the provider's first models fill the slots
+    /// (default + the next ones) — the picker must never shrink to one model.
+    func testResolvedSelectionWithoutChoiceKeepsFirstModels() throws {
+        try writeCache([("gpt-5.6-sol", "list"), ("gpt-5.6-terra", "list"), ("gpt-5.6-luna", "list")])
+        let claude = try XCTUnwrap(ProviderCatalog.default[id: "claude"]) // 7 models
+        let resolved = ModelMasquerade.resolvedSelection(
+            for: claude, selection: nil, cacheURL: cache)
+        XCTAssertEqual(resolved.first, claude.defaultModel)
+        XCTAssertEqual(resolved.count, 3)
+        // No duplicate default entry.
+        XCTAssertEqual(Set(resolved).count, resolved.count)
+    }
+
+    /// When the provider fits in the slots (or the cache is missing), the full
+    /// list is kept untouched — the picker has no reason to appear.
+    func testResolvedSelectionFullListWhenItFitsOrNoCache() throws {
+        let deepseek = try XCTUnwrap(ProviderCatalog.default[id: "deepseek"]) // 2 models
+        try writeCache([("gpt-5.6-sol", "list"), ("gpt-5.6-terra", "list")])
+        XCTAssertEqual(ModelMasquerade.resolvedSelection(
+            for: deepseek, selection: ["deepseek-v4-pro"], cacheURL: cache), deepseek.models)
+        XCTAssertEqual(ModelMasquerade.resolvedSelection(
+            for: deepseek, selection: nil, cacheURL: URL(fileURLWithPath: "/nonexistent.json")),
+            deepseek.models)
     }
 
     /// Fewer slugs than models: the extra models stay selectable under their real

@@ -60,8 +60,9 @@ public final class CompatibilityChecker: Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let response: HTTPURLResponse
+        let data: Data
         do {
-            (response, _) = try await client.send(request)
+            (response, data) = try await client.send(request)
         } catch {
             return CompatibilityResult(
                 state: .incompatible(reason: "Cannot reach \(provider.displayName): \(error.localizedDescription)"),
@@ -70,6 +71,17 @@ public final class CompatibilityChecker: Sendable {
         }
         let code = response.statusCode
         Log.info("Compatibility probe for \(provider.displayName) -> HTTP \(code) at \(endpoint.absoluteString)")
+        // Some gateways (Z.ai notably) answer HTTP 200 with an error object in
+        // the body for a rejected key, e.g. {"code":401,"msg":"token expired or
+        // incorrect","success":false} or {"code":1000,"msg":"Authentication
+        // Failed"}. A 2xx must not be treated as "connected" in that case.
+        if let authFailure = Self.embeddedAuthFailure(data: data) {
+            Log.info("Compatibility probe for \(provider.displayName) -> embedded auth failure (HTTP \(code))")
+            return CompatibilityResult(
+                state: .incompatible(reason: "\(provider.displayName) a refusé la clé : \(authFailure)"),
+                detail: "HTTP \(code) auth"
+            )
+        }
         switch code {
         case 200...299:
             return CompatibilityResult(state: .compatible, detail: "HTTP \(code)")
@@ -87,5 +99,39 @@ public final class CompatibilityChecker: Sendable {
             // 4xx/5xx other than the above still means the endpoint exists.
             return CompatibilityResult(state: .compatible, detail: "HTTP \(code)")
         }
+    }
+
+    /// Detects an authentication failure hidden inside an otherwise successful
+    /// HTTP response. Handles both Z.ai's flat `{"code":401,"msg":…}` shape and
+    /// the OpenAI-compatible `{"error":{"code":"401","message":…}}` shape.
+    static func embeddedAuthFailure(data: Data) -> String? {
+        guard !data.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let errorObject = object["error"] as? [String: Any]
+        let codeValue = object["code"] ?? errorObject?["code"]
+        let message = (object["msg"] as? String)
+            ?? (object["message"] as? String)
+            ?? (errorObject?["message"] as? String)
+            ?? (errorObject?["msg"] as? String)
+
+        if let codeValue {
+            let codeString = "\(codeValue)"
+            if ["401", "402", "403"].contains(codeString) {
+                return message?.isEmpty == false ? message : "code \(codeString)"
+            }
+        }
+        guard let message, !message.isEmpty else { return nil }
+        let text = message.lowercased()
+        if text.contains("authentication failed")
+            || text.contains("token expired")
+            || text.contains("invalid api key")
+            || text.contains("invalid key")
+            || text.contains("unauthorized")
+            || text.contains("bad credentials") {
+            return message
+        }
+        return nil
     }
 }

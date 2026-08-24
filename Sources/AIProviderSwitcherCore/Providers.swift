@@ -153,10 +153,13 @@ public struct ProviderCatalog: Sendable, Equatable {
         Provider(
             id: "glm",
             displayName: "GLM (Z.ai)",
-            // GLM-5.2 is Z.ai's strongest coding model. OpenAI-compatible base.
-            baseURL: URL(string: "https://api.z.ai/api/paas/v4")!,
+            // GLM-5.2 is Z.ai's strongest coding model. The Responses API lives
+            // under https://api.z.ai/api/v1 — the `/api/paas/v4` base serves
+            // chat completions only and returns 404 on `/v1/responses`. The
+            // local adapter appends `/v1/responses` to this base.
+            baseURL: URL(string: "https://api.z.ai/api")!,
             environmentVariable: "ZAI_API_KEY",
-            models: ["glm-5.2", "glm-4.6", "glm-4.5"],
+            models: ["glm-5.2", "glm-5.2-highspeed", "glm-5-turbo", "glm-5.3", "glm-4.7"],
             defaultModel: "glm-5.2",
             // Same bridged agentic set as DeepSeek.
             supportsTools: true,

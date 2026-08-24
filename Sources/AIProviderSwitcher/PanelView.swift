@@ -176,7 +176,47 @@ struct PanelView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if state.shouldShowModelPicker {
+                modelSlotPicker
+            }
         }
+    }
+
+    /// Checkboxes to choose which provider models occupy Codex's finite native
+    /// slugs. Only shown when the provider serves more models than slots.
+    private var modelSlotPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Modèles exposés · \(state.exposedModelCount)/\(state.modelSlots) emplacements")
+                .font(.caption.weight(.medium))
+            ForEach(state.allModelsForActive, id: \.self) { model in
+                Toggle(isOn: Binding(
+                    get: { state.isModelSelected(model) },
+                    set: { on in Task { await state.setModelSelected(model, selected: on) } }
+                )) {
+                    HStack(spacing: 5) {
+                        if state.modelLocked(model) {
+                            Image(systemName: "lock.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(model)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .controlSize(.mini)
+                .font(.caption2)
+                .disabled(state.isScreenshotMode || (state.isModelSelected(model) && state.modelLocked(model)))
+            }
+            Text("Codex n'expose que \(state.modelSlots) emplacements ; le modèle par défaut et le modèle actif restent verrouillés.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var catalogConflictNotice: some View {
@@ -231,7 +271,7 @@ struct PanelView: View {
             HStack(spacing: 8) {
                 Image(systemName: "lock.fill")
                     .foregroundStyle(.secondary)
-                TextField(state.keyEditingProvider.map { state.hasKey(for: $0.id) ? "Clé existante — tapez pour remplacer" : "sk-…" } ?? "sk-…", text: $draftKey)
+                TextField(keyPlaceholder, text: $draftKey)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                     .textContentType(.none)
@@ -254,6 +294,18 @@ struct PanelView: View {
                     state.dismissKeyEditor()
                 }
                 .controlSize(.small)
+            }
+            if let provider = state.keyEditingProvider, provider.id == "glm" {
+                let trimmed = trimmedKey
+                if trimmed.hasPrefix("sk-") {
+                    Label("Format DeepSeek/OpenRouter détecté — une clé Z.ai est de la forme ID.secret.", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                } else if !trimmed.isEmpty && !trimmed.contains(".") {
+                    Label("Format attendu : ID.secret (la clé Z.ai contient un point).", systemImage: "info.circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -394,6 +446,17 @@ struct PanelView: View {
         Text(s.uppercased())
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.secondary)
+    }
+
+    /// Placeholder that hints at the format each provider expects: Z.ai keys are
+    /// `ID.secret`, everything else in this app is `sk-…`.
+    private var keyPlaceholder: String {
+        guard let provider = state.keyEditingProvider else { return "sk-…" }
+        if state.hasKey(for: provider.id) { return "Clé existante — tapez pour remplacer" }
+        switch provider.id {
+        case "glm": return "ID.secret (clé Z.ai, ex. 6e6c…54d8.xxxx)"
+        default: return "sk-…"
+        }
     }
 }
 

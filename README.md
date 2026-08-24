@@ -16,7 +16,8 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 - Relance Codex Desktop/ChatGPT lorsque cela est nécessaire pour recharger la configuration.
 - Lance Codex CLI dans Terminal avec `--profile` et une clé injectée uniquement dans l’environnement.
 - Génère un catalogue de modèles compatible avec le schéma Codex, limité au provider actif.
-- Démarre des proxies locaux pour adapter les providers qui n’exposent pas directement l’API Responses.
+- Si un provider sert plus de modèles que Codex n'expose de slugs (6 aujourd'hui), le panneau affiche des cases à cocher pour choisir lesquels occuper ces emplacements — le choix est conservé entre les sessions.
+- Démarre des proxies locaux pour adapter les providers qui n'exposent pas directement l'API Responses.
 - Donne le même jeu de fonctionnalités à tous les providers : MCP, shell, `apply_patch`, plugins et skills.
 - Interroge chaque provider pour connaître les modèles qu'il sert réellement, au lieu d'une liste figée.
 - Préserve les sections utilisateur, notamment MCP, et crée des sauvegardes avant les modifications.
@@ -92,7 +93,7 @@ La requête passe par l'adaptateur local (`GET /_switcher/upstream-models`), seu
 
 | Provider | Source interrogée |
 |---|---|
-| DeepSeek, GLM, OpenRouter | `/v1/models` de l'upstream, puis `/models` si la base porte déjà sa version (z.ai) |
+| DeepSeek, GLM, OpenRouter | `/v1/models` de l'upstream (GLM : catalogue Responses sous `api.z.ai/api/v1/models`) |
 | OpenCode Zen | `opencode models opencode` via la CLI détectée — la passerelle ne distingue pas le palier gratuit |
 | Claude Code | `/v1/models` d'Anthropic, avec le jeton de Claude Code |
 | Ollama | interrogé directement, sans adaptateur |

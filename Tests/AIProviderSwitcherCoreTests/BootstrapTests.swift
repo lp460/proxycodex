@@ -31,7 +31,7 @@ final class BootstrapTests: XCTestCase {
         let glm = ProviderCatalog.default[id: "glm"]
         XCTAssertNotNil(glm)
         XCTAssertEqual(glm?.environmentVariable, "ZAI_API_KEY")
-        XCTAssertEqual(glm?.baseURL.absoluteString, "https://api.z.ai/api/paas/v4")
+        XCTAssertEqual(glm?.baseURL.absoluteString, "https://api.z.ai/api")
         XCTAssertTrue(glm?.models.contains("glm-5.2") ?? false)
     }
 

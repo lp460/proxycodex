@@ -28,7 +28,11 @@ final class AppState: ObservableObject {
     let configStore = CodexConfigStore()
     let discovery = ModelDiscovery()
     let discoveredStore = DiscoveredModelStore(url: DiscoveredModelStore.defaultURL())
+    let selectionStore = ModelSelectionStore(url: ModelSelectionStore.defaultURL())
     private var discovered: [String: DiscoveredModels] = [:]
+    /// Per-provider subset of models exposed through Codex's finite native
+    /// slugs, as chosen by the user. Absent = keep the provider's first models.
+    private var modelSelection: [String: [String]] = [:]
 
     private(set) var router: ProviderRouter?
     private let screenshotMode: Bool
@@ -55,6 +59,11 @@ final class AppState: ObservableObject {
     private let maxLogs = 100
     private var configWatcher: DispatchSourceFileSystemObject?
     private var configFixTask: Task<Void, Never>?
+    /// Set when a provider card click asked for a key that was missing: the
+    /// next successful injection for that provider applies the selection and
+    /// relaunches Codex, so the user never has to click the card a second time.
+    private var applySelectionAfterKeyInjection = false
+    private var applySelectionTargetID: String?
 
     init() {
         screenshotMode = CommandLine.arguments.contains("--panel-screenshot")
@@ -80,6 +89,9 @@ final class AppState: ObservableObject {
                 version: "1.18.21",
                 hasZenCredential: false
             )
+            if let opencode = ProviderCatalog.default[id: "opencode"] {
+                modelSelection["opencode"] = Array(opencode.models.prefix(6))
+            }
             router = try? ProviderRouter(
                 catalog: catalog,
                 keyResolver: keyStore,
@@ -95,6 +107,7 @@ final class AppState: ObservableObject {
             _ = try? keyStore.enablePersistence(at: KeyStore.defaultPersistentURL())
             persistenceEnabled = keyStore.persistenceEnabled
             _ = try? keyStore.loadFromDisk()
+            modelSelection = selectionStore.load()
             // Build the router/detect native config as soon as the app launches, so the
             // menu actions (select, key, launch) are wired before the user clicks.
             Task { await self.bootstrap() }
@@ -221,6 +234,17 @@ final class AppState: ObservableObject {
             provider.withModels(ModelDiscovery.resolvedModels(
                 for: provider, discovered: entries[provider.id]))
         })
+        // Drop selections pointing at models the provider no longer serves.
+        // The default model is re-added by `exposedModels` when missing.
+        var pruned = modelSelection
+        for provider in catalog.providers {
+            if var selected = pruned[provider.id] {
+                selected = selected.filter { provider.models.contains($0) }
+                pruned[provider.id] = selected.isEmpty ? nil : selected
+            }
+        }
+        modelSelection = pruned
+        try? selectionStore.save(modelSelection)
     }
 
     /// When the models were last read from the providers.
@@ -273,19 +297,89 @@ final class AppState: ObservableObject {
     /// model without one would end up outside the catalog Codex reads.
     var selectableModels: [String] {
         guard let provider = activeProvider else { return [] }
+        let effective = effectiveCatalog[id: provider.id] ?? provider
         return ModelMasquerade.exposableModels(
-            for: provider,
+            for: effective,
             cacheURL: configStore.paths.modelsCacheJson
         )
+    }
+
+    /// Providers with models reduced to the user-chosen exposed subset. The
+    /// full discovered lists stay in `catalog` so the picker keeps every
+    /// choice; everything Codex sees (catalog, profiles, adapter pairing) uses
+    /// these effective providers instead.
+    private var effectiveCatalog: ProviderCatalog {
+        ProviderCatalog(providers: catalog.providers.map { provider in
+            provider.withModels(exposedModels(for: provider.id))
+        })
+    }
+
+    /// Number of native slugs Codex currently exposes (one per listed model).
+    var modelSlots: Int {
+        ModelMasquerade.listedSlotCount(cacheURL: configStore.paths.modelsCacheJson)
+    }
+
+    /// Models actually exposed for a provider: the full list when it fits in
+    /// the native slug slots, otherwise the user's chosen subset, with the
+    /// default model always guaranteed a slot.
+    func exposedModels(for providerID: String) -> [String] {
+        guard let provider = catalog[id: providerID] else { return [] }
+        var result = ModelMasquerade.resolvedSelection(
+            for: provider,
+            selection: modelSelection[providerID],
+            cacheURL: configStore.paths.modelsCacheJson
+        )
+        // Defensive pin: the active model must keep a slot so the running
+        // selection stays valid even if a stale selection file says otherwise.
+        if providerID == snapshot.activeProviderID,
+           !snapshot.activeModel.isEmpty,
+           !result.contains(snapshot.activeModel) {
+            if result.count < modelSlots {
+                result.append(snapshot.activeModel)
+            } else if !result.isEmpty {
+                result[result.count - 1] = snapshot.activeModel
+            }
+        }
+        return result
+    }
+
+    /// Full model list of the active provider, for the selection checkboxes.
+    var allModelsForActive: [String] {
+        activeProvider?.models ?? []
+    }
+
+    /// How many slots the active provider currently occupies.
+    var exposedModelCount: Int {
+        exposedModels(for: snapshot.activeProviderID).count
+    }
+
+    /// The slot checkboxes only matter when the provider serves more models
+    /// than Codex can expose — otherwise every model already has a slot.
+    var shouldShowModelPicker: Bool {
+        guard let provider = activeProvider, ModelMasquerade.masquerades(provider) else { return false }
+        return modelSlots > 0 && provider.models.count > modelSlots
+    }
+
+    func isModelSelected(_ model: String, for providerID: String? = nil) -> Bool {
+        exposedModels(for: providerID ?? snapshot.activeProviderID).contains(model)
+    }
+
+    /// Which models must keep a slot no matter what the user toggles.
+    func modelLocked(_ model: String, for providerID: String? = nil) -> Bool {
+        let id = providerID ?? snapshot.activeProviderID
+        guard let provider = catalog[id: id] else { return false }
+        if model == provider.defaultModel { return true }
+        return id == snapshot.activeProviderID && model == snapshot.activeModel
     }
 
     /// Slug Codex believes it is talking to, when the active provider is exposed
     /// under one of Codex's own models. `nil` when no masquerading happens.
     var exposedModel: String? {
         guard let provider = activeProvider, ModelMasquerade.masquerades(provider) else { return nil }
+        let effective = effectiveCatalog[id: provider.id] ?? provider
         let slug = ModelMasquerade.slug(
             for: snapshot.activeModel,
-            provider: provider,
+            provider: effective,
             cacheURL: configStore.paths.modelsCacheJson
         )
         return slug == snapshot.activeModel ? nil : slug
@@ -302,7 +396,7 @@ final class AppState: ObservableObject {
         do {
             let selectedProviderID = activeProviderID ?? snapshot.activeProviderID
             let report = try configStore.install(
-                providers: catalog.providers,
+                providers: effectiveCatalog.providers,
                 activeProviderID: selectedProviderID
             )
             providersInstalled = true
@@ -336,6 +430,10 @@ final class AppState: ObservableObject {
         stopConfigWatcher()
         defer { startConfigWatcher() }
         dismissKeyEditor()
+        // A pending key-injection auto-apply belongs to the exact card click
+        // that requested it; any other selection cancels it.
+        applySelectionAfterKeyInjection = false
+        applySelectionTargetID = nil
         let provider = catalog[id: providerID]
         let model = provider?.defaultModel ?? snapshot.activeModel
         do {
@@ -346,15 +444,21 @@ final class AppState: ObservableObject {
                 log("OpenAI natif : override supprimé, relance de ChatGPT/Codex…")
             } else {
                 guard let provider else { return }
+                let effective = effectiveCatalog[id: provider.id] ?? provider
                 if provider.requiresKey && !hasKey(for: provider.id) {
-                    log("Saisissez d'abord la clé pour \(provider.displayName), puis cliquez sa carte à nouveau.")
+                    let persisted = keyStore.persistedProviderIDs().contains(provider.id)
+                    log(persisted
+                        ? "Clé \(provider.displayName) présente sur disque mais pas en mémoire : relancez l'app pour la recharger."
+                        : "Saisissez d'abord la clé pour \(provider.displayName)\(persistenceEnabled ? "" : " (persistance locale désactivée)"), puis cliquez sa carte à nouveau.")
+                    applySelectionAfterKeyInjection = true
+                    applySelectionTargetID = provider.id
                     presentKeySheet(for: provider.id)
                     return
                 }
                 // Write the new model/provider first. The config watcher can
                 // then never observe a Claude catalog paired with the previous
                 // GPT model and revert the selection to OpenAI.
-                _ = try configStore.applyOverride(provider: provider, model: model)
+                _ = try configStore.applyOverride(provider: effective, model: model)
                 installProviders(activeProviderID: providerID)
                 snapshot = try await router.setActive(providerID: providerID, model: model)
                 log("Sélection : \(provider.displayName) · \(model). Relance de ChatGPT/Codex…")
@@ -378,9 +482,10 @@ final class AppState: ObservableObject {
         do {
             snapshot = try await router.setActive(providerID: provider.id, model: model)
             if provider.id != "openai" {
+                let effective = effectiveCatalog[id: provider.id] ?? provider
                 // Keep model_provider and model in sync before refreshing the
                 // provider catalog, avoiding a transient old-provider state.
-                _ = try configStore.applyOverride(provider: provider, model: model)
+                _ = try configStore.applyOverride(provider: effective, model: model)
                 installProviders(activeProviderID: provider.id)
                 log("Modèle : \(model). Relance de ChatGPT/Codex…")
                 await relaunchChatGPT()
@@ -392,13 +497,76 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Toggles a model in/out of the finite Codex slots for a provider. The
+    /// default model and the active model are pinned; the change persists and
+    /// re-applies immediately (catalog + adapter pairing + Desktop picker).
+    func setModelSelected(_ model: String, selected: Bool, for providerID: String? = nil) async {
+        guard !screenshotMode else { return }
+        let targetID = providerID ?? snapshot.activeProviderID
+        guard let provider = catalog[id: targetID] else { return }
+        let current = exposedModels(for: targetID)
+        var next: [String]
+        if selected {
+            guard !current.contains(model), current.count < modelSlots else { return }
+            next = orderedExposed(current + [model], provider: provider)
+        } else {
+            guard !modelLocked(model, for: targetID) else { return }
+            next = current.filter { $0 != model }
+        }
+        guard next != current else { return }
+        modelSelection[targetID] = next
+        try? selectionStore.save(modelSelection)
+
+        stopConfigWatcher()
+        defer { startConfigWatcher() }
+        // The adapter advertises the new pairing; the active provider's static
+        // catalog is regenerated so the Desktop picker only lists the choice.
+        ensureProxiesRunning()
+        if targetID == snapshot.activeProviderID {
+            installProviders(activeProviderID: targetID)
+            log("Modèles exposés (\(next.count)/\(modelSlots)) : \(next.joined(separator: ", ")). Relance de ChatGPT/Codex…")
+            await relaunchChatGPT()
+        } else {
+            log("Modèles exposés pour \(provider.displayName) : \(next.joined(separator: ", ")).")
+        }
+    }
+
+    /// Orders an exposed subset with the default model first, the rest in the
+    /// provider's own order.
+    private func orderedExposed(_ models: [String], provider: Provider) -> [String] {
+        let wanted = Set(models)
+        var result: [String] = []
+        var seen: Set<String> = []
+        for model in [provider.defaultModel] + provider.models where wanted.contains(model) {
+            if seen.insert(model).inserted { result.append(model) }
+        }
+        return result
+    }
+
     func setSessionKey(_ value: String, for providerID: String? = nil) async {
         guard !screenshotMode else { return }
         let targetID = providerID ?? editingProviderID ?? snapshot.activeProviderID
         guard let provider = catalog[id: targetID] else { return }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if provider.id == "glm" {
+            if trimmed.hasPrefix("sk-") {
+                log("Attention : cette clé commence par « sk- » (format DeepSeek/OpenRouter). Une clé Z.ai se présente comme ID.secret — elle sera quand même testée.")
+            } else if !trimmed.contains(".") {
+                log("Attention : une clé Z.ai se présente comme ID.secret (ex. 6e6c…54d8.xxxx). La clé collée n'a pas ce format — elle sera quand même testée.")
+            }
+        }
         keyStore.setKey(value, for: provider.id)
         log("Clé injectée en mémoire pour \(provider.displayName).")
-        await runTest(providerID: provider.id)
+        if applySelectionAfterKeyInjection, applySelectionTargetID == provider.id {
+            applySelectionAfterKeyInjection = false
+            applySelectionTargetID = nil
+            log("Activation de \(provider.displayName) avec la clé injectée…")
+            await select(providerID: provider.id)
+        } else {
+            applySelectionAfterKeyInjection = false
+            applySelectionTargetID = nil
+            await runTest(providerID: provider.id)
+        }
     }
 
     func clearKey(for providerID: String? = nil) {
@@ -660,10 +828,13 @@ final class AppState: ObservableObject {
         modelAliases(for: provider).map { "\($0.slug)=\($0.model)" }.joined(separator: ",")
     }
 
-    private let proxyVersion = "2026-08-22-discovery-v2"
+    // Bumped whenever the adapter contract changes (base URLs, pairing, flags):
+    // a stale running proxy would otherwise be kept because its metadata still
+    // matches everything this version compares.
+    private let proxyVersion = "2026-08-23-responses-v3"
 
     func ensureProxiesRunning() {
-        for provider in catalog.providers {
+        for provider in effectiveCatalog.providers {
             guard let port = CodexConfigGenerator.proxyPort(for: provider.id) else { continue }
             let script = proxyScriptURL()
             if isPortOpen(port) {
@@ -937,9 +1108,10 @@ final class AppState: ObservableObject {
         guard let providerID = configProvider,
               let provider = catalog[id: providerID],
               provider.id != "openai" else { return }
+        let effective = effectiveCatalog[id: providerID] ?? provider
         let resolved = ModelMasquerade.model(
             for: model,
-            provider: provider,
+            provider: effective,
             cacheURL: configStore.paths.modelsCacheJson
         )
         do {
@@ -949,11 +1121,11 @@ final class AppState: ObservableObject {
                 // effort in the Desktop. If the file already says what we would
                 // write, only the sidecar has to catch up: rewriting it would
                 // make Codex reload and drop its connection for nothing.
-                if configStore.selectionMatchesConfig(provider: provider, exposedModel: model) {
+                if configStore.selectionMatchesConfig(provider: effective, exposedModel: model) {
                     _ = try configStore.recordSelection(
-                        provider: provider, model: resolved, exposedModel: model)
+                        provider: effective, model: resolved, exposedModel: model)
                 } else {
-                    _ = try configStore.applyOverride(provider: provider, model: resolved)
+                    _ = try configStore.applyOverride(provider: effective, model: resolved)
                 }
             }
             if snapshot.activeProviderID != provider.id || snapshot.activeModel != resolved {

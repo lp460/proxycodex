@@ -12,6 +12,59 @@ final class CompatibilityCheckerTests: XCTestCase {
         XCTAssertEqual(result.state, .compatible)
     }
 
+    func test200WithZAI401BodyIsIncompatible() async throws {
+        // Z.ai answers HTTP 200 with a flat error object when the key is dead.
+        let body = #"{"code":401,"msg":"token expired or incorrect","success":false}"#.data(using: .utf8)!
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 200, body: body), body))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "glm"]!
+        let result = try await checker.check(provider: provider, secret: Secret("dead.key"))
+        if case .incompatible(let reason) = result.state {
+            XCTAssertTrue(reason.contains("refusé la clé"))
+            XCTAssertTrue(reason.contains("token expired"))
+        } else {
+            XCTFail("expected incompatible for embedded auth error")
+        }
+    }
+
+    func test200WithZAI1000AuthFailedBodyIsIncompatible() async throws {
+        // Older Z.ai gateways used code 1000 + "Authentication Failed".
+        let body = #"{"code":1000,"msg":"Authentication Failed","success":false}"#.data(using: .utf8)!
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 200, body: body), body))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "glm"]!
+        let result = try await checker.check(provider: provider, secret: Secret("dead.key"))
+        if case .incompatible(let reason) = result.state {
+            XCTAssertTrue(reason.contains("Authentication Failed"))
+        } else {
+            XCTFail("expected incompatible for embedded auth error")
+        }
+    }
+
+    func test200WithErrorCode401ObjectIsIncompatible() async throws {
+        let body = #"{"error":{"code":"401","message":"Invalid API key"}}"#.data(using: .utf8)!
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 200, body: body), body))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "openrouter"]!
+        let result = try await checker.check(provider: provider, secret: Secret("sk-dead-111111111111"))
+        if case .incompatible(let reason) = result.state {
+            XCTAssertTrue(reason.contains("Invalid API key"))
+        } else {
+            XCTFail("expected incompatible for embedded auth error")
+        }
+    }
+
+    func test200WithUnrelatedBodyStaysCompatible() async throws {
+        // A 200 with a body that is not an auth error (e.g. quota/limit notice)
+        // must stay compatible so the probe remains lenient for real successes.
+        let body = #"{"code":429,"msg":"rate limit exceeded","success":false}"#.data(using: .utf8)!
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 200, body: body), body))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "deepseek"]!
+        let result = try await checker.check(provider: provider, secret: Secret("sk-quota-111111111111"))
+        XCTAssertEqual(result.state, .compatible)
+    }
+
     func test401IsIncompatibleAuth() async throws {
         let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 401), Data()))])
         let checker = CompatibilityChecker(client: mock)

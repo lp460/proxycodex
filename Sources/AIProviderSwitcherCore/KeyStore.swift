@@ -161,6 +161,17 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
         Log.info("Loaded \(entries.count) key(s) from persistent file")
     }
 
+    /// Provider ids that have a key in the persistent file, without exposing
+    /// any secret. Used to explain why a key is not resident in memory.
+    public func persistedProviderIDs() -> [String] {
+        guard let url = currentPersistenceURL(), FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let entries = try? JSONDecoder().decode([PersistentEntry].self, from: data) else {
+            return []
+        }
+        return entries.map(\.providerID)
+    }
+
     /// Returns exported profiles for all known providers that currently have a key.
     /// **Never** contains the secret material.
     public func exportProfiles(catalog: ProviderCatalog) -> [ExportedProfile] {
