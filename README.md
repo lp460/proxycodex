@@ -12,6 +12,8 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 
 - Affiche l’état de connexion et la présence d’une clé pour chaque provider.
 - Change le provider et le modèle actifs depuis la barre.
+- Quand une carte demande une clé absente, ouvre le champ de clé pour ce provider précis ; une fois la clé injectée, applique la sélection et relance Codex sans second clic.
+- Distingue une clé refusée d’un provider indisponible : Z.ai répond parfois HTTP 200 avec une erreur d’authentification dans le corps — le test l’interprète comme une clé invalide au lieu d’afficher « Connecté ».
 - Met à jour `model` et `model_provider` dans `~/.codex/config.toml` avec un override réversible.
 - Relance Codex Desktop/ChatGPT lorsque cela est nécessaire pour recharger la configuration.
 - Lance Codex CLI dans Terminal avec `--profile` et une clé injectée uniquement dans l’environnement.
@@ -51,9 +53,11 @@ wire_api = "responses"
 
 `requires_openai_auth = false` est important : Codex ne doit pas essayer d’appliquer le flux d’authentification OpenAI à un endpoint tiers. Les clés ne sont jamais écrites dans `config.toml`.
 
+GLM (Z.ai) expose le catalogue Responses sous `https://api.z.ai/api/v1` — la base historique `/api/paas/v4` ne sert que `/chat/completions` et renvoyait 404 sur `/v1/responses`. Les modèles proposés sont ceux du **coding plan** Z.AI (`glm-5.2`, `glm-5.2-highspeed`, `glm-5-turbo`, `glm-5.3`, `glm-4.7`) et la clé attendue est de la forme `ID.secret` (et non `sk-…`), vérifiée à la saisie.
+
 ## Comment un changement de provider fonctionne
 
-1. L’application vérifie la clé ou le mode sans clé.
+1. L’application vérifie la clé ou le mode sans clé. Si la clé manque, elle ouvre le champ pour ce provider précis ; l’injection applique ensuite la sélection et relance Codex.
 2. Elle rafraîchit le bloc du provider et son profil `~/.codex/<id>.config.toml`.
 3. Elle génère `~/.codex/catalog.json` pour le provider actif uniquement, sous les slugs de Codex.
 4. Elle applique un override réversible de `model` (le slug) et `model_provider`. Le modèle réel est conservé dans `provider-switcher-state.json`.
@@ -367,11 +371,12 @@ Sources/
 └── AIProviderSwitcherCore/
     ├── Providers.swift                   catalogue providers/modèles
     ├── ModelMasquerade.swift             slugs natifs Codex ↔ modèles réels
+    ├── ModelSelectionStore.swift         sélection persistée des modèles exposés (≤ 6)
     ├── OpenCodeCLI.swift                 détection de la CLI OpenCode
     ├── ModelDiscovery.swift              modèles réellement servis + persistance
     ├── CodexConfigGenerator.swift        TOML et catalogue avec capacités tools
     ├── CodexConfigStore.swift             installation, override et réversibilité
-    ├── CompatibilityChecker.swift         test de `/v1/responses`
+    ├── CompatibilityChecker.swift         test de `/v1/responses` (détecte aussi les erreurs d'auth dans un corps 2xx)
     ├── KeyStore.swift                     mémoire et persistance 0600
     ├── ProviderRouter.swift               état actif provider/modèle
     └── Support/

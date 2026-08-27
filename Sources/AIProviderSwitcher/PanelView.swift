@@ -114,9 +114,15 @@ struct PanelView: View {
                             Task { await state.select(providerID: provider.id) }
                         },
                         keyTap: {
+                            NSApp.activate(ignoringOtherApps: true)
                             draftKey = ""
                             state.presentKeySheet(for: provider.id)
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { keyFieldFocused = true }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                if let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+                                    window.makeKeyAndOrderFront(nil)
+                                }
+                                keyFieldFocused = true
+                            }
                         },
                         isInteractionDisabled: state.isScreenshotMode
                     )
@@ -252,9 +258,15 @@ struct PanelView: View {
                         .font(.callout)
                     Spacer()
                     Button("Saisir une clé…") {
+                        NSApp.activate(ignoringOtherApps: true)
                         draftKey = ""
                         state.presentKeySheet(for: state.snapshot.activeProviderID)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { keyFieldFocused = true }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                            if let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+                                window.makeKeyAndOrderFront(nil)
+                            }
+                            keyFieldFocused = true
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
@@ -276,6 +288,9 @@ struct PanelView: View {
                     .autocorrectionDisabled()
                     .textContentType(.none)
                     .focused($keyFieldFocused)
+                    .onAppear {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { keyFieldFocused = true }
+                    }
                     .onSubmit { injectKey() }
             }
             HStack(spacing: 8) {
