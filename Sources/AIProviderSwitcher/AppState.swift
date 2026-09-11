@@ -726,11 +726,26 @@ final class AppState: ObservableObject {
         guard !screenshotMode else { return }
         let targetID = providerID ?? snapshot.activeProviderID
         guard let provider = catalog[id: targetID] else { return }
-        let current = exposedModels(for: targetID)
+        var current = exposedModels(for: targetID)
         var next: [String]
         if selected {
-            guard !current.contains(model), current.count < modelSlots else { return }
-            next = orderedExposed(current + [model], provider: provider)
+            guard !current.contains(model) else { return }
+            if current.count < modelSlots {
+                next = orderedExposed(current + [model], provider: provider)
+            } else {
+                // Selecting directly while full swaps the last optional model.
+                // This keeps the finite Codex slot count without forcing users
+                // to uncheck another model first.
+                var protected = [provider.defaultModel]
+                if targetID == snapshot.activeProviderID {
+                    protected.append(snapshot.activeModel)
+                }
+                guard let replacementIndex = current.lastIndex(where: { !protected.contains($0) }) else {
+                    return
+                }
+                current[replacementIndex] = model
+                next = orderedExposed(current, provider: provider)
+            }
         } else {
             guard !modelLocked(model, for: targetID) else { return }
             next = current.filter { $0 != model }
