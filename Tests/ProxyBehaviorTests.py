@@ -222,6 +222,92 @@ class ProxyBehaviorTests(unittest.TestCase):
         with mock.patch.object(self.proxy, "opencode_stored_key", return_value="zen-key"):
             self.assertEqual(self.proxy.opencode_authorization("Bearer paid"), "Bearer paid")
 
+    def test_relay_managed_credential_is_the_single_source_of_truth(self):
+        with mock.patch.dict(self.proxy.os.environ,
+                             {"AI_PROVIDER_SWITCHER_PROXY_API_KEY": "managed-key"}):
+            # The managed key wins: a stale env_key must never shadow the key
+            # the user just saved in the panel.
+            self.assertEqual(
+                self.proxy.managed_headers({})["Authorization"], "Bearer managed-key")
+            self.assertEqual(
+                self.proxy.managed_headers({"Authorization": "Bearer stale"})["Authorization"],
+                "Bearer managed-key")
+        # Without a managed key the client keeps its own (direct API tests).
+        self.assertIsNone(self.proxy.managed_headers({}).get("Authorization"))
+        self.assertEqual(
+            self.proxy.managed_headers({"Authorization": "Bearer client-key"})["Authorization"],
+            "Bearer client-key")
+
+    def test_opencode_managed_credential_takes_priority(self):
+        with mock.patch.dict(self.proxy.os.environ,
+                             {"AI_PROVIDER_SWITCHER_PROXY_API_KEY": "zen-managed"}):
+            self.assertEqual(self.proxy.opencode_authorization(None), "Bearer zen-managed")
+            self.assertEqual(self.proxy.opencode_authorization("Bearer client"), "Bearer zen-managed")
+
+    def test_anthropic_credentials_follow_claude_code_env_from_codex_config(self):
+        import tempfile
+        toml = """
+model = "gpt-5.6"
+
+[shell_environment_policy.set]
+ANTHROPIC_AUTH_TOKEN = "zai-id.secret"
+ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
+
+[projects."/tmp"]
+trust_level = "trusted"
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+            handle.write(toml)
+            path = handle.name
+        try:
+            with mock.patch.object(self.proxy, "_anthropic_oauth_token", return_value=None), \
+                 mock.patch.object(self.proxy.os.path, "expanduser", side_effect=lambda p: path):
+                base, headers = self.proxy.anthropic_credentials("")
+        finally:
+            import os as _os
+            _os.unlink(path)
+        # A token issued for a gateway must stay on that gateway: never send a
+        # Z.ai token to api.anthropic.com.
+        self.assertEqual(base, "https://api.z.ai/api/anthropic")
+        self.assertEqual(headers["Authorization"], "Bearer zai-id.secret")
+
+    def test_thinking_blocks_are_exposed_as_reasoning_items(self):
+        response = {
+            "content": [
+                {"type": "thinking", "thinking": "je reflechis"},
+                {"type": "text", "text": "OK"},
+            ],
+            "usage": {},
+        }
+        out = self.proxy.anthropic_to_responses(response, "gpt-5.6-sol")
+        types = [item["type"] for item in out["output"]]
+        self.assertIn("reasoning", types)
+        reasoning = next(i for i in out["output"] if i["type"] == "reasoning")
+        self.assertEqual(reasoning["summary"][0]["text"], "je reflechis")
+        # A response with only thinking must not be empty anymore.
+        only_thinking = self.proxy.anthropic_to_responses(
+            {"content": [{"type": "thinking", "thinking": "seul"}], "usage": {}}, "slug")
+        self.assertEqual([i["type"] for i in only_thinking["output"]], ["reasoning"])
+
+    def test_thinking_stream_emits_reasoning_sse_events(self):
+        translator = self.proxy.AnthropicStreamTranslator("gpt-5.6-sol")
+        lines = [
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}',
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"abc"}}',
+            'data: {"type":"content_block_stop","index":0}',
+            'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"OK"}}',
+            'data: {"type":"content_block_stop","index":1}',
+            'data: {"type":"message_stop"}',
+        ]
+        blob = b"".join(translator.feed(line) for line in lines).decode()
+        self.assertIn("reasoning_summary_text.delta", blob)
+        self.assertIn("output_text.delta", blob)
+        self.assertEqual(translator.response["output"][0]["type"], "reasoning")
+        self.assertEqual(translator.response["output"][0]["summary"][0]["text"], "abc")
+        self.assertEqual(translator.response["output"][1]["content"][0]["text"], "OK")
+
     def test_opencode_stored_key_reads_the_cli_auth_file(self):
         import tempfile, pathlib
         for payload, expected in [({"opencode": {"key": "k1"}}, "k1"),
@@ -286,6 +372,18 @@ class ProxyBehaviorTests(unittest.TestCase):
         self.assertNotIn("service_tier", req)
         self.assertNotIn("prompt_cache_key", req)
         self.assertEqual(req["reasoning"]["effort"], "high")
+
+    def test_openrouter_completion_budget_is_capped(self):
+        original = self.proxy.IS_OPENROUTER
+        try:
+            self.proxy.IS_OPENROUTER = True
+            missing = self.proxy.sanitize_upstream_request({"model": "model"})
+            explicit = self.proxy.sanitize_upstream_request(
+                {"model": "model", "max_output_tokens": 65536})
+        finally:
+            self.proxy.IS_OPENROUTER = original
+        self.assertEqual(missing["max_output_tokens"], self.proxy.OPENROUTER_MAX_OUTPUT_TOKENS)
+        self.assertEqual(explicit["max_output_tokens"], self.proxy.OPENROUTER_MAX_OUTPUT_TOKENS)
 
     def test_tool_filter_deduplicates_flat_and_nested_function_names(self):
         tools = [

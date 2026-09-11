@@ -7,6 +7,13 @@ final class BootstrapTests: XCTestCase {
         XCTAssertEqual(ids, ["openai", "deepseek", "glm", "openrouter", "ollama", "opencode", "claude"])
     }
 
+    func testOpenRouterExposesFreeModelsFirst() {
+        let openrouter = ProviderCatalog.default[id: "openrouter"]!
+        XCTAssertEqual(openrouter.defaultModel, "openrouter/free")
+        XCTAssertEqual(openrouter.models.first, "openrouter/free")
+        XCTAssertTrue(openrouter.models.contains("z-ai/glm-5.2"))
+    }
+
     func testOpenCodeUsesTheZenGatewayWithoutAKey() {
         let opencode = ProviderCatalog.default[id: "opencode"]!
         // The CLI is an agent; the provider talks to the OpenAI-compatible

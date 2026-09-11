@@ -16,7 +16,7 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 - Distingue une clé refusée d’un provider indisponible : Z.ai répond parfois HTTP 200 avec une erreur d’authentification dans le corps — le test l’interprète comme une clé invalide au lieu d’afficher « Connecté ».
 - Met à jour `model` et `model_provider` dans `~/.codex/config.toml` avec un override réversible.
 - Relance Codex Desktop/ChatGPT lorsque cela est nécessaire pour recharger la configuration.
-- Lance Codex CLI dans Terminal avec `--profile` et une clé injectée uniquement dans l’environnement.
+- Lance Codex CLI dans Terminal avec `--profile` et la revue automatique des approbations ; la clé reste dans l’adaptateur local.
 - Génère un catalogue de modèles compatible avec le schéma Codex, limité au provider actif.
 - Si un provider sert plus de modèles que Codex n'expose de slugs (6 aujourd'hui), le panneau affiche des cases à cocher pour choisir lesquels occuper ces emplacements — le choix est conservé entre les sessions.
 - Démarre des proxies locaux pour adapter les providers qui n'exposent pas directement l'API Responses.
@@ -31,11 +31,11 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 | Provider | Transport utilisé par Codex | Authentification | Adapter local | Vu par Codex comme | MCP · shell · apply_patch | Images | Web search |
 |---|---|---|---:|:---:|:---:|:---:|:---:|
 | OpenAI | Natif Codex | Session Codex | Non | lui-même | natif | oui | native |
-| DeepSeek | Responses via proxy | `DEEPSEEK_API_KEY` | `127.0.0.1:18888` | slug natif | ponté | non | non |
-| GLM (Z.ai) | Responses via proxy | `ZAI_API_KEY` | `127.0.0.1:18889` | slug natif | ponté | non | non |
-| OpenRouter | Responses via proxy | `OPENROUTER_API_KEY` | `127.0.0.1:18890` | slug natif | ponté | oui | non |
-| Claude Code | Responses ↔ Anthropic Messages | Session Claude Code / Trousseau | `127.0.0.1:18891` | slug natif | ponté | oui | serveur Anthropic |
-| OpenCode Zen | Responses via proxy | Aucune saisie (clé publique ou clé d'OpenCode) | `127.0.0.1:18892` | slug natif | ponté | non | non |
+| DeepSeek | Responses via proxy | Clé dans l'adaptateur (importable d'OpenCode) | `127.0.0.1:18888` | slug natif | ponté | non | non |
+| GLM (Z.ai) | Responses via proxy | Clé dans l'adaptateur (importable d'OpenCode) | `127.0.0.1:18889` | slug natif | ponté | non | non |
+| OpenRouter | Responses via proxy | Clé dans l'adaptateur (importable d'OpenCode) | `127.0.0.1:18890` | slug natif | ponté | oui | non |
+| Claude Code | Responses ↔ Anthropic Messages | Trousseau Claude Code, `ANTHROPIC_*` (settings.json ou config Codex), clé API optionnelle | `127.0.0.1:18891` | slug natif | ponté | oui | serveur Anthropic |
+| OpenCode Zen | Responses via proxy | Clé Zen optionnelle (saisie ou `opencode auth login`) | `127.0.0.1:18892` | slug natif | ponté | non | non |
 | Ollama | Provider local Codex | Aucune | Non | son vrai slug | function tools | non | non |
 
 « Slug natif » : le provider est exposé sous un slug de Codex, voir [Les providers passent pour des modèles de Codex](#les-providers-passent-pour-des-modèles-de-codex). « Ponté » : l’adaptateur traduit les familles de tools propres à OpenAI et restitue les items d’origine, voir [Parité des fonctionnalités](#parité-des-fonctionnalités-mcp-shell-apply_patch-plugins).
@@ -46,12 +46,11 @@ Les providers tiers sont déclarés dans `[model_providers.<id>]` avec :
 [model_providers.deepseek]
 name = "DeepSeek"
 base_url = "http://127.0.0.1:18888/v1"
-env_key = "DEEPSEEK_API_KEY"
 requires_openai_auth = false
 wire_api = "responses"
 ```
 
-`requires_openai_auth = false` est important : Codex ne doit pas essayer d’appliquer le flux d’authentification OpenAI à un endpoint tiers. Les clés ne sont jamais écrites dans `config.toml`.
+`requires_openai_auth = false` est important : Codex ne doit pas essayer d’appliquer le flux d’authentification OpenAI à un endpoint tiers. **Aucun `env_key`** : une seule source de vérité pour les clés, l’adaptateur local, alimenté par le panneau. Une clé déclarée dans l’environnement de Codex deviendrait périmée dès qu’on la change dans le panneau, c’est exactement ce que cette architecture supprime. Les clés ne sont jamais écrites dans `config.toml`.
 
 GLM (Z.ai) expose le catalogue Responses sous `https://api.z.ai/api/v1` — la base historique `/api/paas/v4` ne sert que `/chat/completions` et renvoyait 404 sur `/v1/responses`. Les modèles proposés sont ceux du **coding plan** Z.AI (`glm-5.2`, `glm-5.2-highspeed`, `glm-5-turbo`, `glm-5.3`, `glm-4.7`) et la clé attendue est de la forme `ID.secret` (et non `sk-…`), vérifiée à la saisie.
 
@@ -186,13 +185,14 @@ Chaque adaptateur laisse une fiche `proxy-<port>.json` (version, provider, capac
 
 ## Claude Code
 
-Claude Code n’utilise pas une clé saisie dans le panneau. Le proxy cherche, dans cet ordre :
+Claude Code n’exige pas de clé saisie dans le panneau. Le proxy cherche, dans cet ordre :
 
-1. le jeton OAuth Claude Code dans le Trousseau macOS (`Claude Code-credentials`) ;
-2. `ANTHROPIC_AUTH_TOKEN` et `ANTHROPIC_BASE_URL` dans `~/.claude/settings.json` ;
-3. une clé éventuellement fournie par la requête.
+1. une clé API Anthropic saisie dans le panneau, si l’utilisateur en a enregistré une ;
+2. le jeton OAuth Claude Code dans le Trousseau macOS (`Claude Code-credentials`), rafraîchi s’il a expiré ;
+3. `ANTHROPIC_AUTH_TOKEN` et `ANTHROPIC_BASE_URL` dans `~/.claude/settings.json` ;
+4. les mêmes variables dans `~/.codex/config.toml` (`[shell_environment_policy.set]`), c’est-à-dire l’environnement que Codex lui-même fournit à Claude Code — le cas d’un backend compatible comme Z.ai.
 
-Un jeton Trousseau expiré déclenche d’abord une tentative de rafraîchissement OAuth (`refresh_token`, endpoints `api.anthropic.com` puis `claude.ai`). La base upstream suit la même priorité : jeton OAuth présent → `api.anthropic.com`, sinon `ANTHROPIC_BASE_URL`, sinon `api.anthropic.com`.
+Le couple jeton/base reste cohérent : un jeton Z.ai n’est jamais envoyé à `api.anthropic.com`. Sans aucune source, le proxy répond une erreur explicite au lieu d’émettre un `x-api-key` vide. Les blocs `thinking` renvoyés par un backend à raisonnement étendu sont restitués comme items `reasoning`, jamais perdus.
 
 Le proxy convertit les messages et les tools entre le format Responses de Codex et le format Messages d’Anthropic. Trois points spécifiques à cet adaptateur :
 
@@ -204,11 +204,14 @@ Le proxy convertit les messages et les tools entre le format Responses de Codex 
 
 La CLI OpenCode est un agent, pas un backend HTTP : elle n'expose que son propre protocole de sessions (`opencode serve` → `POST /session/{id}/prompt`), inutilisable comme model provider. Ce qui est intégré ici est donc **OpenCode Zen**, la passerelle que la CLI interroge elle-même : `https://opencode.ai/zen/v1`, compatible OpenAI **et** servant `/v1/responses`, ce qu'attend Codex.
 
-L'authentification suit celle d'OpenCode, aucune clé à saisir dans le panneau. Le proxy cherche, dans cet ordre :
+L'authentification suit celle d'OpenCode, aucune clé n'étant requise à la base. Le proxy cherche, dans cet ordre :
 
-1. une clé transmise par la requête (clé Zen payante relayée par Codex) ;
-2. l'entrée `opencode` de `~/.local/share/opencode/auth.json`, écrite par `opencode auth login` ;
-3. la clé publique documentée du palier gratuit.
+1. une clé Zen saisie dans le panneau (clé privée de l'adaptateur) ;
+2. une clé transmise par la requête (clé Zen payante relayée par Codex) ;
+3. l'entrée `opencode` de `~/.local/share/opencode/auth.json`, écrite par `opencode auth login` ;
+4. la clé publique documentée du palier gratuit.
+
+Si la passerelle refuse la requête (le palier gratuit via l'API directe est désormais restreint, la CLI garde ses sessions), le message d'erreur le dit et indique la marche à suivre : `opencode auth login`, ou une clé Zen saisie dans le panneau.
 
 La CLI est **détectée, pas requise** : la passerelle répond sans elle. Le panneau affiche l'état sous la grille des fournisseurs — version trouvée et origine de la clé, ou l'absence de la CLI. Les emplacements inspectés sont ceux de l'installeur OpenCode (`~/.opencode/bin`, Homebrew, `/usr/local/bin`, `~/.local/bin`). Seuls les **noms** des credentials sont lus, jamais les valeurs.
 
@@ -244,8 +247,9 @@ Pendant une sélection faite depuis le panneau, la surveillance est suspendue pu
 - Les clés sont gardées en mémoire pendant la session.
 - La persistance locale est activée par défaut dans `~/Library/Application Support/AI Provider Switcher/providers.json`.
 - Le fichier est limité à `0600`, son dossier à `0700`, et exclu des sauvegardes iCloud/Time Machine.
-- Les clés ne sont pas écrites dans `config.toml`, les profils, le catalogue ou les arguments de processus.
-- Au lancement de ChatGPT/Codex, les clés sont injectées dans l’environnement du processus.
+- Les clés ne sont pas écrites dans `config.toml`, les profils, le catalogue, les arguments de processus ni les fichiers temporaires.
+- Les clés déjà accordées à OpenCode (`~/.local/share/opencode/auth.json`) sont importées dans le trousseau local de l’app au premier lancement, pour les providers qui n’en ont pas encore : l’utilisateur ne ressaisit pas une clé qu’il a déjà donnée.
+- ChatGPT/Codex n’est plus relancé avec des secrets dans son environnement : chaque provider routé reçoit sa clé de son adaptateur local, qui la garde et l’applique.
 - Chaque modification de `config.toml` crée une sauvegarde dans `~/.codex/backup-provider-switcher/`.
 
 ## Installation
@@ -420,7 +424,7 @@ indique en revanche que le binaire a été lancé hors de son bundle `.app`.
 - Un slug natif ne peut être attribué qu’une fois : un provider offrant plus de modèles que Codex n’a de slugs n’expose que les premiers dans le sélecteur.
 - La liste de slugs de Codex change avec ses versions — `gpt-reserve` en a disparu en cours de route. Le masquage suit le cache, donc le nombre de modèles exposés peut varier après une mise à jour de Codex.
 - Le journal et la télémétrie locale de Codex attribuent la requête au slug natif, pas au provider réel.
-- Le palier gratuit d'OpenCode Zen est limité par modèle : une réponse `FreeUsageLimitError` vient du quota de la passerelle, pas de l'application. Une clé Zen dans `opencode auth login` la lève.
+- Le palier gratuit d'OpenCode Zen est désormais restreint : l'API directe répond `MissingSessionID`, `AuthError` ou `Internal server error` sans clé. Le panneau le signale et propose d'exécuter `opencode auth login` ou de saisir une clé Zen. La CLI, elle, continue d'utiliser sa propre session.
 - Les noms des modèles gratuits d'OpenCode Zen sont des préversions et changent régulièrement ; ils sont déclarés en dur et se vérifient avec `opencode models opencode`.
 - Ollama est un provider intégré à Codex, sans adapter local : il reçoit les function tools du catalogue, mais pas le nettoyage de requête du proxy (un `service_tier` global dans `config.toml` lui est transmis tel quel).
 - Les providers OpenAI-compatible n’implémentent pas tous Responses, le streaming, les images ou les tools de façon identique.

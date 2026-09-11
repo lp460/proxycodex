@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import Darwin
+import CryptoKit
 import AIProviderSwitcherCore
 
 /// Observable application state. Purely additive over `~/.codex`:
@@ -123,7 +124,7 @@ final class AppState: ObservableObject {
                 win.styleMask = [.titled, .closable]
                 win.appearance = NSAppearance(named: .darkAqua)
                 win.title = "AI Provider Switcher"
-                win.setContentSize(NSSize(width: 388, height: 680))
+                win.setContentSize(NSSize(width: 446, height: 700))
                 win.center()
                 win.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
@@ -162,6 +163,8 @@ final class AppState: ObservableObject {
         }
         // Last known model lists, so a relaunch starts where discovery left off.
         applyDiscovered(discoveredStore.load())
+        // Keys already granted to OpenCode are reused instead of re-asked.
+        importKeysFromOpenCode()
         do {
             let router = try ProviderRouter(catalog: catalog, keyResolver: keyStore, initialProviderID: initial)
             _ = try await router.setActive(providerID: initial, model: model)
@@ -263,6 +266,23 @@ final class AppState: ObservableObject {
         }
         let credential = install.hasZenCredential ? "clé Zen OpenCode" : "palier gratuit (clé publique)"
         log("OpenCode CLI \(install.version ?? "?") détecté (\(install.executable.path)) · \(credential).")
+    }
+
+    /// Seeds the key store from OpenCode's own credentials (`auth.json`). The
+    /// user already granted these keys to the CLI; asking again in the panel is
+    /// the duplication this app exists to remove. Only providers that still
+    /// have no key are touched.
+    func importKeysFromOpenCode() {
+        guard !screenshotMode else { return }
+        var imported: [String] = []
+        for provider in catalog.providers where provider.requiresKey && !keyStore.hasKey(provider.id) {
+            guard let key = OpenCodeCLI.storedKey(for: provider.id), !key.isEmpty else { continue }
+            keyStore.setKey(key, for: provider.id)
+            imported.append(provider.displayName)
+        }
+        if !imported.isEmpty {
+            log("Clé(s) importée(s) depuis OpenCode : \(imported.joined(separator: ", ")).")
+        }
     }
 
     private func observeRouter() async {
@@ -555,18 +575,31 @@ final class AppState: ObservableObject {
                 log("Attention : une clé Z.ai se présente comme ID.secret (ex. 6e6c…54d8.xxxx). La clé collée n'a pas ce format — elle sera quand même testée.")
             }
         }
-        keyStore.setKey(value, for: provider.id)
-        log("Clé injectée en mémoire pour \(provider.displayName).")
-        if applySelectionAfterKeyInjection, applySelectionTargetID == provider.id {
-            applySelectionAfterKeyInjection = false
-            applySelectionTargetID = nil
-            log("Activation de \(provider.displayName) avec la clé injectée…")
-            await select(providerID: provider.id)
-        } else {
-            applySelectionAfterKeyInjection = false
-            applySelectionTargetID = nil
-            await runTest(providerID: provider.id)
+        // A common failure mode is pasting an OpenRouter key while another card
+        // owns the shared key field. Refuse it instead of silently creating an
+        // unusable credential under DeepSeek or GLM.
+        if trimmed.hasPrefix("sk-or-v1-"), provider.id != "openrouter" {
+            log("Clé OpenRouter détectée dans le champ \(provider.displayName). Ouvrez la clé de la carte OpenRouter.")
+            editingProviderID = "openrouter"
+            editingKey = true
+            return
         }
+        keyStore.setKey(value, for: provider.id)
+        guard keyStore.hasKey(provider.id) else {
+            log("Échec : clé non enregistrée pour \(provider.displayName).")
+            return
+        }
+        // A credential change must restart the managed proxy synchronously;
+        // otherwise the running adapter would keep serving the previous key.
+        log(keyStore.lastPersistenceError == nil
+            ? "Clé enregistrée pour \(provider.displayName). Activation…"
+            : "Clé en mémoire pour \(provider.displayName), mais écriture disque impossible : \(keyStore.lastPersistenceError!)")
+        ensureProxiesRunning()
+        applySelectionAfterKeyInjection = false
+        applySelectionTargetID = nil
+        await select(providerID: provider.id)
+        guard snapshot.activeProviderID == provider.id else { return }
+        log("Clé \(provider.displayName) active · dernière tentative : consultez l’état du fournisseur.")
     }
 
     func clearKey(for providerID: String? = nil) {
@@ -663,20 +696,15 @@ final class AppState: ObservableObject {
         let profile = provider.id == "openai" ? nil : provider.id
         let model = snapshot.activeModel
 
-        var envSetup = ""
-        if let key, let value = key.asString(), !value.isEmpty, !provider.environmentVariable.isEmpty {
-            let envFile = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aps-\(provider.id)-env.sh")
-            let escaped = value.replacingOccurrences(of: "'", with: "'\\''")
-            let content = "export \(provider.environmentVariable)='\(escaped)'\n"
-            try? content.write(to: envFile, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: envFile.path)
-            envSetup = "set -a; source \"\(envFile.path)\"; rm -f \"\(envFile.path)\"; set +a; "
-        }
-
         var args = ""
         if let profile { args = " --profile \(profile)" }
-        let cmd = envSetup + "\"\(binary.path)\"\(args)"
+        // This is Codex's supported equivalent of "Approve for me": automatic
+        // review still runs inside the workspace-write sandbox. It is not full
+        // access, which intentionally removes sandbox and confirmation paths.
+        args += " --approve-for-me"
+        // The key stays in the adapter: it is never written to a temp file, to
+        // the process environment, or to the command line.
+        let cmd = "\"\(binary.path)\"\(args)"
 
         let script = """
         tell application "Terminal"
@@ -723,25 +751,11 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Env vars for every provider key held in memory (used when relaunching
-    /// ChatGPT/Codex so the Desktop picker can resolve env_key providers).
-    private var keyEnv: [String: String] {
-        var env: [String: String] = [:]
-        for provider in catalog.providers where !provider.environmentVariable.isEmpty {
-            if let secret = keyStore.secret(for: provider.id)?.asString() {
-                env[provider.environmentVariable] = secret
-            }
-        }
-        return env
-    }
-
-    /// Restarts ChatGPT (which hosts Codex Desktop). The embedded codex server
-    /// reads `env_key` providers from ~/.codex/config.toml, so every key held in
-    /// memory is injected into the relaunched process' environment — without
-    /// them the desktop model picker can only offer ChatGPT/OpenAI.
+    /// Restarts ChatGPT (which hosts Codex Desktop). No secret is injected into
+    /// the child process: every routed provider gets its credential from its
+    /// local adapter, which the app keeps up to date with the key it holds.
     func relaunchChatGPT() async {
         guard !screenshotMode else { return }
-        let env = keyEnv
         let ws = NSWorkspace.shared
         let managedHostIDs: Set<String> = [
             "com.openai.codex",
@@ -775,9 +789,6 @@ final class AppState: ObservableObject {
         let bundleIDs = ["com.openai.codex", "com.openai.chatgpt", "com.openai.chat"]
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = true
-        if !env.isEmpty {
-            config.environment = env
-        }
         do {
             let url = bundleIDs.lazy.compactMap { ws.urlForApplication(withBundleIdentifier: $0) }.first
                 ?? URL(fileURLWithPath: "/Applications/ChatGPT.app")
@@ -786,9 +797,7 @@ final class AppState: ObservableObject {
                 return
             }
             _ = try await ws.openApplication(at: url, configuration: config)
-            log(env.isEmpty
-                ? "ChatGPT/Codex relancé — configuration native."
-                : "ChatGPT/Codex relancé avec \(env.count) clé(s) injectée(s).")
+            log("ChatGPT/Codex relancé — clés servies par les adaptateurs locaux.")
         } catch {
             log("Relance échouée: \(error.localizedDescription)")
         }
@@ -831,7 +840,18 @@ final class AppState: ObservableObject {
     // Bumped whenever the adapter contract changes (base URLs, pairing, flags):
     // a stale running proxy would otherwise be kept because its metadata still
     // matches everything this version compares.
-    private let proxyVersion = "2026-08-23-responses-v3"
+    private let proxyVersion = "2026-09-11-unified-auth-v6"
+
+    /// Stable, non-reversible metadata used to detect credential changes and
+    /// restart a proxy that still carries an older key.
+    static func credentialFingerprint(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "" }
+        let digest = SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+            .prefix(16)
+        return String(digest)
+    }
 
     func ensureProxiesRunning() {
         for provider in effectiveCatalog.providers {
@@ -878,6 +898,9 @@ final class AppState: ObservableObject {
             var environment = ProcessInfo.processInfo.environment
             environment["AI_PROVIDER_SWITCHER_PROXY_VERSION"] = proxyVersion
             environment["AI_PROVIDER_SWITCHER_PROXY_STATE"] = proxyMetadataURL(for: port).path
+            if let key = keyStore.secret(for: provider.id)?.asString(), !key.isEmpty {
+                environment["AI_PROVIDER_SWITCHER_PROXY_API_KEY"] = key
+            }
             proc.environment = environment
             do {
                 try proc.run()
@@ -923,6 +946,8 @@ final class AppState: ObservableObject {
             "version": proxyVersion,
             "port": port,
             "provider": provider.id,
+            "key_fingerprint": Self.credentialFingerprint(
+                keyStore.secret(for: provider.id)?.asString()),
             "pid": pid,
             "supports_tools": provider.supportsTools,
             "supports_apply_patch": provider.supportsApplyPatch,
@@ -954,6 +979,8 @@ final class AppState: ObservableObject {
         let expected: [String: Any] = [
             "version": proxyVersion,
             "provider": provider.id,
+            "key_fingerprint": Self.credentialFingerprint(
+                keyStore.secret(for: provider.id)?.asString()),
             "supports_tools": provider.supportsTools,
             "supports_apply_patch": provider.supportsApplyPatch,
             "supports_images": provider.supportsImages,
@@ -963,6 +990,7 @@ final class AppState: ObservableObject {
             "models": modelSignature(for: provider)
         ]
         let stale = version != expected["version"] as? String
+            || (metadata["key_fingerprint"] as? String) != expected["key_fingerprint"] as? String
             || (metadata["models"] as? String) != expected["models"] as? String
             || (metadata["provider"] as? String) != expected["provider"] as? String
             || (metadata["supports_tools"] as? Bool) != expected["supports_tools"] as? Bool

@@ -58,6 +58,29 @@ public enum OpenCodeCLI {
         authenticatedProviderIDs().contains("opencode")
     }
 
+    /// OpenCode's provider id for one of this app's providers. The CLI names
+    /// Z.ai's coding plan `zai-coding-plan`; the app calls it `glm`.
+    public static func openCodeProviderID(for providerID: String) -> String {
+        providerID == "glm" ? "zai-coding-plan" : providerID
+    }
+
+    /// A credential OpenCode already holds for one of this app's providers,
+    /// read from `auth.json`. Returning the secret is intentional: the caller
+    /// loads it into the key store so the user does not have to type a key
+    /// they already granted to the CLI.
+    public static func storedKey(for providerID: String, at url: URL = credentialsURL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entry = object[openCodeProviderID(for: providerID)] else { return nil }
+        if let entry = entry as? String, !entry.isEmpty { return entry }
+        if let entry = entry as? [String: Any] {
+            for field in ["key", "apiKey", "api_key", "token", "access"] {
+                if let value = entry[field] as? String, !value.isEmpty { return value }
+            }
+        }
+        return nil
+    }
+
     /// Locates the executable without running it.
     public static func executableURL() -> URL? {
         for path in candidatePaths where FileManager.default.isExecutableFile(atPath: path) {

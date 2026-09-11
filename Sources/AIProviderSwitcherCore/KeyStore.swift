@@ -45,6 +45,8 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
     private var memory: [String: Secret] = [:]
     private var persistenceURL: URL?
     public private(set) var persistenceEnabled: Bool = false
+    /// Last local write failure, for the UI. It never contains secret material.
+    public private(set) var lastPersistenceError: String?
 
     public init() {}
 
@@ -220,7 +222,9 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
             let json = try JSONEncoder().encode(entries)
             try json.write(to: url, options: [.atomic])
             try? applyRestrictivePermissions(at: url)
+            lastPersistenceError = nil
         } catch {
+            lastPersistenceError = error.localizedDescription
             Log.error("Failed to persist keys: \(error.localizedDescription)")
         }
     }

@@ -9,11 +9,13 @@ import AIProviderSwitcherCore
 struct PanelView: View {
     @ObservedObject var state: AppState
     @State private var draftKey: String = ""
+    @State private var maintenanceExpanded = false
+    @State private var exposedModelsExpanded = false
     @FocusState private var keyFieldFocused: Bool
 
-    private let columns: [GridItem] = [
-        GridItem(.flexible(), spacing: 8),
-        GridItem(.flexible(), spacing: 8)
+    private let providerColumns: [GridItem] = [
+        GridItem(.flexible(), spacing: 10),
+        GridItem(.flexible(), spacing: 10)
     ]
 
     var body: some View {
@@ -21,24 +23,29 @@ struct PanelView: View {
             header
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    providerSection
+                VStack(alignment: .leading, spacing: 20) {
                     if state.catalogConflict {
                         catalogConflictNotice
                     }
+                    providerSection
+                    modelSection
                     keySection
-                    relaunchSection
+                    launchSection
+                    maintenanceSection
                 }
-                .padding(14)
+                .padding(.horizontal, 18)
+                .padding(.top, 16)
+                .padding(.bottom, 18)
             }
             // macOS 26 MenuBarExtra windows ignore the ScrollView's ideal height
             // and collapse to the fixed-size content only (header + footer). A
             // FIXED height keeps the viewport real.
-            .frame(height: 470)
+            .frame(height: 500)
             Divider()
             footer
         }
-        .frame(width: 372)
+        .frame(width: 430)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: Header
@@ -54,25 +61,35 @@ struct PanelView: View {
             }
             .frame(width: 40, height: 40)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text("AI Provider Switcher")
-                    .font(.headline)
-                Text("Codex natif par défaut · \(state.keyCount) clé(s) injectée(s)")
-                    .font(.caption)
+                    .font(.system(size: 15, weight: .semibold))
+                Text(activeSummary)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer()
             statusBadge
         }
-        .padding(14)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var activeSummary: String {
+        let providerName = state.activeProvider?.displayName ?? "Provider"
+        guard !state.snapshot.activeModel.isEmpty else { return providerName }
+        return "\(providerName) · \(state.snapshot.activeModel)"
     }
 
     private var statusBadge: some View {
         HStack(spacing: 5) {
-            Circle().fill(statusColor).frame(width: 8, height: 8)
+            Circle().fill(statusColor).frame(width: 7, height: 7)
                 .accessibilityHidden(true)
             Text(statusLabel)
                 .font(.caption.weight(.medium))
+                .foregroundStyle(.primary)
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 4)
@@ -101,70 +118,37 @@ struct PanelView: View {
     // MARK: Providers (status + key badge per provider)
 
     private var providerSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            panelTitle("Fournisseurs")
-            LazyVGrid(columns: columns, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader("Fournisseur")
+            LazyVGrid(columns: providerColumns, spacing: 10) {
                 ForEach(state.catalog.providers) { provider in
                     ProviderCard(
                         provider: provider,
                         isActive: provider.id == state.snapshot.activeProviderID,
                         status: state.snapshot.compatibility(for: provider.id),
-                        hasKey: provider.isKeyless || state.hasKey(for: provider.id),
+                        hasKey: state.hasKey(for: provider.id),
                         tap: {
                             Task { await state.select(providerID: provider.id) }
                         },
-                        keyTap: {
-                            NSApp.activate(ignoringOtherApps: true)
-                            draftKey = ""
-                            state.presentKeySheet(for: provider.id)
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                                if let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
-                                    window.makeKeyAndOrderFront(nil)
-                                }
-                                keyFieldFocused = true
-                            }
-                        },
+                        keyTap: { editKey(for: provider) },
                         isInteractionDisabled: state.isScreenshotMode
                     )
                 }
             }
-            modelPicker
-            Text("Un clic sur un fournisseur : config appliquée + ChatGPT/Codex relancé avec les clés.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            openCodeStatus
+
+            SecondaryInfoRow(
+                text: "Un clic applique la configuration et relance ChatGPT/Codex.",
+                symbol: "info.circle"
+            )
         }
     }
 
-    /// OpenCode is detected, not required: the Zen gateway it talks to answers
-    /// without the CLI, so the line states where models and credential come from.
-    private var openCodeStatus: some View {
-        HStack(spacing: 5) {
-            Image(systemName: state.openCode == nil ? "questionmark.circle" : "checkmark.seal.fill")
-                .font(.system(size: 10))
-                .foregroundStyle(state.openCode == nil ? Color.secondary : Color.green)
-            Text(openCodeStatusText)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
+    // MARK: Model
 
-    private var openCodeStatusText: String {
-        guard let install = state.openCode else {
-            return "OpenCode CLI non détecté · passerelle Zen publique (palier gratuit)"
-        }
-        let version = install.version.map { "CLI \($0)" } ?? "CLI"
-        return install.hasZenCredential
-            ? "OpenCode \(version) détecté · clé Zen d’OpenCode réutilisée"
-            : "OpenCode \(version) détecté · palier gratuit (clé publique)"
-    }
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader("Modèle")
 
-    /// Model selector for the active provider. The Desktop picker is fed by
-    /// OpenAI's own backend (quota/limits), so switching happens here instead.
-    private var modelPicker: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            panelTitle("Modèle actif")
             Picker("Modèle", selection: Binding(
                 get: { state.snapshot.activeModel },
                 set: { newValue in Task { await state.setModel(newValue) } }
@@ -175,12 +159,15 @@ struct PanelView: View {
             }
             .pickerStyle(.menu)
             .labelsHidden()
+            .controlSize(.regular)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .disabled(state.isScreenshotMode)
+
             if let exposed = state.exposedModel {
-                Text("Codex voit « \(exposed) » : contrat natif complet (outils, MCP, plugins).")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                SecondaryInfoRow(
+                    text: "Codex voit « \(exposed) » : contrat natif complet (outils, MCP, plugins).",
+                    symbol: "info.circle"
+                )
             }
             if state.shouldShowModelPicker {
                 modelSlotPicker
@@ -188,203 +175,369 @@ struct PanelView: View {
         }
     }
 
-    /// Checkboxes to choose which provider models occupy Codex's finite native
-    /// slugs. Only shown when the provider serves more models than slots.
+    /// Selection of models exposed through Codex's finite native slugs.
+    /// The existing `shouldShowModelPicker` business condition remains unchanged.
     private var modelSlotPicker: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Modèles exposés · \(state.exposedModelCount)/\(state.modelSlots) emplacements")
-                .font(.caption.weight(.medium))
-            ForEach(state.allModelsForActive, id: \.self) { model in
-                Toggle(isOn: Binding(
-                    get: { state.isModelSelected(model) },
-                    set: { on in Task { await state.setModelSelected(model, selected: on) } }
-                )) {
-                    HStack(spacing: 5) {
-                        if state.modelLocked(model) {
-                            Image(systemName: "lock.fill")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.secondary)
+        DisclosureGroup(isExpanded: $exposedModelsExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(state.allModelsForActive, id: \.self) { model in
+                    Toggle(isOn: Binding(
+                        get: { state.isModelSelected(model) },
+                        set: { on in Task { await state.setModelSelected(model, selected: on) } }
+                    )) {
+                        HStack(spacing: 6) {
+                            if state.modelLocked(model) {
+                                Image(systemName: "lock.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Text(model)
+                                .font(.callout)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
                         }
-                        Text(model)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
+                   }
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .disabled(state.isScreenshotMode || (state.isModelSelected(model) && state.modelLocked(model)))
                 }
-                .toggleStyle(.checkbox)
-                .controlSize(.mini)
-                .font(.caption2)
-                .disabled(state.isScreenshotMode || (state.isModelSelected(model) && state.modelLocked(model)))
+
+                SecondaryInfoRow(
+                    text: "Le modèle par défaut et le modèle actif restent verrouillés.",
+                    symbol: "lock.fill"
+                )
             }
-            Text("Codex n'expose que \(state.modelSlots) emplacements ; le modèle par défaut et le modèle actif restent verrouillés.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 8)
+            .padding(.leading, 2)
+        } label: {
+            HStack {
+                Text("Modèles exposés")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+
+                Spacer()
+                Text("\(state.exposedModelCount) / \(state.modelSlots)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
         }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .controlSize(.small)
     }
 
     private var catalogConflictNotice: some View {
-        Label("Catalogue Codex personnalisé détecté : la liste générée n’est pas active.", systemImage: "exclamationmark.triangle.fill")
-            .font(.caption2)
+        VStack(alignment: .leading, spacing: 5) {
+            Label(
+                "Catalogue Codex personnalisé détecté",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.callout.weight(.semibold))
             .foregroundStyle(.orange)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .accessibilityLabel("Avertissement : catalogue Codex personnalisé détecté")
 
+            Text("La liste générée par Proxycodex n’est pas active.")
+                .font(.caption)
+                .foregroundStyle(.primary.opacity(0.82))
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+        .accessibilityLabel("Avertissement : catalogue Codex personnalisé détecté")
     }
 
     // MARK: Keys
 
     private var keySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            panelTitle(state.editingKey ? "Clé API · \(state.keyEditingProvider?.displayName ?? "Provider")" : "Clés API")
+        VStack(alignment: .leading, spacing: 12) {
+            if state.editingKey {
+                SectionHeader(
+                    "Clé API",
+                    accessory: state.keyEditingProvider?.displayName
+                )
+            } else {
+                SectionHeader("Clé API")
+            }
+
             if state.editingKey && !state.isScreenshotMode {
                 keyEditor
             } else {
-                HStack(spacing: 8) {
-                    Image(systemName: state.activeProvider?.isKeyless == true || state.isActiveNative
-                          ? "checkmark.seal.fill"
-                          : (state.hasKeyForActive ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"))
-                        .foregroundStyle(state.activeProvider?.isKeyless == true || state.isActiveNative || state.hasKeyForActive ? .green : .orange)
-                    Text(state.activeProvider?.isKeyless == true || state.isActiveNative
-                         ? "Aucune clé requise"
-                         : (state.hasKeyForActive
-                            ? "Clé enregistrée pour \(state.activeProvider?.displayName ?? "ce provider")"
-                            : "Aucune clé pour \(state.activeProvider?.displayName ?? "ce provider")"))
-                        .font(.callout)
-                    Spacer()
-                    Button("Saisir une clé…") {
-                        NSApp.activate(ignoringOtherApps: true)
-                        draftKey = ""
-                        state.presentKeySheet(for: state.snapshot.activeProviderID)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                            if let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
-                                window.makeKeyAndOrderFront(nil)
-                            }
-                            keyFieldFocused = true
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(state.isScreenshotMode)
-                }
+                keySummary
             }
         }
     }
 
-    /// Inline key editor. Lives inside the panel (a `.sheet` would close the
-    /// MenuBarExtra window), so the field always receives keyboard input.
+    private var keySummary: some View {
+        HStack(spacing: 10) {
+            Image(systemName: keyStatusSymbol)
+                .foregroundStyle(keyStatusColor)
+
+            Text(keyStatusText)
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 12)
+
+            Button(keyActionButtonTitle) {
+                editKey(for: state.snapshot.activeProviderID)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(state.isScreenshotMode)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var keyIsConfigured: Bool {
+        state.activeProvider?.isKeyless == true
+            || state.isActiveNative
+            || state.hasKeyForActive
+    }
+
+    private var keyStatusSymbol: String {
+        keyIsConfigured ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
+    }
+
+    private var keyStatusColor: Color {
+        keyIsConfigured ? .green : .orange
+    }
+
+    private var keyStatusText: String {
+        let providerName = state.activeProvider?.displayName ?? "ce provider"
+        if state.activeProvider?.isKeyless == true || state.isActiveNative {
+            return "Aucune clé requise"
+        }
+        return state.hasKeyForActive
+            ? "Clé enregistrée pour \(providerName)"
+            : "Aucune clé pour \(providerName)"
+    }
+
+    private var keyActionButtonTitle: String {
+        state.activeProvider?.isKeyless == true || state.isActiveNative
+            ? "Modifier"
+            : (state.hasKeyForActive ? "Modifier" : "Ajouter une clé")
+    }
+
+    /// Inline key editor. A `.sheet` would close the MenuBarExtra window, so the
+    /// existing inline presentation and focus workaround are retained.
     private var keyEditor: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: "lock.fill")
                     .foregroundStyle(.secondary)
+
                 TextField(keyPlaceholder, text: $draftKey)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
                     .autocorrectionDisabled()
                     .textContentType(.none)
                     .focused($keyFieldFocused)
                     .onAppear {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { keyFieldFocused = true }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            keyFieldFocused = true
+                        }
                     }
                     .onSubmit { injectKey() }
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+            )
+
+            if let provider = state.keyEditingProvider {
+                Text("Cible : \(provider.displayName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 8) {
                 Button("Coller") { pasteKey() }
+                    .buttonStyle(.bordered)
                     .controlSize(.small)
+
                 if let provider = state.keyEditingProvider, state.hasKey(for: provider.id) {
                     Button("Voir la clé") { showExistingKey() }
+                        .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
-                Button("Injecter") { injectKey() }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(trimmedKey.isEmpty)
+
+                Spacer(minLength: 8)
+
                 Button("Annuler") {
                     draftKey = ""
                     state.dismissKeyEditor()
                 }
+                .buttonStyle(.plain)
                 .controlSize(.small)
+                .foregroundStyle(.secondary)
+
+                Button("Injecter") { injectKey() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(trimmedKey.isEmpty || misroutedOpenRouterKey)
             }
-            if let provider = state.keyEditingProvider, provider.id == "glm" {
-                let trimmed = trimmedKey
-                if trimmed.hasPrefix("sk-") {
-                    Label("Format DeepSeek/OpenRouter détecté — une clé Z.ai est de la forme ID.secret.", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                } else if !trimmed.isEmpty && !trimmed.contains(".") {
-                    Label("Format attendu : ID.secret (la clé Z.ai contient un point).", systemImage: "info.circle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
+
+            keyValidationMessages
         }
     }
 
-    // MARK: Relaunch Codex with injected keys
-
-    private var relaunchSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Button {
-                    state.launchCodexCLI()
-                } label: {
-                    Label("Lancer Codex CLI", systemImage: "terminal.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .help("Lance Codex dans Terminal avec le provider actif et sa clé (chemin fiable pour DeepSeek/GLM/OpenRouter)")
-                .disabled(state.isScreenshotMode)
-
-                Button {
-                    Task { await state.relaunchChatGPT() }
-                } label: {
-                    Label("Relancer ChatGPT/Codex", systemImage: "arrow.counterclockwise.circle.fill")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Redémarre l'app ChatGPT pour appliquer les clés injectées au sélecteur de modèles")
-                .disabled(state.isScreenshotMode)
+    @ViewBuilder
+    private var keyValidationMessages: some View {
+        if let provider = state.keyEditingProvider, provider.id == "glm" {
+            let trimmed = trimmedKey
+            if trimmed.hasPrefix("sk-") {
+                Label(
+                    "Format DeepSeek/OpenRouter détecté — une clé Z.ai est de la forme ID.secret.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            } else if !trimmed.isEmpty && !trimmed.contains(".") {
+                Label(
+                    "Format attendu : ID.secret (la clé Z.ai contient un point).",
+                    systemImage: "info.circle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
+        }
 
-            HStack(spacing: 8) {
-                Button {
-                    Task { await state.runAllTests() }
-                } label: {
-                    if state.testing {
-                        Label("Test en cours…", systemImage: "hourglass")
-                    } else {
-                        Label("Tester tous", systemImage: "checkmark.shield")
+        if trimmedKey.hasPrefix("sk-or-v1-"),
+           let provider = state.keyEditingProvider,
+           provider.id != "openrouter" {
+            Label(
+                "Clé OpenRouter détectée dans le champ \(provider.displayName). Utilisez la clé de la carte OpenRouter.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+    }
+
+    // MARK: Launch
+
+    private var launchSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader("Ouvrir")
+
+            Button {
+                state.launchCodexCLI()
+            } label: {
+                Label("Lancer Codex CLI", systemImage: "terminal.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .help("Lance Codex avec revue automatique des approbations (workspace-write) et la clé du provider actif")
+            .disabled(state.isScreenshotMode)
+
+            Button {
+                Task { await state.relaunchChatGPT() }
+            } label: {
+                Label("Relancer ChatGPT / Codex", systemImage: "arrow.counterclockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.regular)
+            .help("Redémarre l'app ChatGPT pour appliquer les clés injectées au sélecteur de modèles")
+            .disabled(state.isScreenshotMode)
+        }
+    }
+
+    private var maintenanceSection: some View {
+        DisclosureGroup(isExpanded: $maintenanceExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await state.runAllTests() }
+                    } label: {
+                        if state.testing {
+                            Label("Test en cours…", systemImage: "hourglass")
+                        } else {
+                            Label("Tester tous", systemImage: "checkmark.shield")
+                        }
                     }
-                }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(state.testing || state.isScreenshotMode)
 
-                Button {
-                    Task { await state.refreshModels() }
-                } label: {
-                    Label(state.refreshingModels ? "Lecture…" : "Rafraîchir les modèles",
-                          systemImage: "arrow.triangle.2.circlepath")
-                }
+                    Button {
+                        Task { await state.refreshModels() }
+                    } label: {
+                        Label(
+                            state.refreshingModels ? "Lecture…" : "Rafraîchir les modèles",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                    }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .help("Demande à chaque provider la liste des modèles qu'il sert réellement")
                     .disabled(state.refreshingModels || state.isScreenshotMode)
-            }
+                }
 
-            Text(modelSourceText)
-                .font(.caption2)
+                Divider()
+
+                Text(modelSourceText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                openCodeStatus
+            }
+            .padding(.top, 10)
+        } label: {
+            HStack {
+                Text("Maintenance")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+
+                Spacer()
+                Text("Diagnostics")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .controlSize(.small)
+    }
+
+    private var openCodeStatus: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("OpenCode")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+
+            SecondaryInfoRow(
+                text: openCodeStatusText,
+                symbol: state.openCode == nil ? "questionmark.circle" : "checkmark.seal.fill",
+                symbolColor: state.openCode == nil ? .secondary : .green
+            )
         }
     }
 
-    /// Where the model list comes from, so a stale picker is never a mystery.
+    private var openCodeStatusText: String {
+        guard let install = state.openCode else {
+            return "CLI non détectée · saisissez une clé Zen, ou exécutez `opencode auth login`"
+        }
+
+        let version = install.version.map { "CLI \($0)" } ?? "CLI"
+        if state.hasKey(for: "opencode") {
+            return "\(version) détectée · clé Zen enregistrée"
+        }
+        return install.hasZenCredential
+            ? "\(version) détectée · clé Zen d’OpenCode réutilisée"
+            : "\(version) détectée · pas de clé Zen : le palier gratuit peut être restreint"
+    }
+
     private var modelSourceText: String {
         if state.testing { return "Test en cours…" }
         guard let date = state.lastModelRefresh else {
@@ -392,50 +545,63 @@ struct PanelView: View {
         }
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
-        return "Modèles lus auprès des providers à \(formatter.string(from: date)). Codex n'expose que ses propres slugs, donc au plus autant de modèles qu'il a de slugs."
+        return "Dernière synchronisation : \(formatter.string(from: date)). Données interrogées auprès des providers ; Codex expose ses propres slugs."
     }
-
     // MARK: Footer
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
             if let message = state.statusMessage {
                 Label {
                     Text(message)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 } icon: {
                     Image(systemName: "info.circle.fill")
                         .foregroundStyle(Color.accentColor.opacity(0.85))
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.07))
+                )
             }
-            HStack {
-                Toggle("Clé locale (0600)", isOn: Binding(
+
+            HStack(spacing: 12) {
+                Toggle("Mémoriser les clés localement", isOn: Binding(
                     get: { state.persistenceEnabled },
                     set: { on in on ? state.enablePersistence() : state.disablePersistence() }
                 ))
-                .font(.caption)
+                .font(.callout)
                 .toggleStyle(.checkbox)
+                .help("Fichier local avec permissions 0600, exclu d’iCloud")
                 .disabled(state.isScreenshotMode)
-                Spacer()
+
+                Spacer(minLength: 10)
+
                 Button("Quitter") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain)
                     .keyboardShortcut("q")
                     .controlSize(.small)
             }
         }
-        .padding(12)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 
     // MARK: Helpers
 
     private var trimmedKey: String {
         draftKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var misroutedOpenRouterKey: Bool {
+        trimmedKey.hasPrefix("sk-or-v1-")
+            && (state.keyEditingProvider?.id != "openrouter")
     }
 
     private func pasteKey() {
@@ -450,17 +616,34 @@ struct PanelView: View {
     }
 
     private func injectKey() {
-        guard !trimmedKey.isEmpty else { return }
+        guard !trimmedKey.isEmpty, !misroutedOpenRouterKey else { return }
         let providerID = state.keyEditingProvider?.id
         Task { await state.setSessionKey(trimmedKey, for: providerID) }
         draftKey = ""
         state.dismissKeyEditor()
     }
 
-    private func panelTitle(_ s: String) -> some View {
-        Text(s.uppercased())
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
+    private func editKey(for provider: Provider) {
+        NSApp.activate(ignoringOtherApps: true)
+        draftKey = ""
+        state.presentKeySheet(for: provider.id)
+        focusKeyEditor()
+    }
+
+    private func editKey(for providerID: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        draftKey = ""
+        state.presentKeySheet(for: providerID)
+        focusKeyEditor()
+    }
+
+    private func focusKeyEditor() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            if let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+                window.makeKeyAndOrderFront(nil)
+            }
+            keyFieldFocused = true
+        }
     }
 
     /// Placeholder that hints at the format each provider expects: Z.ai keys are
@@ -470,8 +653,67 @@ struct PanelView: View {
         if state.hasKey(for: provider.id) { return "Clé existante — tapez pour remplacer" }
         switch provider.id {
         case "glm": return "ID.secret (clé Z.ai, ex. 6e6c…54d8.xxxx)"
+        case "opencode": return "sk-… (optionnelle — la clé Zen remplace le palier gratuit)"
+        case "claude": return "sk-ant-… (optionnelle — sinon Claude Code/ANTHROPIC_AUTH_TOKEN)"
         default: return "sk-…"
         }
+    }
+}
+
+// MARK: - Small UI primitives
+
+private struct SectionHeader: View {
+    let title: String
+    let accessory: String?
+
+    init(_ title: String, accessory: String? = nil) {
+        self.title = title
+        self.accessory = accessory
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            if let accessory, !accessory.isEmpty {
+                Text(accessory)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.primary.opacity(0.72))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct SecondaryInfoRow: View {
+    let text: String
+    let symbol: String
+    let symbolColor: Color
+
+    init(text: String, symbol: String, symbolColor: Color = .secondary) {
+        self.text = text
+        self.symbol = symbol
+        self.symbolColor = symbolColor
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: symbol)
+                .font(.system(size: 10))
+                .foregroundStyle(symbolColor)
+
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -485,79 +727,123 @@ struct ProviderCard: View {
     let tap: () -> Void
     let keyTap: () -> Void
     let isInteractionDisabled: Bool
+
     @State private var isHovered = false
+    @State private var isKeyHovered = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            Button(action: tap) { cardBody }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(.isButton)
-                .help(isActive ? "Provider actif : \(provider.displayName)" : "Activer \(provider.displayName)")
-                .disabled(isInteractionDisabled)
+        HStack(spacing: 0) {
+            selectionButton
+                .frame(maxWidth: .infinity)
 
-            if provider.requiresKey {
-                Button(action: keyTap) { keyIcon }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(hasKey ? "Modifier la clé" : "Saisir la clé")
-                    .help(hasKey ? "Modifier la clé \(provider.displayName)" : "Saisir la clé \(provider.displayName)")
-                    .disabled(isInteractionDisabled)
+            if !provider.isReserved {
+                keyButton
             }
         }
-        .padding(8)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isActive
-                      ? provider.brandColor.opacity(isHovered ? 0.16 : 0.10)
-                      : Color(nsColor: .windowBackgroundColor).opacity(isHovered ? 0.72 : 1))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(isActive ? provider.brandColor.opacity(0.6) : Color.secondary.opacity(isHovered ? 0.28 : 0), lineWidth: 1)
-                )
-        )
+        .background(cardBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(cardBorder)
         .onHover { isHovered = $0 }
-        .animation(.easeOut(duration: 0.16), value: isHovered)
+        .animation(.easeOut(duration: 0.14), value: isHovered)
+        .animation(.easeOut(duration: 0.14), value: isKeyHovered)
         .accessibilityElement(children: .contain)
     }
 
-    private var cardBody: some View {
-        HStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(provider.brandColor.opacity(0.15))
-                Image(systemName: provider.brandSymbol)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(provider.brandColor)
-            }
-            .frame(width: 26, height: 26)
+    private var selectionButton: some View {
+        Button(action: tap) {
+            HStack(spacing: 9) {
+                providerIcon
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(provider.displayName)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                Text(detailText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(provider.displayName)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
 
-            Spacer(minLength: 0)
+                    Text(detailText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
 
-            if isActive {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .font(.system(size: 12))
-            } else {
-                Circle()
-                    .fill(statusDotColor)
-                    .frame(width: 8, height: 8)
+                Spacer(minLength: 2)
+                activeIndicator
             }
+            .padding(.leading, 10)
+            .padding(.vertical, 9)
+            .padding(.trailing, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel("\(provider.displayName), \(detailText)")
+        .accessibilityHint(isActive ? "Provider actif" : "Activer ce provider")
+        .help(isActive ? "Provider actif : \(provider.displayName)" : "Activer \(provider.displayName)")
+        .disabled(isInteractionDisabled)
+    }
+
+    private var providerIcon: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(provider.brandColor.opacity(0.14))
+
+            Image(systemName: provider.brandSymbol)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(provider.brandColor)
+        }
+        .frame(width: 27, height: 27)
+    }
+
+    @ViewBuilder
+    private var activeIndicator: some View {
+        if isActive {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityLabel("Provider actif")
+        } else {
+            Circle()
+                .fill(statusDotColor)
+                .frame(width: 7, height: 7)
+                .accessibilityHidden(true)
         }
     }
 
-    private var keyIcon: some View {
-        Image(systemName: hasKey ? "key.fill" : "key")
-            .font(.system(size: 13))
-            .foregroundStyle(hasKey ? .green : .secondary)
+    private var keyButton: some View {
+        Button(action: keyTap) {
+            Image(systemName: hasKey ? "key.fill" : "key")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(hasKey ? Color.green : Color.secondary)
+                .frame(width: 34, height: 42)
+                .background(
+                    Rectangle().fill(Color.primary.opacity(isKeyHovered ? 0.045 : 0))
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isKeyHovered = $0 }
+        .accessibilityLabel(hasKey ? "Modifier la clé \(provider.displayName)" : "Saisir la clé \(provider.displayName)")
+        .help(hasKey ? "Modifier la clé \(provider.displayName)" : "Saisir la clé \(provider.displayName)")
+        .disabled(isInteractionDisabled)
+    }
+
+    private var cardBackground: some View {
+        RoundedRectangle(cornerRadius: 11, style: .continuous)
+            .fill(
+                isActive
+                    ? Color.accentColor.opacity(0.085)
+                    : Color(nsColor: .controlBackgroundColor).opacity(isHovered ? 0.94 : 1)
+            )
+    }
+
+    private var cardBorder: some View {
+        RoundedRectangle(cornerRadius: 11, style: .continuous)
+            .strokeBorder(
+                isActive
+                    ? Color.accentColor.opacity(0.62)
+                    : Color.secondary.opacity(isHovered ? 0.20 : 0.10),
+                lineWidth: 1
+            )
     }
 
     private var detailText: String {

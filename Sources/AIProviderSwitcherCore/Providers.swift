@@ -172,10 +172,21 @@ public struct ProviderCatalog: Sendable, Equatable {
             displayName: "OpenRouter",
             baseURL: URL(string: "https://openrouter.ai/api/v1")!,
             environmentVariable: "OPENROUTER_API_KEY",
-            // OpenRouter exposes upstream models as `provider/model-id`.
-            models: ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol", "openai/gpt-5.6-terra",
-                     "deepseek/deepseek-v4-flash", "z-ai/glm-5.2"],
-            defaultModel: "openai/gpt-5.6-luna",
+            // OpenRouter exposes upstream models as `provider/model-id`. Put
+            // the free tier first: Codex exposes only a small native-slot set,
+            // and a paid flagship must not crowd out zero-cost models.
+            models: ["openrouter/free",
+                     "dots-studio/dots-3-note-preview:free",
+                     "liquid/lfm-2.5-2.6b:free",
+                     "nvidia/nemotron-3.5-lightning:free",
+                     "thinkingmachines/inkling-small:free",
+                     "poolside/laguna-xs-2.1:free",
+                     "cohere/north-mini-code:free",
+                     "z-ai/glm-5.2",
+                     "google/gemma-4-31b-it:free",
+                     "openai/gpt-5.6-luna",
+                     "deepseek/deepseek-v4-flash"],
+            defaultModel: "openrouter/free",
             // OpenRouter exposes many upstream function-tool contracts, but not
             // one universal Codex custom-tool contract: the bridge normalizes it.
             supportsTools: true,

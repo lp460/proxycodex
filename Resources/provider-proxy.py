@@ -53,6 +53,13 @@ SUPPORTS_PARALLEL_TOOLS = len(sys.argv) > 10 and sys.argv[10] == "1"
 # tools, so the capability is advertised as `function` in the catalog.
 SUPPORTS_CUSTOM_TOOLS = len(sys.argv) > 11 and sys.argv[11] == "1"
 
+# OpenRouter chooses very large completion budgets by default (GPT models can
+# ask for 64k+ tokens). That budget is pre-authorized against credits before
+# execution, so low-balance accounts receive HTTP 402 even for tiny prompts.
+# Relay mode therefore always provides a practical explicit ceiling.
+IS_OPENROUTER = "openrouter.ai" in UPSTREAM
+OPENROUTER_MAX_OUTPUT_TOKENS = 16384
+
 # Model masquerading: MODELS are the slugs Codex believes are native, REAL_MODELS
 # the provider models answering them. Codex gates part of its feature set on the
 # model it thinks it is talking to, so the slug must stay one of its own.
@@ -202,14 +209,98 @@ def _anthropic_oauth_token():
     return token
 
 
+def managed_credential():
+    """Private credential the app holds for this provider, if any. It is the
+    single source of truth: the panel writes it, the proxy applies it."""
+    return os.environ.get("AI_PROVIDER_SWITCHER_PROXY_API_KEY", "").strip()
+
+
+def managed_headers(headers):
+    """Relay headers carrying the managed credential. When the app has one it
+    replaces any Authorization the client still sends (a stale env_key, for
+    instance), so changing the key in the panel is enough."""
+    credential = managed_credential()
+    if not credential:
+        return dict(headers)
+    out = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+    out["Authorization"] = "Bearer " + credential
+    return out
+
+
+def codex_config_env():
+    """ANTHROPIC_* variables Codex itself is told to export
+    (`~/.codex/config.toml`, `[shell_environment_policy.set]`).
+
+    Claude Code can be pointed at a compatible gateway (Z.ai, etc.) through
+    these variables; the adapter must follow the same contract, otherwise the
+    provider works in Claude Code and fails here.
+    """
+    try:
+        with open(os.path.expanduser("~/.codex/config.toml")) as f:
+            text = f.read()
+    except Exception:
+        return {}
+    env = {}
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            in_section = line.replace(" ", "") == "[shell_environment_policy.set]"
+            continue
+        if not in_section:
+            continue
+        match = re.match(r'^([A-Za-z0-9_]+)\s*=\s*"(.*)"\s*$', line)
+        if match:
+            value = match.group(2).replace('\\"', '"').replace("\\\\", "\\")
+            env[match.group(1)] = value
+    return env
+
+
+def _anthropic_sources():
+    """(base_url, headers) candidates, most authoritative first.
+
+    One provider, one authentication path: the switcher-managed credential,
+    then Claude Code's own keychain OAuth, then the ANTHROPIC_* environment
+    (%s or ~/.codex/config.toml) that Claude Code itself follows.
+    """ % ("~/.claude/settings.json")
+    managed = managed_credential()
+    if managed:
+        yield UPSTREAM, {"x-api-key": managed, "anthropic-version": "2023-06-01"}
+    oauth = _anthropic_oauth_token()
+    if oauth:
+        yield UPSTREAM, {
+            "Authorization": "Bearer " + oauth,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+        }
+    for env in (claude_settings_env(), codex_config_env()):
+        token = (env.get("ANTHROPIC_AUTH_TOKEN")
+                 or env.get("ANTHROPIC_API_KEY")
+                 or "").strip()
+        base = (env.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+        if token and base:
+            yield base, {
+                "Authorization": "Bearer " + token,
+                "anthropic-version": "2023-06-01",
+            }
+
+
+def anthropic_credentials(request_authorization=""):
+    """Resolve `(base_url, headers)` for the Anthropic adapter. Headers are
+    None when nothing can authenticate: the caller reports it instead of
+    sending an empty x-api-key upstream."""
+    for base, headers in _anthropic_sources():
+        return base, headers
+    key = (request_authorization or "").replace("Bearer ", "").strip()
+    if key:
+        return UPSTREAM, {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    return UPSTREAM, None
+
+
 def anthropic_base_url():
-    if _anthropic_oauth_token():
-        return UPSTREAM  # real Anthropic (api.anthropic.com)
-    env = claude_settings_env()
-    base = (env.get("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
-    if base:
-        return base
-    return UPSTREAM
+    return anthropic_credentials()[0]
 
 
 def anthropic_messages_url():
@@ -220,27 +311,7 @@ def anthropic_messages_url():
 
 
 def anthropic_headers(request_authorization):
-    """Real Anthropic first (Claude Code's keychain OAuth), then Claude Code's
-    settings.json env, then a request-level API key."""
-    token = _anthropic_oauth_token()
-    if token:
-        return {
-            "Authorization": "Bearer " + token,
-            "anthropic-version": "2023-06-01",
-            "anthropic-beta": "oauth-2025-04-20",
-        }
-    env = claude_settings_env()
-    token = (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
-    if token:
-        return {
-            "Authorization": "Bearer " + token,
-            "anthropic-version": "2023-06-01",
-        }
-    key = (request_authorization or "").replace("Bearer ", "").strip()
-    return {
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-    }
+    return anthropic_credentials(request_authorization)[1] or {}
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +343,10 @@ def opencode_stored_key():
     return None
 
 
-def opencode_authorization(request_authorization):
+def opencode_authorization(request_authorization=None):
+    managed = managed_credential()
+    if managed:
+        return "Bearer " + managed
     supplied = (request_authorization or "").replace("Bearer ", "").strip()
     return "Bearer " + (supplied or opencode_stored_key() or OPENCODE_PUBLIC_KEY)
 
@@ -703,6 +777,14 @@ def sanitize_upstream_request(req):
         effort = reasoning.get("effort")
         if isinstance(effort, str) and effort not in PORTABLE_REASONING_EFFORTS:
             reasoning["effort"] = "low" if effort == "minimal" else "high"
+    if IS_OPENROUTER:
+        try:
+            requested = int(req.get("max_output_tokens") or 0)
+        except (TypeError, ValueError):
+            requested = 0
+        req["max_output_tokens"] = min(
+            requested or OPENROUTER_MAX_OUTPUT_TOKENS,
+            OPENROUTER_MAX_OUTPUT_TOKENS)
     return req
 
 
@@ -782,15 +864,23 @@ def emit_stream_from_response(resp):
     for idx, item in enumerate(resp.get("output", [])):
         itype = item.get("type")
         events.append({"type": "response.output_item.added", "output_index": idx, "item": item})
-        if itype in ("reasoning", "message"):
-            delta_key = "reasoning_text.delta" if itype == "reasoning" else "output_text.delta"
-            done_key = "reasoning_text.done" if itype == "reasoning" else "output_text.done"
+        if itype == "reasoning":
+            for si, part in enumerate(item.get("summary") or []):
+                events.append({"type": "response.reasoning_summary_part.added", "item_id": item.get("id"),
+                               "output_index": idx, "summary_index": si, "part": part})
+                events.append({"type": "response.reasoning_summary_text.delta", "item_id": item.get("id"),
+                               "output_index": idx, "summary_index": si, "delta": part.get("text", "")})
+                events.append({"type": "response.reasoning_summary_text.done", "item_id": item.get("id"),
+                               "output_index": idx, "summary_index": si, "text": part.get("text", "")})
+                events.append({"type": "response.reasoning_summary_part.done", "item_id": item.get("id"),
+                               "output_index": idx, "summary_index": si, "part": part})
+        if itype == "message":
             for ci, part in enumerate(item.get("content") or []):
                 events.append({"type": "response.content_part.added", "item_id": item.get("id"),
                                "output_index": idx, "content_index": ci, "part": part})
-                events.append({"type": "response." + delta_key, "item_id": item.get("id"),
+                events.append({"type": "response.output_text.delta", "item_id": item.get("id"),
                                "output_index": idx, "content_index": ci, "delta": part.get("text", "")})
-                events.append({"type": "response." + done_key, "item_id": item.get("id"),
+                events.append({"type": "response.output_text.done", "item_id": item.get("id"),
                                "output_index": idx, "content_index": ci, "text": part.get("text", "")})
                 events.append({"type": "response.content_part.done", "item_id": item.get("id"),
                                "output_index": idx, "content_index": ci, "part": part})
@@ -946,6 +1036,18 @@ def anthropic_to_responses(resp, model, rid=None):
     texts = [b.get("text", "") for b in content if b.get("type") == "text"]
     tool_calls = [b for b in content if b.get("type") == "tool_use"]
     output = []
+    # Extended thinking: Z.ai (and Anthropic with thinking enabled) answers with
+    # `thinking` blocks. Dropping them yields an empty response, so they are
+    # surfaced as `reasoning` items — the shape Codex displays.
+    for block in content:
+        if block.get("type") in ("thinking", "redacted_thinking"):
+            text = (block.get("thinking") or "").strip()
+            if text:
+                output.append({
+                    "type": "reasoning",
+                    "id": f"rs_{uuid.uuid4().hex[:24]}",
+                    "summary": [{"type": "summary_text", "text": text}],
+                })
     # Anthropic's own web search runs server-side; report it the way Codex
     # reports OpenAI's hosted search so the UI shows the query.
     for block in content:
@@ -1007,6 +1109,7 @@ class AnthropicStreamTranslator:
         self.sent_created = False
         self.current_tool = None
         self.text_item_id = None
+        self.thinking_item_id = None
         self.input_tokens = 0
         self.output_tokens = 0
 
@@ -1038,7 +1141,25 @@ class AnthropicStreamTranslator:
             self.input_tokens = usage.get("input_tokens", 0) or 0
         elif etype == "content_block_start":
             block = event.get("content_block", {})
-            if block.get("type") == "text":
+            if block.get("type") in ("thinking", "redacted_thinking"):
+                self.thinking_item_id = f"rs_{uuid.uuid4().hex[:24]}"
+                self.response["output"].append({
+                    "type": "reasoning", "id": self.thinking_item_id,
+                    "summary": [{"type": "summary_text", "text": ""}],
+                })
+                chunks.append(sse({
+                    "type": "response.output_item.added",
+                    "output_index": len(self.response["output"]) - 1,
+                    "item": dict(self.response["output"][-1]),
+                }))
+                chunks.append(sse({
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": self.thinking_item_id,
+                    "output_index": len(self.response["output"]) - 1,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                }))
+            elif block.get("type") == "text":
                 self.text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
                 self.response["output"].append({
                     "type": "message", "id": self.text_item_id, "status": "in_progress",
@@ -1073,7 +1194,22 @@ class AnthropicStreamTranslator:
                 }))
         elif etype == "content_block_delta":
             delta = event.get("delta", {})
-            if delta.get("type") == "text_delta":
+            if delta.get("type") == "thinking_delta":
+                text = delta.get("thinking", "")
+                head = self.response["output"][-1] if self.response["output"] else None
+                if head is not None and head.get("id") == self.thinking_item_id:
+                    summary = head.setdefault("summary", [])
+                    if not summary:
+                        summary.append({"type": "summary_text", "text": ""})
+                    summary[0]["text"] = summary[0].get("text", "") + text
+                chunks.append(sse({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": self.thinking_item_id,
+                    "output_index": len(self.response["output"]) - 1,
+                    "summary_index": 0,
+                    "delta": text,
+                }))
+            elif delta.get("type") == "text_delta":
                 text = delta.get("text", "")
                 if self.response["output"] and self.response["output"][-1].get("id") == self.text_item_id:
                     self.response["output"][-1]["content"][0]["text"] += text
@@ -1092,7 +1228,30 @@ class AnthropicStreamTranslator:
                     "delta": partial,
                 }))
         elif etype == "content_block_stop":
-            if self.current_tool is not None:
+            if self.thinking_item_id is not None:
+                item = self.response["output"][-1]
+                text = "".join(p.get("text", "") for p in (item.get("summary") or []))
+                chunks.append(sse({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": self.thinking_item_id,
+                    "output_index": len(self.response["output"]) - 1,
+                    "summary_index": 0,
+                    "text": text,
+                }))
+                chunks.append(sse({
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": self.thinking_item_id,
+                    "output_index": len(self.response["output"]) - 1,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": text},
+                }))
+                chunks.append(sse({
+                    "type": "response.output_item.done",
+                    "output_index": len(self.response["output"]) - 1,
+                    "item": dict(item),
+                }))
+                self.thinking_item_id = None
+            elif self.current_tool is not None:
                 self.current_tool["status"] = "completed"
                 chunks.append(sse({
                     "type": "response.function_call_arguments.done",
@@ -1197,6 +1356,12 @@ def do_anthropic_request(body_bytes, headers, stream):
     if stream:
         anth["stream"] = True
     hdrs = anthropic_headers(headers.get("Authorization", ""))
+    if not hdrs:
+        message = ("Aucune authentification Claude Code trouvée. Connectez-vous avec "
+                   "`claude` (Trousseau) ou renseignez ANTHROPIC_AUTH_TOKEN.")
+        sys.stderr.write("[proxy %s] %s\n" % (DISPLAY, message))
+        return 401, json.dumps({"error": {"type": "authentication_error",
+                                          "message": message}}).encode(), "application/json"
     hdrs["Content-Type"] = "application/json"
     resp, error = _post_anthropic(anth, hdrs, server_tools)
     if error:
@@ -1346,11 +1511,15 @@ class Handler(BaseHTTPRequestHandler):
                 req = None
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "accept-encoding", "content-length", "transfer-encoding")}
-        if ADAPTER == "opencode":
+        if ADAPTER == "relay":
+            # One credential path per mode. Relay providers use the credential
+            # the app holds; it replaces any stale header the client carries.
+            headers = managed_headers(headers)
+        elif ADAPTER == "opencode":
             # Codex sends no Authorization for a keyless provider; OpenCode Zen
-            # needs one, so it is resolved from OpenCode's own credentials.
-            # Header names keep the client's casing, hence the case-insensitive
-            # sweep before setting ours.
+            # needs one, so it is resolved from the managed key, OpenCode's own
+            # credentials, then the public key. Header names keep the client's
+            # casing, hence the case-insensitive sweep before setting ours.
             supplied = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
             for key in [k for k in headers if k.lower() == "authorization"]:
                 del headers[key]
@@ -1421,6 +1590,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
         except urllib.error.HTTPError as e:
             body = e.read()
+            if ADAPTER == "opencode" and e.code in (401, 402, 403, 500, 502, 503):
+                detail = ""
+                try:
+                    detail = (json.loads(body.decode("utf-8")).get("error") or {}).get("message", "")
+                except Exception:
+                    pass
+                message = ("OpenCode Zen a renvoyé une erreur%s. Si le palier gratuit ne "
+                           "répond plus, exécutez `opencode auth login` ou saisissez une clé "
+                           "Zen dans le panneau." % (" (%s)" % detail if detail else ""))
+                body = json.dumps({"error": {"type": "opencode_auth", "message": message}}).encode()
             self.send_response(e.code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()

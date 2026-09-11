@@ -71,9 +71,51 @@ final class CompatibilityCheckerTests: XCTestCase {
         let provider = ProviderCatalog.default[id: "deepseek"]!
         let result = try await checker.check(provider: provider, secret: Secret("sk-bad-111111111111"))
         if case .incompatible(let reason) = result.state {
-            XCTAssertTrue(reason.contains("rejected the key"))
+            XCTAssertTrue(reason.contains("refusé la clé"))
         } else {
             XCTFail("expected incompatible")
+        }
+    }
+
+    func testMissingKeyIsReportedWithoutAnyRequest() async throws {
+        let mock = MockHTTPClient(responses: [])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "openrouter"]!
+        let result = try await checker.check(provider: provider, secret: nil)
+        if case .incompatible(let reason) = result.state {
+            XCTAssertTrue(reason.contains("Clé manquante"))
+        } else {
+            XCTFail("expected missing-key incompatibility")
+        }
+        XCTAssertTrue(mock.recorded.isEmpty, "no request should be spent without a key")
+    }
+
+    /// OpenCode Zen answers 2xx with an error envelope on a restricted free
+    /// tier; a 2xx must not be reported as connected.
+    func test200WithGenericErrorEnvelopeIsIncompatible() async throws {
+        let body = #"{"type":"error","error":{"type":"error","message":"Internal server error"}}"#.data(using: .utf8)!
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 200, body: body), body))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "opencode"]!
+        let result = try await checker.check(provider: provider, secret: nil)
+        if case .incompatible(let reason) = result.state {
+            XCTAssertTrue(reason.contains("Internal server error"))
+        } else {
+            XCTFail("expected incompatible for a 2xx error envelope")
+        }
+    }
+
+    func testOpenRouterCreditFailureIsNotReportedAsAKeyError() async throws {
+        let body = #"{"error":{"code":402,"message":"This request requires more credits"}}"#.data(using: .utf8)!
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 402, body: body), body))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "openrouter"]!
+        let result = try await checker.check(provider: provider, secret: Secret("sk-credits-111111111111"))
+        if case .incompatible(let reason) = result.state {
+            XCTAssertTrue(reason.contains("crédit ou budget de sortie insuffisant"))
+            XCTAssertFalse(reason.contains("refusé la clé"))
+        } else {
+            XCTFail("expected incompatible for credit failure")
         }
     }
 
@@ -114,5 +156,15 @@ final class CompatibilityCheckerTests: XCTestCase {
         _ = try await checker.check(provider: provider, secret: Secret(key))
         XCTAssertFalse(sink.allJoined.contains(key))
         XCTAssertEqual(mock.recorded.first?.hasAuthorization, true)
+    }
+
+    func testProbeSetsAnExplicitSmallCompletionBudget() async throws {
+        let mock = MockHTTPClient(responses: [.success((MockHTTPClient.makeResponse(url: endpoint, status: 200), Data()))])
+        let checker = CompatibilityChecker(client: mock)
+        let provider = ProviderCatalog.default[id: "openrouter"]!
+        _ = try await checker.check(provider: provider, secret: Secret("sk-budget-111111111111"))
+        let body = try XCTUnwrap(mock.recorded.first?.body)
+        let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(payload["max_output_tokens"] as? Int, 1024)
     }
 }

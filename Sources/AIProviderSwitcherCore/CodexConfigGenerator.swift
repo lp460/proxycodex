@@ -1,6 +1,7 @@
 import Foundation
 
-/// Generates **key-less, proxy-free** TOML snippets for the native Codex config:
+/// Generates key-less TOML snippets for the native Codex config. Every routed
+/// provider points at its local adapter, which holds the credential:
 /// - a provider declaration block (`[model_providers.<id>]`) appended additively;
 /// - a profile file (`~/.codex/<id>.config.toml`) selected via `codex --profile <id>`.
 ///
@@ -25,10 +26,10 @@ public enum CodexConfigGenerator {
         }
     }
 
-    /// TOML block declaring a custom model_provider. Contains NO key: the key is
-    /// read at runtime from the env var named by `env_key`. Third-party
-    /// providers (those with an adapter port) route through the local proxy so
-    /// Codex Desktop can list their models.
+    /// TOML block declaring a custom model_provider. Contains NO key: routed
+    /// providers go through their local adapter, which applies the credential
+    /// the app holds. `env_key` is only kept for a hypothetical keyed provider
+    /// without an adapter, so this app never has two key paths.
     public static func providerBlock(_ provider: Provider) -> String {
         precondition(!reservedProviderIDs.contains(provider.id), "Cannot declare reserved provider: \(provider.id)")
         var lines: [String] = []
@@ -39,7 +40,12 @@ public enum CodexConfigGenerator {
         } else {
             lines.append("base_url = \(toml(provider.baseURL.absoluteString))")
         }
-        if provider.requiresKey && !provider.environmentVariable.isEmpty {
+        // Routed providers never declare `env_key`: the adapter holds the
+        // credential and applies it. A second source (the env of a relaunched
+        // Codex) would go stale as soon as the panel changes the key, which is
+        // exactly the confusion this app exists to remove.
+        if proxyPort(for: provider.id) == nil,
+           provider.requiresKey, !provider.environmentVariable.isEmpty {
             lines.append("env_key = \(toml(provider.environmentVariable))")
         }
         // Third-party endpoints must not be forced through Codex's native
@@ -235,8 +241,16 @@ public enum CodexConfigGenerator {
     /// Codex's catalog schema has required fields (`support_verbosity`,
     /// `default_verbosity`, …) and it reacts to a missing one by rejecting
     /// `config.toml` entirely — third-party providers, MCP servers and every user
-    /// setting go down with it. So every entry must carry at least the fields the
-    /// cache entries carry; a lighter entry means we invented something.
+    /// setting go down with it. So every entry must carry at least the fields of
+    /// the cache entry it was copied from; a lighter entry means we invented
+    /// something.
+    ///
+    /// The comparison is **per model**, not against the union of every slug's
+    /// fields: Codex evolves its schema one model at a time (`gpt-6-astra` now
+    /// carries `multi_agent_reasoning_effort`, older slugs do not). A union made
+    /// every other entry look incomplete as soon as one model gained a field,
+    /// which silently disabled masquerading and sent Codex back to its own
+    /// catalog.
     static func catalogIsComplete(
         _ models: [[String: Any]],
         comparedTo nativeEntries: [String: [String: Any]]
@@ -245,11 +259,12 @@ public enum CodexConfigGenerator {
         let optional: Set<String> = ["availability_nux", "upgrade", "tool_mode",
                                      "web_search_tool_type", "apply_patch_tool_type",
                                      "multi_agent_version"]
-        let required = nativeEntries.values
-            .map { Set($0.keys) }
-            .reduce(into: Set<String>()) { $0.formUnion($1) }
-            .subtracting(optional)
-        return models.allSatisfy { required.subtracting($0.keys).isEmpty }
+        return models.allSatisfy { model in
+            guard let slug = model["slug"] as? String,
+                  let source = nativeEntries[slug] else { return false }
+            let required = Set(source.keys).subtracting(optional)
+            return required.subtracting(model.keys).isEmpty
+        }
     }
 
     /// Removes JSON nulls because Codex's model catalog schema rejects null for
@@ -300,7 +315,8 @@ public enum CodexConfigGenerator {
     public static func profileFile(model: String, providerID: String) -> String {
         """
         # Managed by AI Provider Switcher. Contains NO API keys.
-        # The key (if any) is injected via the env variable named by env_key.
+        # The routed provider reads its credential from the local adapter,
+        # which the panel keeps up to date (no env_key involved).
         model = \(toml(model))
         model_provider = \(toml(providerID))
 

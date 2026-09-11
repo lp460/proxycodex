@@ -31,13 +31,24 @@ public final class CompatibilityChecker: Sendable {
     }
 
     public func check(provider: Provider, secret: Secret?) async throws -> CompatibilityResult {
+        // A provider that needs a key cannot work without one: report it
+        // directly instead of spending a round trip that returns a 401.
+        if provider.requiresKey, secret?.asString()?.isEmpty != false {
+            return CompatibilityResult(
+                state: .incompatible(reason: "Clé manquante pour \(provider.displayName)."),
+                detail: "no key"
+            )
+        }
         // Routed providers are reached through the local adapter proxy: probe the
         // URL Codex actually uses (e.g. Anthropic has no /v1/responses upstream).
         let base: URL
+        let throughProxy: Bool
         if let port = CodexConfigGenerator.proxyPort(for: provider.id) {
             base = URL(string: "http://127.0.0.1:\(port)/v1")!
+            throughProxy = true
         } else {
             base = provider.baseURL
+            throughProxy = false
         }
         let endpoint = base.appendingPathComponent("responses")
         var request = URLRequest(url: endpoint)
@@ -52,10 +63,14 @@ public final class CompatibilityChecker: Sendable {
         }
         // Minimal probe body. Providers that accept /v1/responses will respond
         // (2xx or a structured 4xx). A 404/405 indicates the endpoint is absent.
+        // Do not let gateways choose their largest default completion budget:
+        // OpenRouter can reject an authenticated probe with HTTP 402 before it
+        // checks whether the endpoint works.
         let body: [String: Any] = [
             "model": provider.defaultModel,
             "input": "ping",
-            "stream": false
+            "stream": false,
+            "max_output_tokens": 1024
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -64,10 +79,10 @@ public final class CompatibilityChecker: Sendable {
         do {
             (response, data) = try await client.send(request)
         } catch {
-            return CompatibilityResult(
-                state: .incompatible(reason: "Cannot reach \(provider.displayName): \(error.localizedDescription)"),
-                detail: error.localizedDescription
-            )
+            let reason = throughProxy
+                ? "Adaptateur local arrêté pour \(provider.displayName) : lancez l'app puis réessayez."
+                : "Cannot reach \(provider.displayName): \(error.localizedDescription)"
+            return CompatibilityResult(state: .incompatible(reason: reason), detail: error.localizedDescription)
         }
         let code = response.statusCode
         Log.info("Compatibility probe for \(provider.displayName) -> HTTP \(code) at \(endpoint.absoluteString)")
@@ -75,19 +90,29 @@ public final class CompatibilityChecker: Sendable {
         // the body for a rejected key, e.g. {"code":401,"msg":"token expired or
         // incorrect","success":false} or {"code":1000,"msg":"Authentication
         // Failed"}. A 2xx must not be treated as "connected" in that case.
-        if let authFailure = Self.embeddedAuthFailure(data: data) {
+        if let failure = Self.embeddedAuthFailure(data: data) {
             Log.info("Compatibility probe for \(provider.displayName) -> embedded auth failure (HTTP \(code))")
             return CompatibilityResult(
-                state: .incompatible(reason: "\(provider.displayName) a refusé la clé : \(authFailure)"),
+                state: .incompatible(reason: Self.userFacingFailure(
+                    providerDisplayName: provider.displayName, code: code, failure: failure)),
                 detail: "HTTP \(code) auth"
             )
         }
         switch code {
         case 200...299:
+            // Some gateways answer 2xx with an error payload (OpenCode Zen does
+            // this for a restricted free tier). That is not "connected".
+            if let payload = Self.embeddedErrorMessage(data: data) {
+                return CompatibilityResult(
+                    state: .incompatible(reason: "\(provider.displayName) : \(payload)"),
+                    detail: "HTTP \(code) error payload"
+                )
+            }
             return CompatibilityResult(state: .compatible, detail: "HTTP \(code)")
         case 401, 403:
+            let detail = Self.embeddedErrorMessage(data: data) ?? "HTTP \(code)"
             return CompatibilityResult(
-                state: .incompatible(reason: "\(provider.displayName) rejected the key (HTTP \(code))"),
+                state: .incompatible(reason: "\(provider.displayName) a refusé la clé : \(detail)"),
                 detail: "HTTP \(code)"
             )
         case 404, 405:
@@ -96,15 +121,38 @@ public final class CompatibilityChecker: Sendable {
                 detail: "HTTP \(code)"
             )
         default:
-            // 4xx/5xx other than the above still means the endpoint exists.
+            if code >= 500 {
+                let detail = Self.embeddedErrorMessage(data: data) ?? "HTTP \(code)"
+                return CompatibilityResult(
+                    state: .incompatible(reason: "\(provider.displayName) : erreur serveur — \(detail)"),
+                    detail: "HTTP \(code)"
+                )
+            }
+            // Other 4xx still means the endpoint exists and parsed the request.
             return CompatibilityResult(state: .compatible, detail: "HTTP \(code)")
         }
+    }
+
+    /// Message an error payload carries, whatever its shape. Used to surface a
+    /// gateway's own wording instead of a bare HTTP code.
+    static func embeddedErrorMessage(data: Data) -> String? {
+        guard !data.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        // Only explicit error envelopes count. A flat `msg` can be a quota
+        // notice on an otherwise successful probe, which must stay "compatible".
+        let errorObject = object["error"] as? [String: Any]
+        let message = (errorObject?["message"] as? String)
+            ?? (object["message"] as? String)
+        guard let message, !message.isEmpty else { return nil }
+        return message
     }
 
     /// Detects an authentication failure hidden inside an otherwise successful
     /// HTTP response. Handles both Z.ai's flat `{"code":401,"msg":…}` shape and
     /// the OpenAI-compatible `{"error":{"code":"401","message":…}}` shape.
-    static func embeddedAuthFailure(data: Data) -> String? {
+    static func embeddedAuthFailure(data: Data) -> (code: String?, message: String?)? {
         guard !data.isEmpty,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
@@ -119,7 +167,7 @@ public final class CompatibilityChecker: Sendable {
         if let codeValue {
             let codeString = "\(codeValue)"
             if ["401", "402", "403"].contains(codeString) {
-                return message?.isEmpty == false ? message : "code \(codeString)"
+                return (codeString, message?.isEmpty == false ? message : "code \(codeString)")
             }
         }
         guard let message, !message.isEmpty else { return nil }
@@ -130,8 +178,20 @@ public final class CompatibilityChecker: Sendable {
             || text.contains("invalid key")
             || text.contains("unauthorized")
             || text.contains("bad credentials") {
-            return message
+            return (nil, message)
         }
         return nil
+    }
+
+    static func userFacingFailure(
+        providerDisplayName: String,
+        code: Int,
+        failure: (code: String?, message: String?)
+    ) -> String {
+        let detail = failure.message ?? "erreur \(failure.code ?? String(code))"
+        if failure.code == "402" || code == 402 {
+            return "\(providerDisplayName) a refusé la requête : crédit ou budget de sortie insuffisant — \(detail)"
+        }
+        return "\(providerDisplayName) a refusé la clé : \(detail)"
     }
 }

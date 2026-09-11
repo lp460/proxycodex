@@ -8,6 +8,7 @@ struct AIProviderSwitcherApp: App {
     var body: some Scene {
         // A native panel (not a plain submenu) so the provider grid, logs,
         // key sheet and Claude status live in one rich, stable SwiftUI surface.
+        // No WindowGroup: the app is a menu-bar accessory, never a Dock app.
         MenuBarExtra {
             PanelView(state: state)
         } label: {

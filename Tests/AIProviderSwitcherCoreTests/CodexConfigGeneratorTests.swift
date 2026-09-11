@@ -6,7 +6,6 @@ final class CodexConfigGeneratorTests: XCTestCase {
     func testProviderBlockDeepSeek() {
         let toml = CodexConfigGenerator.providerBlock(ProviderCatalog.default[id: "deepseek"]!)
         XCTAssertTrue(toml.contains("[model_providers.deepseek]"))
-        XCTAssertTrue(toml.contains("env_key = \"DEEPSEEK_API_KEY\""))
         XCTAssertTrue(toml.contains("requires_openai_auth = false"))
         XCTAssertTrue(toml.contains("wire_api = \"responses\""))
         // Third-party providers are routed through the local adapter proxy so
@@ -15,6 +14,19 @@ final class CodexConfigGeneratorTests: XCTestCase {
         XCTAssertTrue(CodexConfigGenerator.proxyPort(for: "deepseek") == 18888)
         XCTAssertFalse(CodexConfigGenerator.containsKeyLikeField(toml))
         XCTAssertFalse(toml.contains("sk-"))
+    }
+
+    /// One credential path for every routed provider: the adapter holds the
+    /// key. Declaring `env_key` would give Codex a second, stale source of
+    /// truth as soon as the panel changes the key.
+    func testRoutedProvidersNeverDeclareEnvKey() {
+        for id in ["deepseek", "glm", "openrouter", "opencode", "claude"] {
+            let provider = ProviderCatalog.default[id: id]!
+            let toml = CodexConfigGenerator.providerBlock(provider)
+            XCTAssertFalse(toml.contains("env_key"), id)
+            XCTAssertTrue(toml.contains("base_url = \"http://127.0.0.1:"), id)
+            XCTAssertTrue(toml.contains("requires_openai_auth = false"), id)
+        }
     }
 
     func testReservedIDsIncludeBuiltins() {
@@ -66,6 +78,39 @@ final class CodexConfigGeneratorTests: XCTestCase {
     /// A routed provider must look like one of Codex's own models: the metadata
     /// Codex fetched for that slug is reused as-is, so its full feature contract
     /// applies. Only the two OpenAI-internal wire switches are neutralized.
+    /// End-to-end regression for the bug that sent Codex back to its native
+    /// catalog: one model carried an extra field and every masqueraded entry
+    /// was refused. The catalog must stay masqueraded for the whole provider.
+    func testMasqueradeSurvivesAModelWithExtraSchemaFields() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("aps-hetero-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cache: [String: Any] = ["models": [
+            ["slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list",
+             "supported_in_api": true, "support_verbosity": true,
+             "multi_agent_reasoning_effort": "high"],
+            ["slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list",
+             "supported_in_api": true, "support_verbosity": true]
+        ]]
+        try JSONSerialization.data(withJSONObject: cache).write(to: url, options: [.atomic])
+
+        let json = CodexConfigGenerator.catalogJSON(
+            providers: ProviderCatalog.default.providers,
+            activeProviderID: "deepseek",
+            cacheURL: url
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: try XCTUnwrap(json.data(using: .utf8))) as? [String: Any])
+        let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+
+        XCTAssertEqual(models.map { $0["slug"] as? String }, ["gpt-6-astra", "gpt-5.6-sol"])
+        // The real model names stay visible to the user, never as slugs.
+        XCTAssertTrue(models.allSatisfy {
+            ($0["display_name"] as? String)?.contains("DeepSeek") == true
+        })
+        XCTAssertFalse(models.contains { ($0["slug"] as? String)?.hasPrefix("deepseek-") == true })
+    }
+
     func testMasqueradeCatalogCopiesCodexNativeMetadata() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("aps-native-cache-\(UUID().uuidString).json")
@@ -162,7 +207,31 @@ final class CodexConfigGeneratorTests: XCTestCase {
         // Fields Codex treats as optional may legitimately be absent.
         XCTAssertTrue(CodexConfigGenerator.catalogIsComplete(
             [["slug": "gpt-5.6-sol", "support_verbosity": true, "visibility": "list"]],
-            comparedTo: ["a": native["gpt-5.6-sol"]!.merging(["tool_mode": "code_mode_only"]) { $1 }]))
+            comparedTo: ["gpt-5.6-sol": native["gpt-5.6-sol"]!
+                .merging(["tool_mode": "code_mode_only"]) { $1 }]))
+    }
+
+    /// Regression: Codex evolved its schema per model (`gpt-6-astra` carries
+    /// `multi_agent_reasoning_effort`, older slugs do not). Comparing every entry
+    /// to the union of all fields made each entry look incomplete, silently
+    /// disabled masquerading, and Codex fell back to its native catalog.
+    func testCatalogCompletenessIsPerModelNotUnionOfFields() {
+        let native: [String: [String: Any]] = [
+            "gpt-6-astra": ["slug": "gpt-6-astra", "support_verbosity": true,
+                            "multi_agent_reasoning_effort": "high"],
+            "gpt-5.6-sol": ["slug": "gpt-5.6-sol", "support_verbosity": true]
+        ]
+        XCTAssertTrue(CodexConfigGenerator.catalogIsComplete(
+            [["slug": "gpt-5.6-sol", "support_verbosity": true],
+             ["slug": "gpt-6-astra", "support_verbosity": true,
+              "multi_agent_reasoning_effort": "high"]],
+            comparedTo: native))
+        // A field missing from the entry's own source still refuses the batch.
+        XCTAssertFalse(CodexConfigGenerator.catalogIsComplete(
+            [["slug": "gpt-5.6-sol"]], comparedTo: native))
+        // An entry with no source at all cannot be trusted either.
+        XCTAssertFalse(CodexConfigGenerator.catalogIsComplete(
+            [["slug": "invented", "support_verbosity": true]], comparedTo: native))
     }
 
     /// Ollama is a Codex built-in with no adapter to rewrite the model name, so
