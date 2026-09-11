@@ -94,6 +94,24 @@ final class ProviderUsageServiceTests: XCTestCase {
         XCTAssertNil(snapshot.windows.first?.resetsAt)
     }
 
+    func testOpenCodeGoParsesRollingWeeklyAndMonthlyWindows() async throws {
+        let body = """
+        {"usage":{"rolling":{"status":"ok","percent":12,"resetsAt":"2026-09-12T01:54:20.610Z"},
+                  "weekly":{"status":"ok","percent":34,"resetsAt":"2026-09-14T00:00:00.610Z"},
+                  "monthly":{"status":"rate-limited","percent":100,
+                             "resetsAt":"2026-10-11T18:13:18.610Z"}}}
+        """
+        let snapshot = try await service(response(200, body)).snapshot(
+            for: ProviderCatalog.default[id: "opencode-go"]!,
+            secret: Secret("sk-go-test-value-123")
+        )
+        XCTAssertEqual(snapshot.status, ProviderUsageStatus.available)
+        XCTAssertEqual(snapshot.planLabel, "OpenCode Go")
+        XCTAssertEqual(snapshot.windows.map(\.id), ["rolling", "weekly", "monthly"])
+        XCTAssertEqual(snapshot.windows.map(\.usedPercent), [12, 34, 100])
+        XCTAssertEqual(snapshot.windows.last?.detail, "Limite atteinte")
+    }
+
     func testCodexWindowsAreIdentifiedByDurationNotPosition() throws {
         func payload(primary: Int, secondary: Int?) -> [String: Any] {
             var limits: [String: Any] = ["primary": [

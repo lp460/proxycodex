@@ -487,12 +487,12 @@ def upstream_models(request_authorization):
     if ADAPTER == "opencode-go":
         headers = {"Authorization": opencode_authorization(
             request_authorization, provider_id="opencode-go")}
+        headers.update(opencode_go_identity_headers(b""))
         ids = _ids_from_models_payload(_get_json(UPSTREAM + "/v1/models", headers))
-        # Go routes models through Responses, Chat Completions or Messages. The
-        # Responses adapter can serve only the first family without a payload
-        # rewrite; hide the others instead of exposing a request that must fail.
-        return ([model for model in ids if model in OPENCODE_GO_RESPONSE_MODELS],
-                "gateway-responses")
+        # Most Go models speak Chat Completions. The Responses-shaped endpoint
+        # used by Codex is translated below; only these four currently answer
+        # Responses directly and can skip that translation.
+        return ids, "gateway"
     if ADAPTER == "anthropic":
         headers = anthropic_headers(request_authorization)
         base = anthropic_base_url()
@@ -985,6 +985,191 @@ def complete_tool_calls_relay(upstream_url, req, headers, response, max_rounds=2
         req = append_synthetic_tool_results(req, response)
         response = post_responses_json(upstream_url + "/v1/responses", req, headers)
     return response
+
+
+def _responses_parts_to_chat(content):
+    """Responses message content -> OpenAI Chat content."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") in ("input_text", "output_text", "text"):
+            text = part.get("text", "")
+            if parts and isinstance(parts[-1], str):
+                parts[-1] += text
+            else:
+                parts.append(text)
+        elif part.get("type") == "input_image" and SUPPORTS_IMAGES:
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if isinstance(url, str) and url:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+    if not parts:
+        return ""
+    if len(parts) == 1 and isinstance(parts[0], str):
+        return parts[0]
+    return [{"type": "text", "text": item} if isinstance(item, str) else item
+             for item in parts]
+
+
+def responses_to_chat(body):
+    """Translate a prepared Responses request to Chat Completions.
+
+    The tool bridge has already normalized Codex's native tool flavors into
+    flat Responses function tools. This pass converts those tools and the
+    conversation history to the Chat wire shape.
+    """
+    system = []
+    if isinstance(body.get("instructions"), str) and body["instructions"].strip():
+        system.append(body["instructions"].strip())
+    messages = []
+
+    def append_message(role, content, tool_calls=None):
+        if role == "system":
+            if isinstance(content, str) and content.strip():
+                system.append(content.strip())
+            return
+        if role == "assistant" and messages and messages[-1]["role"] == "assistant":
+            target = messages[-1]
+            if isinstance(content, str) and content:
+                target["content"] = ((target.get("content") or "") + content).strip()
+            target.setdefault("tool_calls", []).extend(tool_calls or [])
+            return
+        item = {"role": role, "content": content}
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+        messages.append(item)
+
+    raw = body.get("input")
+    if isinstance(raw, str):
+        append_message("user", raw)
+    elif isinstance(raw, list):
+        pending_tool_calls = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                if pending_tool_calls:
+                    append_message("assistant", "", pending_tool_calls)
+                    pending_tool_calls = []
+                role = item.get("role") or "user"
+                content = _responses_parts_to_chat(item.get("content"))
+                append_message("assistant" if role == "assistant" else role, content)
+            elif item_type == "function_call":
+                pending_tool_calls.append({
+                    "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments") or "{}",
+                    },
+                })
+            elif item_type == "function_call_output":
+                if pending_tool_calls:
+                    append_message("assistant", "", pending_tool_calls)
+                    pending_tool_calls = []
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "content": item.get("output") or "",
+                })
+        if pending_tool_calls:
+            append_message("assistant", "", pending_tool_calls)
+
+    if system:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system)})
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    chat = {
+        "model": body.get("model") or MODELS[0],
+        "messages": messages,
+        "stream": False,
+    }
+    tools = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            },
+        })
+    if tools:
+        chat["tools"] = tools
+        if body.get("tool_choice") is not None:
+            chat["tool_choice"] = body["tool_choice"]
+        if body.get("parallel_tool_calls") is not None:
+            chat["parallel_tool_calls"] = body["parallel_tool_calls"]
+
+    if body.get("max_output_tokens") is not None:
+        chat["max_tokens"] = body["max_output_tokens"]
+    for field in ("temperature", "top_p"):
+        if body.get(field) is not None:
+            chat[field] = body[field]
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        chat["reasoning_effort"] = reasoning["effort"]
+    return chat
+
+
+def chat_to_responses(body, slug):
+    """Translate a non-streaming Chat completion to a Responses object."""
+    choice = ((body.get("choices") or [{}])[0] or {})
+    message = choice.get("message") or {}
+    output = []
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        output.append({
+            "id": "msg_" + uuid.uuid4().hex[:24],
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        })
+    elif isinstance(content, list):
+        text = "".join(part.get("text", "") for part in content
+                       if isinstance(part, dict) and part.get("type") == "text")
+        if text:
+            output.append({
+                "id": "msg_" + uuid.uuid4().hex[:24],
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            })
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        output.append({
+            "id": call.get("id") or "fc_" + uuid.uuid4().hex[:24],
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call.get("id") or "",
+            "name": function.get("name", ""),
+            "arguments": function.get("arguments") or "{}",
+        })
+    usage = body.get("usage") or {}
+    return {
+        "id": body.get("id") or "resp_" + uuid.uuid4().hex[:24],
+        "object": "response",
+        "created_at": body.get("created") or int(time.time()),
+        "model": slug,
+        "status": "completed",
+        "output": output,
+        "parallel_tool_calls": body.get("parallel_tool_calls", False),
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
 
 
 def responses_to_anthropic(body):
@@ -1554,10 +1739,88 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         break
             return
+        if ADAPTER == "opencode-go" and self.path.startswith("/v1/responses") and data:
+            try:
+                req, bridge, _, slug = prepare_upstream_request(json.loads(data))
+                if req.get("model") not in OPENCODE_GO_RESPONSE_MODELS:
+                    self.relay_opencode_chat(req, bridge, slug)
+                    return
+            except Exception:
+                # malformed JSON and native Responses models continue through
+                # the normal relay path, which has the original error handling.
+                pass
         self.relay(body_bytes=data)
 
     def do_DELETE(self):
         self.relay()
+
+    def relay_opencode_chat(self, req, bridge, slug):
+        """Serve a Responses request by translating it to Chat Completions."""
+        supplied = self.headers.get("Authorization")
+        authorization = opencode_authorization(supplied, provider_id="opencode-go")
+        if not authorization:
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": {
+                "type": "opencode_auth",
+                "message": "Clé OpenCode Go manquante.",
+            }}).encode())
+            return
+
+        should_stream = bool(req.get("stream")) or "text/event-stream" in (
+            self.headers.get("Accept") or "")
+        headers = {
+            "Authorization": authorization,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        headers.update(opencode_go_identity_headers(json.dumps(req).encode()))
+        chat = responses_to_chat(req)
+        try:
+            request = urllib.request.Request(
+                UPSTREAM + "/v1/chat/completions",
+                data=json.dumps(chat).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(request, context=ssl_context(), timeout=180) as response:
+                upstream = json.loads(response.read().decode("utf-8"))
+            final = chat_to_responses(upstream, slug)
+            if bridge_needs_restore(bridge):
+                final["output"] = restore_output_items(final.get("output"), bridge)
+            payload = emit_stream_from_response(final) if should_stream else json.dumps(final).encode()
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "text/event-stream" if should_stream else "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            if error.code in (401, 402, 403, 500, 502, 503):
+                try:
+                    detail = (json.loads(body.decode("utf-8")).get("error") or {}).get("message", "")
+                except Exception:
+                    detail = ""
+                body = json.dumps({"error": {
+                    "type": "opencode_auth",
+                    "message": ("OpenCode Go a renvoyé une erreur%s. Vérifiez votre abonnement Go "
+                                "ou la clé saisie dans le panneau."
+                                % (" (%s)" % detail if detail else "")),
+                }}).encode()
+            self.send_response(error.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as error:
+            body = json.dumps({"error": {"type": "proxy_error", "message": str(error)}}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def relay(self, body_bytes=None):
         url = UPSTREAM + self.path

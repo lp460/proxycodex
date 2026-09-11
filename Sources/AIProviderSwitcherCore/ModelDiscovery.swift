@@ -31,6 +31,10 @@ public struct ModelDiscovery: Sendable {
     /// (OpenRouter serves hundreds), so the curated list is kept instead.
     public static let listableLimit = 30
 
+    static func listableLimit(for provider: Provider) -> Int {
+        provider.id == "opencode-go" ? 64 : listableLimit
+    }
+
     public init(client: HTTPClient = URLSessionHTTPClient(), timeout: TimeInterval = 25) {
         self.client = client
         self.timeout = timeout
@@ -88,7 +92,7 @@ public struct ModelDiscovery: Sendable {
     /// default hoisted, since the default takes the primary native slug.
     public static func resolvedModels(for provider: Provider, discovered: DiscoveredModels?) -> [String] {
         guard let discovered, !discovered.models.isEmpty,
-              discovered.models.count <= listableLimit else { return provider.models }
+              discovered.models.count <= listableLimit(for: provider) else { return provider.models }
         var models = discovered.models
         if let index = models.firstIndex(of: provider.defaultModel) {
             models.remove(at: index)

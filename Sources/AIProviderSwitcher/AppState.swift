@@ -1044,7 +1044,7 @@ final class AppState: ObservableObject {
     // Bumped whenever the adapter contract changes (base URLs, pairing, flags):
     // a stale running proxy would otherwise be kept because its metadata still
     // matches everything this version compares.
-    private let proxyVersion = "2026-09-11-opencode-go-v7"
+    private let proxyVersion = "2026-09-11-opencode-go-v9"
 
     /// Stable, non-reversible metadata used to detect credential changes and
     /// restart a proxy that still carries an older key.

@@ -47,6 +47,14 @@ final class ModelDiscoveryTests: XCTestCase {
                        openrouter.models)
     }
 
+    func testOpenCodeGoCanExposeItsCompleteGatewayCatalog() {
+        let go = ProviderCatalog.default[id: "opencode-go"]!
+        var gatewayModels = (0..<37).map { "go-model-\($0)" }
+        gatewayModels[0] = go.defaultModel
+        XCTAssertEqual(ModelDiscovery.resolvedModels(for: go, discovered: discovered(gatewayModels)).count,
+                       gatewayModels.count)
+    }
+
     func testNoAnswerKeepsTheDeclaredList() {
         let claude = ProviderCatalog.default[id: "claude"]!
         XCTAssertEqual(ModelDiscovery.resolvedModels(for: claude, discovered: nil), claude.models)

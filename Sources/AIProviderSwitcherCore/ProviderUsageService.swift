@@ -47,11 +47,10 @@ public struct ProviderUsageService: Sendable {
                 note: "Quota détaillé non exposé."
             )
         case "opencode-go":
-            return ProviderUsageSnapshot(
-                providerID: provider.id,
-                status: .unsupported,
-                note: "Quota Go non exposé ici ; consultez la console OpenCode."
-            )
+            guard let secret, !(secret.asString() ?? "").isEmpty else {
+                return ProviderUsageSnapshot(providerID: provider.id, status: .authenticationRequired)
+            }
+            return try await openCodeGoSnapshot(secret: secret)
         case "ollama":
             return ProviderUsageSnapshot(
                 providerID: provider.id,
@@ -167,6 +166,23 @@ public struct ProviderUsageService: Sendable {
             throw ProviderUsageError.invalidResponse
         }
         return ZAIUsageParser.snapshot(from: object, providerID: "glm", fetchedAt: Date())
+    }
+
+    // MARK: OpenCode Go
+
+    func openCodeGoSnapshot(secret: Secret) async throws -> ProviderUsageSnapshot {
+        var request = URLRequest(url: URL(string: "https://opencode.ai/zen/go/v1/usage")!)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(secret.asString() ?? "")", forHTTPHeaderField: "Authorization")
+
+        let (data, _) = try await validated(request)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = object["usage"] as? [String: Any] else {
+            throw ProviderUsageError.invalidResponse
+        }
+        return OpenCodeGoUsageParser.snapshot(from: usage, fetchedAt: Date())
     }
 
     // MARK: Helpers
@@ -304,6 +320,53 @@ public enum ZAIUsageParser {
                 ? number.doubleValue / 1000 : number.doubleValue)
         }
         return nil
+    }
+}
+
+/// Parses OpenCode Go's three subscription windows: rolling, weekly, monthly.
+public enum OpenCodeGoUsageParser {
+    public static func snapshot(
+        from usage: [String: Any],
+        fetchedAt: Date = Date()
+    ) -> ProviderUsageSnapshot {
+        let labels = [
+            "rolling": "Glissant",
+            "weekly": "7 jours",
+            "monthly": "30 jours"
+        ]
+        let windows = ["rolling", "weekly", "monthly"].compactMap { key -> UsageWindow? in
+            guard let entry = usage[key] as? [String: Any] else { return nil }
+            return UsageWindow(
+                id: key,
+                label: labels[key] ?? key,
+                usedPercent: Self.double(entry["percent"] ?? entry["usagePercent"]),
+                resetsAt: Self.date(entry["resetsAt"] ?? entry["reset_at"]),
+                detail: (entry["status"] as? String) == "rate-limited"
+                    ? "Limite atteinte" : nil
+            )
+        }
+        let rateLimited = windows.filter { $0.detail == "Limite atteinte" }
+        return ProviderUsageSnapshot(
+            providerID: "opencode-go",
+            fetchedAt: fetchedAt,
+            status: windows.isEmpty
+                ? .unavailable
+                : (rateLimited.count == windows.count ? .unavailable : .available),
+            planLabel: "OpenCode Go",
+            windows: windows,
+            note: windows.isEmpty ? "Quota Go non exposé." : nil
+        )
+    }
+
+    private static func double(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let text = value as? String { return Double(text) }
+        return nil
+    }
+
+    private static func date(_ value: Any?) -> Date? {
+        guard let text = value as? String else { return nil }
+        return ISO8601DateFormatter().date(from: text)
     }
 }
 
