@@ -421,6 +421,10 @@ enum CodexAppServerClient {
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
         process.standardInput = Pipe()
+        // Capture this before launch: an immediately exiting child can make
+        // Foundation invalidate its FileHandle wrapper while the quota task is
+        // still setting up. The integer descriptor stays safe to probe.
+        let stdinFD = stdout.fileHandleForWriting.fileDescriptor
 
         final class StreamState: @unchecked Sendable {
             private let lock = NSLock()
@@ -471,7 +475,6 @@ enum CodexAppServerClient {
         // short-lived app-server can legitimately close before our next RPC,
         // so raw POSIX writes keep that observable as a controlled error.
         signal(SIGPIPE, SIG_IGN)
-        let stdinFD = stdout.fileHandleForWriting.fileDescriptor
 
         func send(_ object: [String: Any]) throws {
             if let data = try? JSONSerialization.data(withJSONObject: object) {
