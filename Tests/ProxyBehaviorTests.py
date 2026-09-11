@@ -244,6 +244,36 @@ class ProxyBehaviorTests(unittest.TestCase):
             self.assertEqual(self.proxy.opencode_authorization(None), "Bearer zen-managed")
             self.assertEqual(self.proxy.opencode_authorization("Bearer client"), "Bearer zen-managed")
 
+    def test_opencode_go_uses_its_own_credential_without_free_fallback(self):
+        with mock.patch.object(self.proxy, "managed_credential", return_value=None):
+            with mock.patch.object(self.proxy, "opencode_stored_key",
+                                   side_effect=lambda provider_id: "go-key"
+                                   if provider_id == "opencode-go" else None):
+                self.assertEqual(
+                    self.proxy.opencode_authorization(None, provider_id="opencode-go"),
+                    "Bearer go-key")
+                self.assertEqual(
+                    self.proxy.opencode_authorization("Bearer client", provider_id="opencode-go"),
+                    "Bearer client")
+                with mock.patch.object(self.proxy, "opencode_stored_key",
+                                       return_value=None):
+                    self.assertEqual(
+                        self.proxy.opencode_authorization(None, provider_id="opencode-go"), "")
+
+    def test_opencode_go_identity_headers_are_stable_per_conversation(self):
+        body = json.dumps({
+            "model": "grok-4.6",
+            "input": [{"type": "message",
+                       "content": [{"type": "input_text", "text": "hello"}]}],
+        }).encode()
+        first = self.proxy.opencode_go_identity_headers(body)
+        second = self.proxy.opencode_go_identity_headers(body)
+        self.assertEqual(first["x-opencode-session"], second["x-opencode-session"])
+        self.assertTrue(first["x-opencode-session"].startswith("aips-"))
+        self.assertNotEqual(first["x-opencode-session"], first["x-opencode-request"])
+        self.assertEqual(first["x-opencode-client"], "ai-provider-switcher")
+        self.assertIn("AIProviderSwitcher", first["User-Agent"])
+
     def test_anthropic_credentials_follow_claude_code_env_from_codex_config(self):
         import tempfile
         toml = """
@@ -345,6 +375,17 @@ trust_level = "trusted"
              mock.patch.object(self.proxy.subprocess, "run", return_value=FakeRun()):
             # Only the free tier of the opencode provider is kept.
             self.assertEqual(self.proxy.opencode_cli_models(), ["big-pickle", "hy3-free"])
+
+    def test_opencode_go_upstream_models_keeps_response_capable_models_only(self):
+        payload = {"data": [{"id": model} for model in [
+            "grok-4.6", "kimi-k3", "gpt-5.6-luna", "qwen3.8-max"]]}
+        with mock.patch.object(self.proxy, "ADAPTER", "opencode-go"), \
+             mock.patch.object(self.proxy, "_get_json", return_value=payload), \
+             mock.patch.object(self.proxy, "opencode_authorization",
+                               return_value="Bearer go"):
+            ids, source = self.proxy.upstream_models("")
+        self.assertEqual(source, "gateway-responses")
+        self.assertEqual(ids, ["grok-4.6", "gpt-5.6-luna"])
 
     def test_discovery_tries_both_model_paths(self):
         # Some upstreams only serve /models (z.ai's legacy /api/paas/v4 base);

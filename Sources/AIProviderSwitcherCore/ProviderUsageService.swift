@@ -46,6 +46,12 @@ public struct ProviderUsageService: Sendable {
                 status: .unsupported,
                 note: "Quota détaillé non exposé."
             )
+        case "opencode-go":
+            return ProviderUsageSnapshot(
+                providerID: provider.id,
+                status: .unsupported,
+                note: "Quota Go non exposé ici ; consultez la console OpenCode."
+            )
         case "ollama":
             return ProviderUsageSnapshot(
                 providerID: provider.id,

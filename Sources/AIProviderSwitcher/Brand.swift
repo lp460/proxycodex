@@ -12,6 +12,7 @@ extension Provider {
         case "ollama": return .brown
         case "claude": return .red
         case "opencode": return .indigo
+        case "opencode-go": return .mint
         default: return .accentColor
         }
     }
@@ -25,6 +26,7 @@ extension Provider {
         case "ollama": return "hare.fill"
         case "claude": return "bubble.left.and.bubble.right.fill"
         case "opencode": return "chevron.left.forwardslash.chevron.right"
+        case "opencode-go": return "speedometer"
         default: return "key.fill"
         }
     }

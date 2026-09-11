@@ -88,7 +88,8 @@ final class AppState: ObservableObject {
                     "openrouter": .untested,
                     "ollama": .compatible,
                     "claude": .compatible,
-                    "opencode": .compatible
+                    "opencode": .compatible,
+                    "opencode-go": .compatible
                 ]
             )
             openCode = OpenCodeInstallation(
@@ -98,6 +99,9 @@ final class AppState: ObservableObject {
             )
             if let opencode = ProviderCatalog.default[id: "opencode"] {
                 modelSelection["opencode"] = Array(opencode.models.prefix(6))
+            }
+            if let opencodeGo = ProviderCatalog.default[id: "opencode-go"] {
+                modelSelection["opencode-go"] = Array(opencodeGo.models.prefix(6))
             }
             router = try? ProviderRouter(
                 catalog: catalog,
@@ -311,6 +315,12 @@ final class AppState: ObservableObject {
             ),
             "claude": ProviderUsageSnapshot(providerID: "claude", fetchedAt: now, status: .unsupported),
             "opencode": ProviderUsageSnapshot(providerID: "opencode", fetchedAt: now, status: .unsupported),
+            "opencode-go": ProviderUsageSnapshot(
+                providerID: "opencode-go",
+                fetchedAt: now,
+                status: .unsupported,
+                note: "Quota Go non exposé ici ; consultez la console OpenCode."
+            ),
             "ollama": ProviderUsageSnapshot(providerID: "ollama", fetchedAt: now, status: .available, note: "Local · sans quota fournisseur.")
         ]
         let demoMessages = [
@@ -1003,6 +1013,7 @@ final class AppState: ObservableObject {
         switch provider.id {
         case "claude": return "anthropic"     // Responses <-> Anthropic Messages
         case "opencode": return "opencode"    // relay + OpenCode's own credentials
+        case "opencode-go": return "opencode-go" // paid Go key + session affinity
         default: return "relay"
         }
     }
@@ -1026,7 +1037,7 @@ final class AppState: ObservableObject {
     // Bumped whenever the adapter contract changes (base URLs, pairing, flags):
     // a stale running proxy would otherwise be kept because its metadata still
     // matches everything this version compares.
-    private let proxyVersion = "2026-09-11-unified-auth-v6"
+    private let proxyVersion = "2026-09-11-opencode-go-v7"
 
     /// Stable, non-reversible metadata used to detect credential changes and
     /// restart a proxy that still carries an older key.

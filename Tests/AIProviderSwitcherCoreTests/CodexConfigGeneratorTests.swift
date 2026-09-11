@@ -20,7 +20,7 @@ final class CodexConfigGeneratorTests: XCTestCase {
     /// key. Declaring `env_key` would give Codex a second, stale source of
     /// truth as soon as the panel changes the key.
     func testRoutedProvidersNeverDeclareEnvKey() {
-        for id in ["deepseek", "glm", "openrouter", "opencode", "claude"] {
+        for id in ["deepseek", "glm", "openrouter", "opencode", "opencode-go", "claude"] {
             let provider = ProviderCatalog.default[id: id]!
             let toml = CodexConfigGenerator.providerBlock(provider)
             XCTAssertFalse(toml.contains("env_key"), id)

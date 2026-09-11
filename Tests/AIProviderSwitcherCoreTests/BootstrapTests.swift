@@ -4,7 +4,8 @@ import XCTest
 final class BootstrapTests: XCTestCase {
     func testCatalogHasExpectedProviders() {
         let ids = ProviderCatalog.default.providers.map(\.id)
-        XCTAssertEqual(ids, ["openai", "deepseek", "glm", "openrouter", "ollama", "opencode", "claude"])
+        XCTAssertEqual(ids, ["openai", "deepseek", "glm", "openrouter", "ollama",
+                             "opencode", "opencode-go", "claude"])
     }
 
     func testOpenRouterExposesFreeModelsFirst() {
@@ -24,6 +25,20 @@ final class BootstrapTests: XCTestCase {
         XCTAssertEqual(opencode.wireAPI, .responses)
         XCTAssertEqual(CodexConfigGenerator.proxyPort(for: "opencode"), 18892)
         XCTAssertTrue(opencode.models.contains("big-pickle"))
+    }
+
+    func testOpenCodeGoUsesThePaidGatewayWithAKey() throws {
+        let go = try XCTUnwrap(ProviderCatalog.default[id: "opencode-go"])
+        XCTAssertEqual(go.displayName, "OpenCode Go")
+        XCTAssertEqual(go.baseURL.absoluteString, "https://opencode.ai/zen/go/v1")
+        XCTAssertEqual(go.environmentVariable, "OPENCODE_API_KEY")
+        XCTAssertFalse(go.isKeyless)
+        XCTAssertEqual(go.wireAPI, .responses)
+        XCTAssertEqual(CodexConfigGenerator.proxyPort(for: "opencode-go"), 18893)
+        XCTAssertEqual(go.defaultModel, "grok-4.6")
+        XCTAssertEqual(go.models, ["grok-4.6", "gpt-5.6-luna",
+                                   "muse-spark-1.3-contributor",
+                                   "muse-spark-1.2-contributor"])
     }
 
     func testEveryProviderHasModelsAndValidDefault() {

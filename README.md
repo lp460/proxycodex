@@ -38,6 +38,7 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 | OpenRouter | Responses via proxy | Clé dans l'adaptateur (importable d'OpenCode) | `127.0.0.1:18890` | slug natif | ponté | oui | non |
 | Claude Code | Responses ↔ Anthropic Messages | Trousseau Claude Code, `ANTHROPIC_*` (settings.json ou config Codex), clé API optionnelle | `127.0.0.1:18891` | slug natif | ponté | oui | serveur Anthropic |
 | OpenCode Zen | Responses via proxy | Clé Zen optionnelle (saisie ou `opencode auth login`) | `127.0.0.1:18892` | slug natif | ponté | non | non |
+| OpenCode Go | Responses via proxy | Clé Go requise (abonnement, saisie ou credential `opencode-go` d'OpenCode) | `127.0.0.1:18893` | slug natif | ponté | oui | non |
 | Ollama | Provider local Codex | Aucune | Non | son vrai slug | function tools | non | non |
 
 ### Quota & utilisation
@@ -120,6 +121,7 @@ La requête passe par l'adaptateur local (`GET /_switcher/upstream-models`), seu
 |---|---|
 | DeepSeek, GLM, OpenRouter | `/v1/models` de l'upstream (GLM : catalogue Responses sous `api.z.ai/api/v1/models`) |
 | OpenCode Zen | `opencode models opencode` via la CLI détectée — la passerelle ne distingue pas le palier gratuit |
+| OpenCode Go | `/v1/models` de la passerelle Go, filtré sur les modèles exposés par `/v1/responses` |
 | Claude Code | `/v1/models` d'Anthropic, avec le jeton de Claude Code |
 | Ollama | interrogé directement, sans adaptateur |
 
@@ -224,9 +226,17 @@ Le proxy convertit les messages et les tools entre le format Responses de Codex 
 
 ## OpenCode
 
-La CLI OpenCode est un agent, pas un backend HTTP : elle n'expose que son propre protocole de sessions (`opencode serve` → `POST /session/{id}/prompt`), inutilisable comme model provider. Ce qui est intégré ici est donc **OpenCode Zen**, la passerelle que la CLI interroge elle-même : `https://opencode.ai/zen/v1`, compatible OpenAI **et** servant `/v1/responses`, ce qu'attend Codex.
+La CLI OpenCode est un agent, pas un backend HTTP : elle n'expose que son propre protocole de sessions (`opencode serve` → `POST /session/{id}/prompt`), inutilisable comme model provider. Ce qui est intégré ici est donc la passerelle que la CLI interroge elle-même : **OpenCode Zen** et, séparément, l'abonnement **OpenCode Go**. Les deux bases sont compatibles OpenAI et servent `/v1/responses`, ce qu'attend Codex.
 
-L'authentification suit celle d'OpenCode, aucune clé n'étant requise à la base. Le proxy cherche, dans cet ordre :
+### OpenCode Go
+
+`opencode-go` utilise `https://opencode.ai/zen/go/v1` (adaptateur `127.0.0.1:18893`) et demande une clé Go distincte d'une éventuelle clé Zen. Le proxy lit la clé saisie dans le panneau, puis l'entrée `opencode-go` de `~/.local/share/opencode/auth.json` créée par `/connect` → `OpenCode Go`. Contrairement à Zen, il n'y a pas de repli sur une clé publique.
+
+Go route ses modèles vers Responses, Chat Completions ou Anthropic Messages selon le modèle. L'adaptateur actuel parle Responses à Codex ; il n'expose donc que les modèles documentés sur `/v1/responses` : `grok-4.6`, `gpt-5.6-luna`, `muse-spark-1.3-contributor` et `muse-spark-1.2-contributor`. Les autres modèles Go restent utilisables dans OpenCode, mais ne sont pas annoncés ici pour éviter des requêtes vouées à un 404.
+
+Le proxy ajoute les en-têtes `x-opencode-session`, `x-opencode-request`, `x-opencode-client` et `User-Agent` attendus pour le routage et l'affinité de cache. L'identifiant de session est dérivé de façon stable à partir de l'ID explicite de la requête ou du premier message utilisateur ; aucune clé n'est écrite dans ces en-têtes ni dans les journaux.
+
+Pour Zen, aucune clé n'est requise à la base. Le proxy cherche, dans cet ordre :
 
 1. une clé Zen saisie dans le panneau (clé privée de l'adaptateur) ;
 2. une clé transmise par la requête (clé Zen payante relayée par Codex) ;
@@ -237,7 +247,7 @@ Si la passerelle refuse la requête (le palier gratuit via l'API directe est dé
 
 La CLI est **détectée, pas requise** : la passerelle répond sans elle. Le panneau affiche l'état sous la grille des fournisseurs — version trouvée et origine de la clé, ou l'absence de la CLI. Les emplacements inspectés sont ceux de l'installeur OpenCode (`~/.opencode/bin`, Homebrew, `/usr/local/bin`, `~/.local/bin`). Seuls les **noms** des credentials sont lus, jamais les valeurs.
 
-Les modèles déclarés sont ceux du palier gratuit, tels que listés par `opencode models opencode` :
+Les modèles Zen déclarés sont ceux du palier gratuit, tels que listés par `opencode models opencode` :
 
 ```bash
 opencode models opencode
@@ -448,6 +458,7 @@ indique en revanche que le binaire a été lancé hors de son bundle `.app`.
 - Le journal et la télémétrie locale de Codex attribuent la requête au slug natif, pas au provider réel.
 - Le palier gratuit d'OpenCode Zen est désormais restreint : l'API directe répond `MissingSessionID`, `AuthError` ou `Internal server error` sans clé. Le panneau le signale et propose d'exécuter `opencode auth login` ou de saisir une clé Zen. La CLI, elle, continue d'utiliser sa propre session.
 - Les noms des modèles gratuits d'OpenCode Zen sont des préversions et changent régulièrement ; ils sont déclarés en dur et se vérifient avec `opencode models opencode`.
+- Les modèles Go changent régulièrement. Seule leur famille Responses est exposée ; l'ajout d'une passerelle Chat/Messages distincte serait nécessaire pour exposer les autres sans conflit de schéma.
 - Ollama est un provider intégré à Codex, sans adapter local : il reçoit les function tools du catalogue, mais pas le nettoyage de requête du proxy (un `service_tier` global dans `config.toml` lui est transmis tel quel).
 - Les providers OpenAI-compatible n’implémentent pas tous Responses, le streaming, les images ou les tools de façon identique.
 - Les proxies tournent tant que l’application de la barre de menus est active.

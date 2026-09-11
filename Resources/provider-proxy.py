@@ -9,8 +9,8 @@ Codex Desktop expects provider model lists in its own catalog schema
 - anthropic mode (Claude): translates GET /v1/models AND POST /v1/responses
                  (Responses API <-> Anthropic Messages API), including SSE
                  streaming and tool calls.
-- opencode mode  (OpenCode Zen): relay, plus auth resolved from OpenCode's own
-                 credentials — Codex sends none for a keyless provider.
+- opencode modes (OpenCode Zen / Go): relay, plus auth resolved from OpenCode's
+                 own credentials — Codex sends none for the keyless Zen provider.
 
 Both modes bridge Codex's native tool flavors (freeform custom tools such as
 apply_patch, `local_shell`, MCP function tools) so every provider gets the same
@@ -22,9 +22,10 @@ slugs, so its full native feature contract applies) and the optional
 order. The adapter swaps the name on the way out and restores it on the way in,
 so Codex never sees a slug it does not recognize.
 
-Usage: provider-proxy.py <port> <upstream_base> <display_name> <model1,model2...> [relay|anthropic|opencode] [tools] [apply_patch] [images] [web_search] [parallel_tools] [custom_tools] [real1,real2...]
+Usage: provider-proxy.py <port> <upstream_base> <display_name> <model1,model2...> [relay|anthropic|opencode|opencode-go] [tools] [apply_patch] [images] [web_search] [parallel_tools] [custom_tools] [real1,real2...]
 """
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -315,22 +316,22 @@ def anthropic_headers(request_authorization):
 
 
 # ---------------------------------------------------------------------------
-# OpenCode Zen: the OpenAI-compatible gateway the OpenCode CLI talks to. Auth
-# follows OpenCode's own credentials, so nothing has to be typed in the panel:
-#   1. a key supplied by the request (a paid Zen key relayed by Codex);
-#   2. the `opencode` entry in ~/.local/share/opencode/auth.json, written by
-#      `opencode auth login`;
-#   3. the documented public key of the free tier.
+# OpenCode Zen / Go: OpenAI-compatible gateways. Auth follows OpenCode's own
+# credentials, so a stored credential does not have to be typed again:
+#   1. a key supplied by the request (a paid key relayed by Codex);
+#   2. the matching `opencode` / `opencode-go` entry in
+#      ~/.local/share/opencode/auth.json;
+#   3. the documented public key (Zen free tier only).
 # ---------------------------------------------------------------------------
 
 OPENCODE_PUBLIC_KEY = "public"
 OPENCODE_AUTH_PATH = "~/.local/share/opencode/auth.json"
 
 
-def opencode_stored_key():
+def opencode_stored_key(provider_id="opencode"):
     try:
         with open(os.path.expanduser(OPENCODE_AUTH_PATH)) as f:
-            entry = json.load(f).get("opencode") or {}
+            entry = json.load(f).get(provider_id) or {}
     except Exception:
         return None
     if isinstance(entry, str):
@@ -343,12 +344,61 @@ def opencode_stored_key():
     return None
 
 
-def opencode_authorization(request_authorization=None):
+def opencode_authorization(request_authorization=None, provider_id="opencode"):
     managed = managed_credential()
     if managed:
         return "Bearer " + managed
     supplied = (request_authorization or "").replace("Bearer ", "").strip()
-    return "Bearer " + (supplied or opencode_stored_key() or OPENCODE_PUBLIC_KEY)
+    go_credential = opencode_stored_key(provider_id) if provider_id == "opencode-go" else None
+    fallback = (go_credential
+                or (opencode_stored_key("opencode") if provider_id == "opencode" else None)
+                or (OPENCODE_PUBLIC_KEY if provider_id == "opencode" else ""))
+    credential = supplied or fallback
+    return ("Bearer " + credential) if credential else ""
+
+
+def opencode_go_identity_headers(body_bytes):
+    """Headers Go uses for routing and prompt-cache affinity.
+
+    Codex does not expose a portable conversation ID on the Responses wire, so
+    derive a stable one from its explicit IDs when present, or from the first
+    user message otherwise. The request fingerprint changes with each turn,
+    exactly like OpenCode's own per-message ID.
+    """
+    body = {}
+    if body_bytes:
+        try:
+            body = json.loads(body_bytes)
+        except Exception:
+            body = {}
+    conversation_source = (body.get("session_id")
+                           or body.get("previous_response_id")
+                           or "")
+    if not conversation_source:
+        items = body.get("input") if isinstance(body.get("input"), list) else []
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") not in (None, "message"):
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                conversation_source = content
+                break
+            if isinstance(content, list):
+                text = "".join(part.get("text", "") for part in content
+                               if isinstance(part, dict))
+                if text.strip():
+                    conversation_source = text
+                    break
+    session = hashlib.sha256(str(conversation_source).encode("utf-8")).hexdigest()[:32]
+    request = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False,
+                                        default=str).encode("utf-8")).hexdigest()[:32]
+    return {
+        "x-opencode-project": "ai-provider-switcher",
+        "x-opencode-session": "aips-" + session,
+        "x-opencode-request": "aips-" + request,
+        "x-opencode-client": "ai-provider-switcher",
+        "User-Agent": "AIProviderSwitcher/1.0",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +468,14 @@ def opencode_cli_models():
     return []
 
 
+OPENCODE_GO_RESPONSE_MODELS = {
+    "grok-4.6",
+    "gpt-5.6-luna",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2-contributor",
+}
+
+
 def upstream_models(request_authorization):
     """Model ids the provider really serves, with the source used."""
     if ADAPTER == "opencode":
@@ -426,6 +484,15 @@ def upstream_models(request_authorization):
             return ids, "opencode-cli"
         headers = {"Authorization": opencode_authorization(request_authorization)}
         return _ids_from_models_payload(_get_json(UPSTREAM + "/v1/models", headers)), "gateway"
+    if ADAPTER == "opencode-go":
+        headers = {"Authorization": opencode_authorization(
+            request_authorization, provider_id="opencode-go")}
+        ids = _ids_from_models_payload(_get_json(UPSTREAM + "/v1/models", headers))
+        # Go routes models through Responses, Chat Completions or Messages. The
+        # Responses adapter can serve only the first family without a payload
+        # rewrite; hide the others instead of exposing a request that must fail.
+        return ([model for model in ids if model in OPENCODE_GO_RESPONSE_MODELS],
+                "gateway-responses")
     if ADAPTER == "anthropic":
         headers = anthropic_headers(request_authorization)
         base = anthropic_base_url()
@@ -1515,15 +1582,27 @@ class Handler(BaseHTTPRequestHandler):
             # One credential path per mode. Relay providers use the credential
             # the app holds; it replaces any stale header the client carries.
             headers = managed_headers(headers)
-        elif ADAPTER == "opencode":
+        elif ADAPTER in ("opencode", "opencode-go"):
             # Codex sends no Authorization for a keyless provider; OpenCode Zen
             # needs one, so it is resolved from the managed key, OpenCode's own
-            # credentials, then the public key. Header names keep the client's
-            # casing, hence the case-insensitive sweep before setting ours.
+            # credentials, then the public key (free tier only). Header names
+            # keep the client's casing, hence the case-insensitive sweep.
             supplied = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
             for key in [k for k in headers if k.lower() == "authorization"]:
                 del headers[key]
-            headers["Authorization"] = opencode_authorization(supplied)
+            provider_id = "opencode-go" if ADAPTER == "opencode-go" else "opencode"
+            headers["Authorization"] = opencode_authorization(supplied, provider_id=provider_id)
+            if not headers["Authorization"]:
+                # Go has no public-key fallback: let upstream say the key is
+                # missing instead of sending a malformed empty Bearer header.
+                del headers["Authorization"]
+            if ADAPTER == "opencode-go":
+                # Go validates client identity and benefits from stable routing
+                # affinity. Replace any client values with this adapter's own.
+                for key in [k for k in headers
+                            if k.lower().startswith(("x-opencode-", "user-agent"))]:
+                    del headers[key]
+                headers.update(opencode_go_identity_headers(body_bytes))
         try:
             with urllib.request.urlopen(
                     urllib.request.Request(url, data=body_bytes, headers=headers, method=self.command),
@@ -1590,15 +1669,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
         except urllib.error.HTTPError as e:
             body = e.read()
-            if ADAPTER == "opencode" and e.code in (401, 402, 403, 500, 502, 503):
+            if ADAPTER in ("opencode", "opencode-go") and e.code in (401, 402, 403, 500, 502, 503):
                 detail = ""
                 try:
                     detail = (json.loads(body.decode("utf-8")).get("error") or {}).get("message", "")
                 except Exception:
                     pass
-                message = ("OpenCode Zen a renvoyé une erreur%s. Si le palier gratuit ne "
-                           "répond plus, exécutez `opencode auth login` ou saisissez une clé "
-                           "Zen dans le panneau." % (" (%s)" % detail if detail else ""))
+                if ADAPTER == "opencode-go":
+                    message = ("OpenCode Go a renvoyé une erreur%s. Vérifiez votre abonnement Go, "
+                               "reliez la clé via OpenCode (`/connect` → OpenCode Go) ou saisissez-la "
+                               "dans le panneau." % (" (%s)" % detail if detail else ""))
+                else:
+                    message = ("OpenCode Zen a renvoyé une erreur%s. Si le palier gratuit ne "
+                               "répond plus, exécutez `opencode auth login` ou saisissez une clé "
+                               "Zen dans le panneau." % (" (%s)" % detail if detail else ""))
                 body = json.dumps({"error": {"type": "opencode_auth", "message": message}}).encode()
             self.send_response(e.code)
             self.send_header("Content-Type", "application/json")

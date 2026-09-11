@@ -234,6 +234,25 @@ public struct ProviderCatalog: Sendable, Equatable {
             configProviderIDDirect: "opencode"
         ),
         Provider(
+            id: "opencode-go",
+            displayName: "OpenCode Go",
+            // Go is the paid OpenCode subscription. It is a distinct gateway
+            // from Zen and requires its own key. Only the models documented on
+            // the `/v1/responses` endpoint are declared here: the adapter speaks
+            // Responses to Codex and does not rewrite Chat/Messages payloads.
+            baseURL: URL(string: "https://opencode.ai/zen/go/v1")!,
+            environmentVariable: "OPENCODE_API_KEY",
+            models: ["grok-4.6", "gpt-5.6-luna",
+                     "muse-spark-1.3-contributor", "muse-spark-1.2-contributor"],
+            defaultModel: "grok-4.6",
+            supportsTools: true,
+            supportsApplyPatch: true,
+            supportsImages: true,
+            supportsParallelToolCalls: true,
+            requiresKey: true,
+            configProviderIDDirect: "opencode-go"
+        ),
+        Provider(
             id: "claude",
             displayName: "Claude Code",
             // Auth comes from Claude Code's own environment (~/.claude/settings.json:

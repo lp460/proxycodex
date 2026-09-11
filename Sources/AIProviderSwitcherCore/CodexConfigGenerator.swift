@@ -22,6 +22,7 @@ public enum CodexConfigGenerator {
         case "openrouter": return 18890
         case "claude": return 18891
         case "opencode": return 18892
+        case "opencode-go": return 18893
         default: return nil
         }
     }

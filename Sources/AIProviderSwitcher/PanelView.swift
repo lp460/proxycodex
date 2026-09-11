@@ -620,11 +620,12 @@ struct PanelView: View {
 
         let version = install.version.map { "CLI \($0)" } ?? "CLI"
         if state.hasKey(for: "opencode") {
-            return "\(version) détectée · clé Zen enregistrée"
+            let go = state.hasKey(for: "opencode-go") ? " · clé Go enregistrée" : ""
+            return "\(version) détectée · clé Zen enregistrée\(go)"
         }
-        return install.hasZenCredential
-            ? "\(version) détectée · clé Zen d’OpenCode réutilisée"
-            : "\(version) détectée · pas de clé Zen : le palier gratuit peut être restreint"
+        let zen = install.hasZenCredential ? "clé Zen réutilisée" : "pas de clé Zen"
+        let go = state.hasKey(for: "opencode-go") ? "clé Go enregistrée" : "pas de clé Go"
+        return "\(version) détectée · \(zen) · \(go)"
     }
 
     private var modelSourceText: String {
@@ -742,6 +743,7 @@ struct PanelView: View {
         switch provider.id {
         case "glm": return "ID.secret (clé Z.ai, ex. 6e6c…54d8.xxxx)"
         case "opencode": return "sk-… (optionnelle — la clé Zen remplace le palier gratuit)"
+        case "opencode-go": return "sk-… (clé Go — requise, abonnement OpenCode Go)"
         case "claude": return "sk-ant-… (optionnelle — sinon Claude Code/ANTHROPIC_AUTH_TOKEN)"
         default: return "sk-…"
         }
