@@ -1,50 +1,87 @@
-# ProxyCodex release setup
+# ProxyCodex — publication sans App Store
 
-The repository contains two automated delivery workflows:
+ProxyCodex est distribué directement depuis GitHub. Aucun passage par le Mac App Store
+n’est prévu.
 
-- `pages.yml` publishes `docs/` to GitHub Pages.
-- `release.yml` builds, signs and notarizes a universal macOS DMG, generates a
-  signed Sparkle appcast, and attaches both files to a GitHub Release.
+Le dépôt contient trois automatisations :
 
-## One-time GitHub Pages setup
+- `pages.yml` publie la landing page bilingue depuis `docs/` ;
+- `ci.yml` vérifie le site, teste l’application et assemble le bundle ;
+- `release.yml` crée automatiquement le DMG et le flux de mise à jour Sparkle
+  lorsqu’un push sur `main` modifie le code de l’application.
 
-In **Settings → Pages → Build and deployment**, select **GitHub Actions**.
-The public site will be available at `https://lp460.github.io/proxycodex/`.
+## 1. Activer GitHub Pages une seule fois
 
-## One-time signing setup
+Dans **Settings → Pages → Build and deployment**, choisir **GitHub Actions**.
 
-Add these values in **Settings → Secrets and variables → Actions**:
+Le site sera disponible sur `https://lp460.github.io/proxycodex/`.
 
-| Secret | Value |
+## 2. Ajouter les deux secrets Sparkle obligatoires
+
+Sparkle permet à une copie déjà installée de vérifier qu’une mise à jour vient bien
+de ce dépôt. Cette signature est indépendante du Mac App Store et ne nécessite pas
+de compte Apple Developer.
+
+Télécharger une distribution Sparkle sur un Mac, puis exécuter son outil
+`bin/generate_keys`. La clé est créée une seule fois. Conserver la clé privée en
+lieu sûr et copier :
+
+| Secret GitHub | Valeur |
 | --- | --- |
-| `DEVELOPER_ID_CERTIFICATE` | Developer ID Application `.p12`, base64 encoded |
-| `DEVELOPER_ID_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12` |
-| `APPLE_ID` | Apple ID used for notarization |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for that Apple ID |
-| `APPLE_TEAM_ID` | Apple Developer team identifier |
-| `CI_KEYCHAIN_PASSWORD` | A new random password used only for the temporary CI keychain |
-| `SPARKLE_PRIVATE_KEY` | Private EdDSA key produced by Sparkle `generate_keys` |
-| `SPARKLE_PUBLIC_KEY` | Public EdDSA key printed by Sparkle `generate_keys` |
+| `SPARKLE_PRIVATE_KEY` | contenu de la clé privée EdDSA exportée par `generate_keys -x <fichier>` |
+| `SPARKLE_PUBLIC_KEY` | clé publique affichée par `generate_keys` |
 
-Never commit the private key or the `.p12` file. The public Sparkle key is
-injected into the release app's `Info.plist`; the private key is used only by
-the release workflow to sign the update feed.
+Ajouter ces valeurs dans **Settings → Secrets and variables → Actions → New
+repository secret**.
 
-## Publish a version
+Ne jamais committer la clé privée. Le workflow l’utilise uniquement en mémoire
+pour signer le DMG dans `appcast.xml`. La clé publique est injectée dans
+`Info.plist` au moment de la compilation.
 
-Create and push a semantic version tag:
+## 3. Secrets Apple facultatifs
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+Ces secrets ne servent pas à l’App Store. Ils permettent seulement une signature
+**Developer ID** et la notarisation Apple, afin que Gatekeeper ouvre le DMG sans
+avertissement inhabituel.
 
-The workflow then publishes:
+| Secret GitHub facultatif | Valeur |
+| --- | --- |
+| `DEVELOPER_ID_CERTIFICATE` | certificat Developer ID Application `.p12`, encodé en base64 |
+| `DEVELOPER_ID_CERTIFICATE_PASSWORD` | mot de passe d’export du `.p12` |
+| `APPLE_ID` | identifiant Apple utilisé pour la notarisation |
+| `APPLE_APP_SPECIFIC_PASSWORD` | mot de passe spécifique à l’application |
+| `APPLE_TEAM_ID` | identifiant de l’équipe Apple Developer |
 
-- `ProxyCodex.dmg`
-- `appcast.xml`
+Il faut soit renseigner les cinq secrets Apple, soit n’en renseigner aucun :
 
-The website resolves the current DMG from the GitHub Releases API. Installed
-copies use the stable Sparkle feed URL
-`https://github.com/lp460/proxycodex/releases/latest/download/appcast.xml`, so
-neither the website nor the application needs to be edited for later releases.
+- sans eux, le workflow produit un DMG signé ad hoc et Sparkle reste sécurisé par
+  la signature EdDSA ; macOS peut demander un clic droit → **Ouvrir** au premier
+  lancement ;
+- avec eux, le même DMG est signé Developer ID, envoyé à la notarisation puis
+  agrafé, toujours sans publication sur l’App Store.
+
+Le secret `CI_KEYCHAIN_PASSWORD` n’est plus nécessaire : le workflow génère un mot
+de passe temporaire à chaque exécution.
+
+## Publication automatique
+
+Après fusion sur `main`, tout push modifiant `Sources/`, `Resources/`, `Package.swift`
+ou les scripts de build déclenche automatiquement :
+
+1. les tests ;
+2. la création d’un bundle universel Apple Silicon + Intel ;
+3. la création de `ProxyCodex.dmg` ;
+4. la signature du flux Sparkle ;
+5. une GitHub Release avec une version automatique `1.0.<numéro du run>`.
+
+Un changement uniquement dans `docs/` republie le site, sans créer inutilement une
+nouvelle version de l’application.
+
+Pour choisir exceptionnellement une version précise, lancer **Actions → Publish
+macOS update → Run workflow** et saisir une version `X.Y.Z`.
+
+La landing page récupère toujours le dernier DMG via l’API GitHub Releases. Les
+copies installées utilisent l’URL Sparkle stable
+`https://github.com/lp460/proxycodex/releases/latest/download/appcast.xml`.
+Ainsi, ni le site ni l’application n’ont besoin d’être modifiés pour pointer vers
+chaque nouvelle version.
