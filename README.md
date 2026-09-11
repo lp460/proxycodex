@@ -11,6 +11,8 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 ## Ce que fait l’application
 
 - Affiche l’état de connexion et la présence d’une clé pour chaque provider.
+- Affiche une section « Quota & utilisation » : fenêtres réelles, soldes/budgets, resets exposés et mini-résumés par provider.
+- Journalise les événements techniques et les lectures de quota dans le journal local existant, sans jamais y écrire une clé.
 - Change le provider et le modèle actifs depuis la barre.
 - Quand une carte demande une clé absente, ouvre le champ de clé pour ce provider précis ; une fois la clé injectée, applique la sélection et relance Codex sans second clic.
 - Distingue une clé refusée d’un provider indisponible : Z.ai répond parfois HTTP 200 avec une erreur d’authentification dans le corps — le test l’interprète comme une clé invalide au lieu d’afficher « Connecté ».
@@ -37,6 +39,26 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 | Claude Code | Responses ↔ Anthropic Messages | Trousseau Claude Code, `ANTHROPIC_*` (settings.json ou config Codex), clé API optionnelle | `127.0.0.1:18891` | slug natif | ponté | oui | serveur Anthropic |
 | OpenCode Zen | Responses via proxy | Clé Zen optionnelle (saisie ou `opencode auth login`) | `127.0.0.1:18892` | slug natif | ponté | non | non |
 | Ollama | Provider local Codex | Aucune | Non | son vrai slug | function tools | non | non |
+
+### Quota & utilisation
+
+La section reste une couche d’observation : un quota indisponible ne change jamais la compatibilité du provider ni le routage Codex. Les valeurs absentes restent absentes — aucune donnée manquante n’est convertie en zéro.
+
+| Provider | Donnée disponible |
+|---|---|
+| OpenAI/Codex | Fenêtres quota + reset + crédits si exposés, via `codex app-server --stdio` |
+| DeepSeek | Solde API exposé par `GET /user/balance` |
+| OpenRouter | Budget de la clé courante + consommation, via `GET /api/v1/key` |
+| GLM/Z.ai | Quota Coding Plan exposé par l’endpoint monitor Z.ai |
+| Claude Code | Non exposé par une API supportée |
+| OpenCode Zen | Non exposé si aucune API publique |
+| Ollama | Local / sans quota fournisseur |
+
+Le provider actif affiche une carte détaillée ; les autres providers apparaissent en mini-cartes. Le refresh utilise un cache mémoire d’environ 90 secondes. Un clic sur **Actualiser** force la lecture du provider actif ; **Actualiser tous les quotas** est disponible dans Maintenance. Les résultats et erreurs détaillées vont dans le journal repliable.
+
+Pour Z.ai, l’endpoint monitor reçoit le token brut sans préfixe `Bearer`, comme le plugin officiel. Si aucune heure de reset n’est exposée, l’interface le dit explicitement : elle n’infère jamais une fenêtre depuis l’heure de lecture.
+
+Pour OpenRouter, `/api/v1/key` décrit le **budget de la clé courante**, pas le solde du compte. La version actuelle n’ajoute pas de Management Key et n’appelle donc pas l’endpoint account-level `/credits`.
 
 « Slug natif » : le provider est exposé sous un slug de Codex, voir [Les providers passent pour des modèles de Codex](#les-providers-passent-pour-des-modèles-de-codex). « Ponté » : l’adaptateur traduit les familles de tools propres à OpenAI et restitue les items d’origine, voir [Parité des fonctionnalités](#parité-des-fonctionnalités-mcp-shell-apply_patch-plugins).
 

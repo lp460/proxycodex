@@ -11,6 +11,7 @@ struct PanelView: View {
     @State private var draftKey: String = ""
     @State private var maintenanceExpanded = false
     @State private var exposedModelsExpanded = false
+    @State private var journalExpanded = false
     @FocusState private var keyFieldFocused: Bool
 
     private let providerColumns: [GridItem] = [
@@ -29,9 +30,11 @@ struct PanelView: View {
                     }
                     providerSection
                     modelSection
+                    usageSection
                     keySection
                     launchSection
                     maintenanceSection
+                    journalSection
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, 16)
@@ -40,11 +43,11 @@ struct PanelView: View {
             // macOS 26 MenuBarExtra windows ignore the ScrollView's ideal height
             // and collapse to the fixed-size content only (header + footer). A
             // FIXED height keeps the viewport real.
-            .frame(height: 500)
+            .frame(height: 620)
             Divider()
             footer
         }
-        .frame(width: 430)
+        .frame(width: 540)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -246,6 +249,83 @@ struct PanelView: View {
                 .fill(Color.orange.opacity(0.10))
         )
         .accessibilityLabel("Avertissement : catalogue Codex personnalisé détecté")
+    }
+
+    // MARK: Quota & usage
+
+    private var usageSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader("Quota & utilisation")
+
+            if let provider = state.activeProvider {
+                UsageCard(
+                    provider: provider,
+                    snapshot: state.providerUsage[provider.id],
+                    isRefreshing: state.refreshingUsageIDs.contains(provider.id),
+                    errorMessage: state.usageErrors[provider.id],
+                    refresh: {
+                        Task { await state.refreshUsage(for: provider.id, force: true) }
+                    }
+                )
+            }
+
+            let miniProviders = state.catalog.providers.filter {
+                $0.id != state.snapshot.activeProviderID
+            }
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 122, maximum: 160), spacing: 8)],
+                spacing: 8
+            ) {
+                ForEach(miniProviders) { provider in
+                    UsageMiniCard(
+                        provider: provider,
+                        snapshot: state.providerUsage[provider.id],
+                        isRefreshing: state.refreshingUsageIDs.contains(provider.id)
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: Journal
+
+    private var journalSection: some View {
+        DisclosureGroup(isExpanded: $journalExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Journal")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Effacer") { state.clearLogs() }
+                        .buttonStyle(.plain)
+                        .controlSize(.small)
+                        .foregroundStyle(.secondary)
+                }
+
+                if state.logs.isEmpty {
+                    Text("Aucun événement.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(state.logs.suffix(10).reversed())) { entry in
+                        JournalRow(entry: entry)
+                    }
+                }
+            }
+            .padding(.top, 10)
+        } label: {
+            HStack {
+                Text("Journal")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Text("\(state.logs.count) événements")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .controlSize(.small)
     }
 
     // MARK: Keys
@@ -482,6 +562,15 @@ struct PanelView: View {
                     .controlSize(.small)
                     .help("Demande à chaque provider la liste des modèles qu'il sert réellement")
                     .disabled(state.refreshingModels || state.isScreenshotMode)
+
+                    Button {
+                        Task { await state.refreshAllUsage() }
+                    } label: {
+                        Label("Actualiser tous les quotas", systemImage: "gauge.with.needle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(state.isScreenshotMode || !state.refreshingUsageIDs.isEmpty)
                 }
 
                 Divider()
@@ -556,7 +645,6 @@ struct PanelView: View {
                     Text(message)
                         .font(.caption)
                         .foregroundStyle(.primary)
-                        .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 } icon: {
                     Image(systemName: "info.circle.fill")
@@ -661,6 +749,385 @@ struct PanelView: View {
 }
 
 // MARK: - Small UI primitives
+
+private struct UsageCard: View {
+    let provider: Provider
+    let snapshot: ProviderUsageSnapshot?
+    let isRefreshing: Bool
+    let errorMessage: String?
+    let refresh: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(provider.displayName)
+                        .font(.callout.weight(.semibold))
+                    if let plan = snapshot?.planLabel {
+                        Text(plan)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                Button {
+                    refresh()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .foregroundStyle(isRefreshing ? Color.secondary : Color.accentColor)
+                        Text(isRefreshing ? "Actualisation…" : "Actualiser")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isRefreshing)
+            }
+
+            if let snapshot {
+                snapshotContent(snapshot)
+
+                if !isRefreshing, snapshot.hasUsefulData, let errorMessage {
+                    Label {
+                        Text("\(errorMessage) · dernière donnée conservée.")
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+
+                HStack(spacing: 4) {
+                    Text("Mis à jour")
+                        .foregroundStyle(.secondary)
+                    Text(snapshot.fetchedAt, style: .relative)
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption2.monospacedDigit())
+            } else if isRefreshing {
+                Label("Actualisation…", systemImage: "hourglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Quota indisponible")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.secondary.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func snapshotContent(_ snapshot: ProviderUsageSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let balance = snapshot.balance {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(balance.available == nil && balance.used != nil ? "Consommation connue" : balance.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(UsageFormatting.currency(balance.available ?? balance.used, code: balance.currency))
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                    if let detail = UsageFormatting.balanceDetail(balance) {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            ForEach(snapshot.windows) { window in
+                UsageWindowRow(window: window)
+            }
+
+            if !snapshot.windows.isEmpty || snapshot.balance != nil {
+                if let note = snapshot.note, !note.isEmpty {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(Self.statusTitle(snapshot.status))
+                        .font(.callout.weight(.medium))
+                    if let note = snapshot.note ?? Self.statusNote(snapshot.status) {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private static func statusTitle(_ status: ProviderUsageStatus) -> String {
+        switch status {
+        case .authenticationRequired: return "Clé requise"
+        case .unsupported: return "Non exposé"
+        case .unavailable: return "Indisponible"
+        case .failed: return "Impossible d'actualiser"
+        case .available: return "Aucune donnée"
+        }
+    }
+
+    private static func statusNote(_ status: ProviderUsageStatus) -> String? {
+        switch status {
+        case .authenticationRequired: return "Ajoutez la clé provider pour lire le quota."
+        case .unavailable: return "Le provider n'a pas fourni de valeur utilisable."
+        case .failed: return "Dernière donnée conservée si disponible ; détail dans le journal."
+        case .unsupported, .available: return nil
+        }
+    }
+}
+
+private struct UsageWindowRow: View {
+    let window: UsageWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(window.label)
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Text(remainingText)
+                    .font(.callout.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(color)
+            }
+
+            UsageProgressBar(remainingPercent: window.remainingPercent)
+
+            Text(resetText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var remainingText: String {
+        guard let remaining = window.remainingPercent else { return "—" }
+        return "\(Int(remaining.rounded())) % restant"
+    }
+
+    private var color: Color {
+        guard let remaining = window.remainingPercent else { return .secondary }
+        if remaining >= 50 { return .green }
+        if remaining >= 20 { return .orange }
+        return .red
+    }
+
+    private var resetText: String {
+        if let reset = window.resetsAt {
+            let interval = reset.timeIntervalSinceNow
+            if interval > 0 {
+                return "Reset \(UsageFormatting.relativeCountdown(reset)) · \(UsageFormatting.clock(reset))"
+            }
+            return "Reset \(UsageFormatting.clock(reset))"
+        }
+        return window.detail ?? "Reset non exposé"
+    }
+}
+
+private struct UsageProgressBar: View {
+    let remainingPercent: Double?
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.16))
+                Capsule()
+                    .fill(color)
+                    .frame(width: max(2, proxy.size.width * fraction))
+            }
+        }
+        .frame(height: 5)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Quota restant")
+        .accessibilityValue(remainingText)
+    }
+
+    private var fraction: Double {
+        min(1, max(0, (remainingPercent ?? 0) / 100))
+    }
+
+    private var color: Color {
+        guard let value = remainingPercent else { return .secondary }
+        if value >= 50 { return .green }
+        if value >= 20 { return .orange }
+        return .red
+    }
+
+    private var remainingText: String {
+        guard let remainingPercent else { return "inconnu" }
+        return "\(Int(remainingPercent.rounded())) %"
+    }
+}
+
+private struct UsageMiniCard: View {
+    let provider: Provider
+    let snapshot: ProviderUsageSnapshot?
+    let isRefreshing: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Text(provider.displayName)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if isRefreshing {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Text(summary)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(snapshot?.hasUsefulData == true ? .primary : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let remaining = snapshot?.windows.compactMap(\.remainingPercent).first {
+                UsageProgressBar(remainingPercent: remaining)
+            } else if snapshot?.balance?.available != nil {
+                UsageProgressBar(remainingPercent: balancePercent)
+            } else {
+                Rectangle()
+                    .fill(.clear)
+                    .frame(height: 5)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.secondary.opacity(0.10), lineWidth: 1)
+        )
+    }
+
+    private var balancePercent: Double? {
+        guard let available = snapshot?.balance?.available,
+              let total = snapshot?.balance?.total,
+              total > 0 else { return nil }
+        return max(0, min(100, NSDecimalNumber(decimal: available).doubleValue / NSDecimalNumber(decimal: total).doubleValue * 100))
+    }
+
+    private var summary: String {
+        guard let snapshot else { return "Aucune donnée" }
+        if let window = snapshot.windows.first, let remaining = window.remainingPercent {
+            return "\(Int(remaining.rounded())) % · \(window.label)"
+        }
+        if let available = snapshot.balance?.available {
+            return UsageFormatting.currency(available, code: snapshot.balance?.currency ?? "USD")
+        }
+        switch snapshot.status {
+        case .authenticationRequired: return "Clé requise"
+        case .unsupported: return provider.id == "ollama" ? "Local" : "Non exposé"
+        case .unavailable, .failed: return "Indisponible"
+        case .available: return snapshot.note?.isEmpty == false ? snapshot.note! : "Aucune donnée"
+        }
+    }
+}
+
+private struct JournalRow: View {
+    let entry: LogEntry
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(UsageFormatting.time(entry.date))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Text(entry.message)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+enum UsageFormatting {
+    static func currency(_ value: Decimal?, code: String) -> String {
+        guard let value else { return "—" }
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = code
+        formatter.locale = .current
+        if code.uppercased() == "USD" {
+            formatter.currencySymbol = "$"
+        }
+        return formatter.string(from: value as NSDecimalNumber) ?? "\(value) \(code)"
+    }
+
+    static func balanceDetail(_ balance: UsageBalance) -> String? {
+        var parts: [String] = []
+        if let toppedUp = balance.toppedUp {
+            parts.append("\(currency(toppedUp, code: balance.currency)) rechargés")
+        }
+        if let granted = balance.granted {
+            parts.append("\(currency(granted, code: balance.currency)) offerts")
+        }
+        if let total = balance.total {
+            parts.append("sur \(currency(total, code: balance.currency))")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func time(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .medium
+        return formatter.string(from: date)
+    }
+
+    static func clock(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        if Calendar.current.isDateInTomorrow(date) {
+            return "demain \(formatter.string(from: date))"
+        }
+        if Calendar.current.isDate(date, equalTo: .now, toGranularity: .weekOfYear) {
+            formatter.setLocalizedDateFormatFromTemplate("EEE")
+            return "\(formatter.string(from: date)) \(shortTime.string(from: date))"
+        }
+        return shortTime.string(from: date)
+    }
+
+    private static let shortTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    static func relativeCountdown(_ date: Date) -> String {
+        let components = Calendar.current.dateComponents([.day, .hour, .minute], from: .now, to: date)
+        if let day = components.day, day > 0 {
+            return "dans \(day) j \(components.hour ?? 0) h"
+        }
+        if let hour = components.hour, hour > 0 {
+            return "dans \(hour) h \(components.minute ?? 0) min"
+        }
+        return "dans \(max(0, components.minute ?? 0)) min"
+    }
+}
 
 private struct SectionHeader: View {
     let title: String

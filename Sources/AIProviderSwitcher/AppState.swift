@@ -30,6 +30,7 @@ final class AppState: ObservableObject {
     let discovery = ModelDiscovery()
     let discoveredStore = DiscoveredModelStore(url: DiscoveredModelStore.defaultURL())
     let selectionStore = ModelSelectionStore(url: ModelSelectionStore.defaultURL())
+    let usageService = ProviderUsageService(timeout: 6)
     private var discovered: [String: DiscoveredModels] = [:]
     /// Per-provider subset of models exposed through Codex's finite native
     /// slugs, as chosen by the user. Absent = keep the provider's first models.
@@ -54,6 +55,10 @@ final class AppState: ObservableObject {
     @Published var openCode: OpenCodeInstallation?
     @Published var refreshingModels = false
     @Published private(set) var logs: [LogEntry] = []
+    @Published private(set) var providerUsage: [String: ProviderUsageSnapshot] = [:]
+    @Published private(set) var refreshingUsageIDs: Set<String> = []
+    @Published private(set) var lastUsageRefresh: Date?
+    @Published private(set) var usageErrors: [String: String] = [:]
 
     private var observationTask: Task<Void, Never>?
     private var nextLogID = 1
@@ -65,6 +70,7 @@ final class AppState: ObservableObject {
     /// relaunches Codex, so the user never has to click the card a second time.
     private var applySelectionAfterKeyInjection = false
     private var applySelectionTargetID: String?
+    private var usageRefreshTasks: [String: Task<Void, Never>] = [:]
 
     init() {
         screenshotMode = CommandLine.arguments.contains("--panel-screenshot")
@@ -101,6 +107,7 @@ final class AppState: ObservableObject {
             nativeConfigDetected = true
             providersInstalled = true
             statusMessage = "Démonstration prête · aucun secret réel utilisé."
+            loadScreenshotUsage()
         } else {
             // Keep keys across restarts: persistence is ON by default (0600 file,
             // excluded from iCloud). Keys are loaded back into memory at launch so
@@ -124,7 +131,7 @@ final class AppState: ObservableObject {
                 win.styleMask = [.titled, .closable]
                 win.appearance = NSAppearance(named: .darkAqua)
                 win.title = "AI Provider Switcher"
-                win.setContentSize(NSSize(width: 446, height: 700))
+                win.setContentSize(NSSize(width: 556, height: 820))
                 win.center()
                 win.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
@@ -144,6 +151,180 @@ final class AppState: ObservableObject {
 
     func clearLogs() {
         logs.removeAll()
+    }
+
+    // MARK: Quota & usage
+
+    /// Background refresh, with a small in-memory TTL. A quota problem never
+    /// invalidates model routing or provider compatibility.
+    func refreshUsage(for providerID: String, force: Bool = false) async {
+        guard !screenshotMode, catalog[id: providerID] != nil, usageRefreshTasks[providerID] == nil else {
+            return
+        }
+        if let snapshot = providerUsage[providerID], !force,
+           Date().timeIntervalSince(snapshot.fetchedAt) < 90 {
+            return
+        }
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performUsageRefresh(for: providerID)
+        }
+        usageRefreshTasks[providerID] = task
+        refreshingUsageIDs.insert(providerID)
+        defer {
+            usageRefreshTasks[providerID] = nil
+            refreshingUsageIDs.remove(providerID)
+        }
+        await task.value
+    }
+
+    private func performUsageRefresh(for providerID: String) async {
+        guard let provider = catalog[id: providerID] else { return }
+        do {
+            let snapshot: ProviderUsageSnapshot
+            if providerID == "openai" {
+                guard let executable = AppState.findCodexExecutable() else {
+                    throw MissingCodexError()
+                }
+                snapshot = try await usageService.codexSnapshot(executable: executable)
+            } else {
+                snapshot = try await usageService.snapshot(
+                    for: provider,
+                    secret: keyStore.secret(for: provider.id)
+                )
+            }
+            providerUsage[providerID] = snapshot
+            lastUsageRefresh = Date()
+            usageErrors[providerID] = nil
+            log(usageLogMessage(snapshot))
+        } catch {
+            let description = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            if providerUsage[providerID] == nil {
+                providerUsage[providerID] = ProviderUsageSnapshot(
+                    providerID: providerID,
+                    status: .failed(description)
+                )
+            }
+            usageErrors[providerID] = description
+            log("Échec lecture quota \(provider.displayName) : \(description). Dernière donnée conservée si disponible.")
+        }
+    }
+
+    func refreshActiveUsage(force: Bool = false) async {
+        await refreshUsage(for: snapshot.activeProviderID, force: force)
+    }
+
+    func refreshAllUsage() async {
+        for provider in catalog.providers {
+            await refreshUsage(for: provider.id, force: false)
+        }
+    }
+
+    private func usageLogMessage(_ snapshot: ProviderUsageSnapshot) -> String {
+        let provider = catalog[id: snapshot.providerID]?.displayName ?? snapshot.providerID
+        if let balance = snapshot.balance {
+            if snapshot.providerID == "deepseek" {
+                return "Solde \(provider) · \(formatQuota(balance.available)) \(balance.currency) disponibles."
+            }
+            return "Budget \(provider) · \(formatQuota(balance.available)) \(balance.currency) restants."
+        }
+        if snapshot.windows.isEmpty {
+            switch snapshot.status {
+            case .unsupported:
+                return "Quota \(provider) non exposé par une API supportée."
+            case .authenticationRequired:
+                return "Quota \(provider) : clé requise."
+            case .unavailable:
+                return "Quota \(provider) indisponible."
+            case .failed(let reason):
+                return "Échec lecture quota \(provider) : \(reason)."
+            case .available:
+                return "Quota \(provider) : aucune donnée exposée."
+            }
+        }
+        let details = snapshot.windows.map { window -> String in
+            guard let remaining = window.remainingPercent else {
+                return window.label
+            }
+            return "\(window.label) : \(Int(remaining.rounded())) % restant"
+        }
+        return "Quota \(provider) · \(details.joined(separator: " · "))."
+    }
+
+    private func formatQuota(_ value: Decimal?) -> String {
+        guard let value else { return "—" }
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 2
+        return formatter.string(from: value as NSDecimalNumber) ?? "\(value)"
+    }
+
+    private struct MissingCodexError: LocalizedError {
+        var errorDescription: String? { "Codex CLI introuvable." }
+    }
+
+    private func loadScreenshotUsage() {
+        let now = Date()
+        providerUsage = [
+            "openai": ProviderUsageSnapshot(
+                providerID: "openai",
+                fetchedAt: now,
+                status: .available,
+                windows: [
+                    UsageWindow(id: "openai-5h", label: "5 heures", usedPercent: 78, durationMinutes: 300, resetsAt: now.addingTimeInterval(6_120)),
+                    UsageWindow(id: "openai-week", label: "7 jours", usedPercent: 46, durationMinutes: 10_080, resetsAt: now.addingTimeInterval(172_800))
+                ]
+            ),
+            "deepseek": ProviderUsageSnapshot(
+                providerID: "deepseek",
+                fetchedAt: now,
+                status: .available,
+                balance: UsageBalance(
+                    available: Decimal(string: "18.42"),
+                    granted: Decimal(string: "2.00"),
+                    toppedUp: Decimal(string: "16.42"),
+                    currency: "USD",
+                    label: "Crédit API"
+                )
+            ),
+            "glm": ProviderUsageSnapshot(
+                providerID: "glm",
+                fetchedAt: now,
+                status: .available,
+                planLabel: "Coding Plan",
+                windows: [UsageWindow(id: "glm-5h", label: "5 heures", usedPercent: 72, durationMinutes: 300)]
+            ),
+            "openrouter": ProviderUsageSnapshot(
+                providerID: "openrouter",
+                fetchedAt: now,
+                status: .available,
+                balance: UsageBalance(
+                    available: Decimal(string: "32.70"),
+                    total: Decimal(string: "50"),
+                    currency: "USD",
+                    label: "Budget de la clé"
+                ),
+                note: "Reset : mensuel"
+            ),
+            "claude": ProviderUsageSnapshot(providerID: "claude", fetchedAt: now, status: .unsupported),
+            "opencode": ProviderUsageSnapshot(providerID: "opencode", fetchedAt: now, status: .unsupported),
+            "ollama": ProviderUsageSnapshot(providerID: "ollama", fetchedAt: now, status: .available, note: "Local · sans quota fournisseur.")
+        ]
+        let demoMessages = [
+            "DeepSeek sélectionné.",
+            "Modèles rafraîchis.",
+            "Solde DeepSeek · 18,42 USD disponibles.",
+            "Codex CLI lancé."
+        ]
+        for (offset, message) in demoMessages.enumerated() {
+            let entry = LogEntry(id: offset + 1, date: now.addingTimeInterval(Double(offset - 4) * 28), message: message)
+            logs.append(entry)
+        }
+        nextLogID = demoMessages.count + 1
+        statusMessage = "Démonstration prête · aucun secret réel utilisé."
     }
 
     // MARK: Bootstrap (read-only detection — never modifies native config)
@@ -188,6 +369,9 @@ final class AppState: ObservableObject {
         log("Catalogue chargé : \(catalog.providers.map(\.displayName).joined(separator: ", ")).")
         // Proxies are up now, so the providers can be asked what they serve.
         await refreshModels(announce: false)
+        // Quota endpoints can be slower than startup; this stays behind the
+        // completed bootstrap and never blocks provider switching.
+        await refreshAllUsage()
     }
 
     // MARK: Model discovery
@@ -484,6 +668,7 @@ final class AppState: ObservableObject {
                 log("Sélection : \(provider.displayName) · \(model). Relance de ChatGPT/Codex…")
             }
             await runTest()
+            await refreshUsage(for: providerID, force: false)
             refreshRunningApps()
             await relaunchChatGPT()
         } catch {
@@ -594,6 +779,7 @@ final class AppState: ObservableObject {
         log(keyStore.lastPersistenceError == nil
             ? "Clé enregistrée pour \(provider.displayName). Activation…"
             : "Clé en mémoire pour \(provider.displayName), mais écriture disque impossible : \(keyStore.lastPersistenceError!)")
+        Task { await refreshUsage(for: provider.id, force: true) }
         ensureProxiesRunning()
         applySelectionAfterKeyInjection = false
         applySelectionTargetID = nil
