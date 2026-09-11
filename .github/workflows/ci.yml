@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate bilingual landing page
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const html = fs.readFileSync('docs/index.html', 'utf8');
+          const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
+            .map((match) => match[1])
+            .filter(Boolean);
+          if (scripts.length === 0) throw new Error('No interactive script found');
+          scripts.forEach((source) => new Function(source));
+          for (const marker of ['data-lang="fr"', 'data-lang="en"', 'id="provider-list"']) {
+            if (!html.includes(marker)) throw new Error('Missing ' + marker);
+          }
+          NODE
+      - name: Swift tests
+        run: swift test
+      - name: Assemble app bundle
+        run: ./scripts/build-app.sh --no-sign
