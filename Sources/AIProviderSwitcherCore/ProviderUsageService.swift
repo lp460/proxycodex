@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Reads only documented, provider-owned quota endpoints. Responses are
@@ -466,9 +467,15 @@ enum CodexAppServerClient {
             }
         }
 
-        func send(_ object: [String: Any]) {
+        // Foundation's FileHandle raises Objective-C exceptions on EPIPE. A
+        // short-lived app-server can legitimately close before our next RPC,
+        // so raw POSIX writes keep that observable as a controlled error.
+        signal(SIGPIPE, SIG_IGN)
+        let stdinFD = stdout.fileHandleForWriting.fileDescriptor
+
+        func send(_ object: [String: Any]) throws {
             if let data = try? JSONSerialization.data(withJSONObject: object) {
-                stdout.fileHandleForWriting.write(data + Data("\n".utf8))
+                try Self.write(data, to: stdinFD)
             }
         }
 
@@ -486,7 +493,7 @@ enum CodexAppServerClient {
             throw ProviderUsageError.timeout
         }
 
-        send([
+        try send([
             "method": "initialize",
             "id": 1,
             "params": [
@@ -499,10 +506,29 @@ enum CodexAppServerClient {
         ])
         let initialize = try response(id: 1)
         if initialize["error"] != nil { throw ProviderUsageError.invalidResponse }
-        send(["method": "initialized", "params": [:]])
-        send(["method": "account/rateLimits/read", "id": 2, "params": [:]])
+        try send(["method": "initialized", "params": [:]])
+        try send(["method": "account/rateLimits/read", "id": 2, "params": [:]])
         let usage = try response(id: 2)
         return try JSONSerialization.data(withJSONObject: usage)
+    }
+
+    private static func write(_ data: Data, to fd: Int32) throws {
+        var offset = 0
+        let bytes = [UInt8](data)
+        while offset < bytes.count {
+            let count = bytes.withUnsafeBufferPointer { buffer in
+                Darwin.write(fd, buffer.baseAddress!.advanced(by: offset), bytes.count - offset)
+            }
+            if count > 0 {
+                offset += count
+            } else if count < 0 && errno == EINTR {
+                continue
+            } else if errno == EPIPE || errno == EBADF {
+                throw ProviderUsageError.pipeClosed
+            } else {
+                throw ProviderUsageError.invalidResponse
+            }
+        }
     }
 
     static func messages(in data: Data) -> [[String: Any]] {

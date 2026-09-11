@@ -105,12 +105,14 @@ public enum ProviderUsageError: Error, LocalizedError, Equatable {
     case http(Int)
     case invalidResponse
     case timeout
+    case pipeClosed
 
     public var errorDescription: String? {
         switch self {
         case .http(let status): return "HTTP \(status)"
         case .invalidResponse: return "Réponse illisible"
         case .timeout: return "Délai dépassé"
+        case .pipeClosed: return "Serveur Codex fermé"
         }
     }
 }
