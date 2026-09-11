@@ -74,19 +74,24 @@ if ! otool -l "$ROOT/Contents/MacOS/$EXEC" | grep -q '@executable_path/../Framew
 fi
 
 if [[ "$SIGN" == "yes" ]]; then
-    TIMESTAMP_ARGS=()
-    if [[ "$SIGN_IDENTITY" != "-" ]]; then
-        TIMESTAMP_ARGS=(--timestamp)
-    fi
-
     echo ">> Signing embedded framework and app…"
-    codesign --force --deep --options runtime "${TIMESTAMP_ARGS[@]}" \
-        --sign "$SIGN_IDENTITY" "$ROOT/Contents/Frameworks/Sparkle.framework"
-    codesign --force --options runtime "${TIMESTAMP_ARGS[@]}" \
-        --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" \
-        "$ROOT/Contents/MacOS/$EXEC"
-    codesign --force --options runtime "${TIMESTAMP_ARGS[@]}" \
-        --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$ROOT"
+    if [[ "$SIGN_IDENTITY" == "-" ]]; then
+        # An ad-hoc build deliberately omits Hardened Runtime. Enabling library
+        # validation without a Developer ID prevents the embedded Sparkle
+        # framework from loading.
+        codesign --force --deep --sign - "$ROOT/Contents/Frameworks/Sparkle.framework"
+        codesign --force --sign - --entitlements "$ENTITLEMENTS" \
+            "$ROOT/Contents/MacOS/$EXEC"
+        codesign --force --sign - --entitlements "$ENTITLEMENTS" "$ROOT"
+    else
+        codesign --force --deep --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" "$ROOT/Contents/Frameworks/Sparkle.framework"
+        codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" \
+            "$ROOT/Contents/MacOS/$EXEC"
+        codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$ROOT"
+    fi
     codesign --verify --deep --strict --verbose=2 "$ROOT"
 fi
 
