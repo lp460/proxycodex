@@ -513,6 +513,18 @@ final class AppState: ObservableObject {
     func hasKey(for providerID: String) -> Bool {
         screenshotMode ? screenshotKeyIDs.contains(providerID) : keyStore.hasKey(providerID)
     }
+    /// Models offered for the active provider. While masquerading, only models
+    /// that own a native slug are listed: Codex's slug list is finite, and a
+    /// model without one would end up outside the catalog Codex reads.
+    var selectableModels: [String] {
+        guard let provider = activeProvider else { return [] }
+        let effective = effectiveCatalog[id: provider.id] ?? provider
+        return ModelMasquerade.exposableModels(
+            for: effective,
+            cacheURL: configStore.paths.modelsCacheJson
+        )
+    }
+
     /// Providers with models reduced to the user-chosen exposed subset. The
     /// full discovered lists stay in `catalog` so the picker keeps every
     /// choice; everything Codex sees (catalog, profiles, adapter pairing) uses
@@ -690,12 +702,8 @@ final class AppState: ObservableObject {
         stopConfigWatcher()
         defer { startConfigWatcher() }
         do {
-            let exposureChanged = ensureModelExposed(model, for: provider)
             snapshot = try await router.setActive(providerID: provider.id, model: model)
             if provider.id != "openai" {
-                if exposureChanged {
-                    ensureProxiesRunning()
-                }
                 let effective = effectiveCatalog[id: provider.id] ?? provider
                 // Keep model_provider and model in sync before refreshing the
                 // provider catalog, avoiding a transient old-provider state.
@@ -709,31 +717,6 @@ final class AppState: ObservableObject {
         } catch {
             log(L("Changement de modèle échoué: %@", error.localizedDescription))
         }
-    }
-
-    /// Promote a model chosen from the complete picker into Codex's finite slot
-    /// subset. When all slots are taken, replace the last optional slot rather
-    /// than silently falling back to the stale six-model selection.
-    private func ensureModelExposed(_ model: String, for provider: Provider) -> Bool {
-        guard provider.models.contains(model),
-              modelSlots > 0,
-              provider.models.count > modelSlots else { return false }
-
-        var current = exposedModels(for: provider.id)
-        guard !current.contains(model) else { return false }
-
-        if current.count < modelSlots {
-            current.append(model)
-        } else if let replacementIndex = current.lastIndex(where: { $0 != provider.defaultModel }) {
-            current[replacementIndex] = model
-        } else {
-            return false
-        }
-
-        let next = orderedExposed(current, provider: provider)
-        modelSelection[provider.id] = next
-        try? selectionStore.save(modelSelection)
-        return true
     }
 
     /// Toggles a model in/out of the finite Codex slots for a provider. The

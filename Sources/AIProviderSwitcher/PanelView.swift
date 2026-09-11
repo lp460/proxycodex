@@ -192,7 +192,7 @@ struct PanelView: View {
                 get: { state.snapshot.activeModel },
                 set: { newValue in Task { await state.setModel(newValue) } }
             )) {
-                ForEach(state.allModelsForActive, id: \.self) { model in
+                ForEach(state.selectableModels, id: \.self) { model in
                     Text(model).tag(model)
                 }
             }
