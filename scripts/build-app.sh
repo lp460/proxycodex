@@ -90,6 +90,12 @@ if ! otool -l "$ROOT/Contents/MacOS/$EXEC" | grep -q '@executable_path/../Framew
 fi
 
 if [[ "$SIGN" == "yes" ]]; then
+    # Sparkle's downloadable binary artifact can carry resource-fork metadata,
+    # which codesign rejects when it reaches nested helper bundles.
+    xattr -cr "$ROOT"
+fi
+
+if [[ "$SIGN" == "yes" ]]; then
     echo ">> Signing embedded framework and app…"
     if [[ "$SIGN_IDENTITY" == "-" ]]; then
         # An ad-hoc build deliberately omits Hardened Runtime. Enabling library
