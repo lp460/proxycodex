@@ -741,10 +741,11 @@ struct PanelView: View {
     }
 
     private func injectKey() {
-        guard !trimmedKey.isEmpty, !misroutedOpenRouterKey else { return }
+        let key = trimmedKey
         let providerID = state.keyEditingProvider?.id
-        Task { await state.setSessionKey(trimmedKey, for: providerID) }
+        guard !key.isEmpty, !misroutedOpenRouterKey else { return }
         draftKey = ""
+        Task { await state.setSessionKey(key, for: providerID) }
         state.dismissKeyEditor()
     }
 
