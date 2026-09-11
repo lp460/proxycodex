@@ -1,0 +1,145 @@
+name: Build and publish macOS release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, for example 1.0.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      CERTIFICATE_P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE }}
+      CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+      SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+      KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release secrets
+        run: |
+          for name in CERTIFICATE_P12 CERTIFICATE_PASSWORD APPLE_ID APPLE_APP_PASSWORD APPLE_TEAM_ID SPARKLE_PRIVATE_KEY SPARKLE_PUBLIC_KEY KEYCHAIN_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub secret: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="$GITHUB_REF_NAME"
+          else
+            VERSION="$INPUT_VERSION"
+            TAG="v$VERSION"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must use X.Y.Z" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID certificate
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/proxycodex-signing.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$CERTIFICATE_P12" | base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          SIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)"
+          if [[ -z "$SIGN_IDENTITY" ]]; then
+            echo "Developer ID Application identity not found" >&2
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$SIGN_IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Stamp release metadata
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_KEY" Resources/Info.plist
+
+      - name: Test
+        run: swift test
+
+      - name: Build signed universal app
+        env:
+          UNIVERSAL_BUILD: "yes"
+        run: ./scripts/build-app.sh
+
+      - name: Create, notarize and staple DMG
+        run: |
+          mkdir -p release/dmg-root
+          ditto "build/AIProviderSwitcher.app" "release/dmg-root/ProxyCodex.app"
+          ln -s /Applications "release/dmg-root/Applications"
+          hdiutil create -volname "ProxyCodex" -srcfolder "release/dmg-root" -ov -format UDZO "release/ProxyCodex.dmg"
+          xcrun notarytool submit "release/ProxyCodex.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "release/ProxyCodex.dmg"
+          spctl --assess --type open --context context:primary-signature -v "release/ProxyCodex.dmg"
+
+      - name: Generate signed Sparkle appcast
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz" -o "$RUNNER_TEMP/sparkle.tar.xz"
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xJf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+          GENERATE_APPCAST="$(find "$RUNNER_TEMP/sparkle" -type f -path '*/bin/generate_appcast' -print -quit)"
+          if [[ -z "$GENERATE_APPCAST" ]]; then
+            echo "generate_appcast not found" >&2
+            exit 1
+          fi
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$GENERATE_APPCAST" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/lp460/proxycodex/releases/download/$TAG/" \
+            --link "https://lp460.github.io/proxycodex/" \
+            --maximum-versions 1 \
+            --output-path "release/appcast.xml" \
+            "release"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/ProxyCodex.dmg release/appcast.xml --clobber
+          else
+            gh release create "$TAG" release/ProxyCodex.dmg release/appcast.xml \
+              --title "ProxyCodex $VERSION" \
+              --generate-notes
+          fi
+
+      - name: Clean signing keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true

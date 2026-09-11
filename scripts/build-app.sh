@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
-#
-# Builds the AI Provider Switcher .app bundle (release), ad-hoc signed with the
-# Hardened Runtime. Non-sandboxed so it can launch the user's Codex CLI.
+# Builds the ProxyCodex app bundle.
 #
 #   ./scripts/build-app.sh [--no-sign] [--install] [--open]
 #
-# --install copies the bundle to /Applications, so the app no longer depends on
-# this checkout staying where it is.
+# Environment variables used by the release workflow:
+#   SIGN_IDENTITY="Developer ID Application: …"
+#   UNIVERSAL_BUILD=yes
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 EXEC="AIProviderSwitcher"
-BUNDLE_NAME="AI Provider Switcher"
 INFO_PLIST="Resources/Info.plist"
 ENTITLEMENTS="Resources/AIProviderSwitcher.entitlements"
-BUILD_DIR="$REPO_ROOT/.build/release"
 OUT_DIR="$REPO_ROOT/build"
 APP_BUNDLE="$OUT_DIR/$EXEC.app"
 
@@ -24,6 +21,7 @@ SIGN="yes"
 OPEN_AFTER="no"
 INSTALL="no"
 INSTALL_DIR="/Applications"
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 for arg in "$@"; do
     case "$arg" in
         --no-sign) SIGN="no" ;;
@@ -33,9 +31,14 @@ for arg in "$@"; do
     esac
 done
 
-echo ">> Building release executable…"
-swift build -c release
+ARCH_ARGS=()
+if [[ "${UNIVERSAL_BUILD:-no}" == "yes" ]]; then
+    ARCH_ARGS=(--arch arm64 --arch x86_64)
+fi
 
+echo ">> Building release executable…"
+swift build -c release "${ARCH_ARGS[@]}"
+BUILD_DIR="$(swift build -c release "${ARCH_ARGS[@]}" --show-bin-path)"
 BIN="$BUILD_DIR/$EXEC"
 if [[ ! -x "$BIN" ]]; then
     echo "expected executable at $BIN" >&2
@@ -46,42 +49,55 @@ echo ">> Assembling $APP_BUNDLE …"
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
 ROOT="$STAGING/$EXEC.app"
-mkdir -p "$ROOT/Contents/MacOS" "$ROOT/Contents/Resources"
+mkdir -p "$ROOT/Contents/MacOS" "$ROOT/Contents/Resources" "$ROOT/Contents/Frameworks"
 
 cp "$BIN" "$ROOT/Contents/MacOS/$EXEC"
 cp "$INFO_PLIST" "$ROOT/Contents/Info.plist"
-# The adapter proxy must ship inside the bundle: an installed app cannot rely on
-# this checkout still being there.
 cp "$REPO_ROOT/Resources/provider-proxy.py" "$ROOT/Contents/Resources/provider-proxy.py"
 
-# Optional icon if present.
 if [[ -f "$REPO_ROOT/Resources/AppIcon.icns" ]]; then
     cp "$REPO_ROOT/Resources/AppIcon.icns" "$ROOT/Contents/Resources/AppIcon.icns"
 fi
 
+# Sparkle is a binary SwiftPM dependency. Preserve its full framework bundle,
+# including installer helpers and XPC services required for self-updates.
+SPARKLE_FRAMEWORK="$(find "$REPO_ROOT/.build" -type d -name Sparkle.framework -print -quit)"
+if [[ -z "$SPARKLE_FRAMEWORK" ]]; then
+    echo "Sparkle.framework was not found after swift build" >&2
+    exit 1
+fi
+ditto "$SPARKLE_FRAMEWORK" "$ROOT/Contents/Frameworks/Sparkle.framework"
+
+if ! otool -l "$ROOT/Contents/MacOS/$EXEC" | grep -q '@executable_path/../Frameworks'; then
+    install_name_tool -add_rpath '@executable_path/../Frameworks' "$ROOT/Contents/MacOS/$EXEC"
+fi
+
 if [[ "$SIGN" == "yes" ]]; then
-    echo ">> Ad-hoc signing with Hardened Runtime…"
-    codesign --force --options runtime --sign - \
-        --entitlements "$ENTITLEMENTS" \
+    TIMESTAMP_ARGS=()
+    if [[ "$SIGN_IDENTITY" != "-" ]]; then
+        TIMESTAMP_ARGS=(--timestamp)
+    fi
+
+    echo ">> Signing embedded framework and app…"
+    codesign --force --deep --options runtime "${TIMESTAMP_ARGS[@]}" \
+        --sign "$SIGN_IDENTITY" "$ROOT/Contents/Frameworks/Sparkle.framework"
+    codesign --force --options runtime "${TIMESTAMP_ARGS[@]}" \
+        --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" \
         "$ROOT/Contents/MacOS/$EXEC"
-    codesign --force --options runtime --sign - \
-        --entitlements "$ENTITLEMENTS" \
-        "$ROOT"
-    echo ">> Verifying signature…"
-    codesign --verify --strict --verbose=2 "$ROOT" 2>&1 | sed 's/^/   /' || true
+    codesign --force --options runtime "${TIMESTAMP_ARGS[@]}" \
+        --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$ROOT"
+    codesign --verify --deep --strict --verbose=2 "$ROOT"
 fi
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$OUT_DIR"
 mv "$ROOT" "$APP_BUNDLE"
 
-echo ""
 echo "✓ Built: $APP_BUNDLE"
 
 TARGET="$APP_BUNDLE"
 if [[ "$INSTALL" == "yes" ]]; then
     INSTALLED="$INSTALL_DIR/$EXEC.app"
-    # A running instance would keep the old binary and the old proxies alive.
     if pgrep -x "$EXEC" >/dev/null 2>&1; then
         echo ">> Quitting the running instance…"
         pkill -x "$EXEC" || true
@@ -89,24 +105,14 @@ if [[ "$INSTALL" == "yes" ]]; then
     fi
     echo ">> Installing to $INSTALLED …"
     rm -rf "$INSTALLED"
-    # ditto preserves the bundle layout; the xattr sweep removes quarantine and
-    # Finder metadata, which codesign rejects as "detritus".
     ditto "$APP_BUNDLE" "$INSTALLED"
     xattr -cr "$INSTALLED"
-    if [[ "$SIGN" == "yes" ]]; then
-        echo ">> Signing the installed copy…"
-        codesign --force --options runtime --sign - \
-            --entitlements "$ENTITLEMENTS" "$INSTALLED/Contents/MacOS/$EXEC"
-        codesign --force --options runtime --sign - \
-            --entitlements "$ENTITLEMENTS" "$INSTALLED"
-        codesign --verify --strict --verbose=2 "$INSTALLED" 2>&1 | sed 's/^/   /'
-    fi
     TARGET="$INSTALLED"
     echo "✓ Installed: $INSTALLED"
 fi
 
 echo "  Run with: open \"$TARGET\""
-echo "  Important: launch the .app bundle (not Contents/MacOS/$EXEC directly) so macOS registers the bundle identifier and MenuBarExtra."
+echo "  Launch the .app bundle so macOS registers its identifier and MenuBarExtra."
 
 if [[ "$OPEN_AFTER" == "yes" ]]; then
     open "$TARGET"
