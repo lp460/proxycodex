@@ -31,14 +31,15 @@ for arg in "$@"; do
     esac
 done
 
-ARCH_ARGS=()
 if [[ "${UNIVERSAL_BUILD:-no}" == "yes" ]]; then
-    ARCH_ARGS=(--arch arm64 --arch x86_64)
+    echo ">> Building universal release executable…"
+    swift build -c release --arch arm64 --arch x86_64
+    BUILD_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+else
+    echo ">> Building release executable…"
+    swift build -c release
+    BUILD_DIR="$(swift build -c release --show-bin-path)"
 fi
-
-echo ">> Building release executable…"
-swift build -c release "${ARCH_ARGS[@]}"
-BUILD_DIR="$(swift build -c release "${ARCH_ARGS[@]}" --show-bin-path)"
 BIN="$BUILD_DIR/$EXEC"
 if [[ ! -x "$BIN" ]]; then
     echo "expected executable at $BIN" >&2
