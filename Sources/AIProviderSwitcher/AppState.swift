@@ -59,6 +59,7 @@ final class AppState: ObservableObject {
     @Published private(set) var refreshingUsageIDs: Set<String> = []
     @Published private(set) var lastUsageRefresh: Date?
     @Published private(set) var usageErrors: [String: String] = [:]
+    @Published private(set) var language = LocalizationManager.language
 
     private var observationTask: Task<Void, Never>?
     private var nextLogID = 1
@@ -110,7 +111,7 @@ final class AppState: ObservableObject {
             )
             nativeConfigDetected = true
             providersInstalled = true
-            statusMessage = "Démonstration prête · aucun secret réel utilisé."
+            statusMessage = L("Démonstration prête · aucun secret réel utilisé.")
             loadScreenshotUsage()
         } else {
             // Keep keys across restarts: persistence is ON by default (0600 file,
@@ -155,6 +156,12 @@ final class AppState: ObservableObject {
 
     func clearLogs() {
         logs.removeAll()
+    }
+
+    func setLanguage(_ newLanguage: AppLanguage) {
+        guard newLanguage != language else { return }
+        LocalizationManager.language = newLanguage
+        language = newLanguage
     }
 
     // MARK: Quota & usage
@@ -230,31 +237,31 @@ final class AppState: ObservableObject {
         let provider = catalog[id: snapshot.providerID]?.displayName ?? snapshot.providerID
         if let balance = snapshot.balance {
             if snapshot.providerID == "deepseek" {
-                return "Solde \(provider) · \(formatQuota(balance.available)) \(balance.currency) disponibles."
+                return L("Solde %@ · %@ %@ disponibles.", provider, formatQuota(balance.available), balance.currency)
             }
-            return "Budget \(provider) · \(formatQuota(balance.available)) \(balance.currency) restants."
+            return L("Budget %@ · %@ %@ restants.", provider, formatQuota(balance.available), balance.currency)
         }
         if snapshot.windows.isEmpty {
             switch snapshot.status {
             case .unsupported:
-                return "Quota \(provider) non exposé par une API supportée."
+                return L("Quota %@ non exposé par une API supportée.", provider)
             case .authenticationRequired:
-                return "Quota \(provider) : clé requise."
+                return L("Quota %@ : clé requise.", provider)
             case .unavailable:
-                return "Quota \(provider) indisponible."
+                return L("Quota %@ indisponible.", provider)
             case .failed(let reason):
-                return "Échec lecture quota \(provider) : \(reason)."
+                return L("Échec lecture quota %@ : %@.", provider, reason)
             case .available:
-                return "Quota \(provider) : aucune donnée exposée."
+                return L("Quota %@ : aucune donnée exposée.", provider)
             }
         }
         let details = snapshot.windows.map { window -> String in
             guard let remaining = window.remainingPercent else {
                 return window.label
             }
-            return "\(window.label) : \(Int(remaining.rounded())) % restant"
+            return L("%@ : %lld %% restant", window.label, Int(remaining.rounded()))
         }
-        return "Quota \(provider) · \(details.joined(separator: " · "))."
+        return L("Quota %@ · %@.", provider, details.joined(separator: " · "))
     }
 
     private func formatQuota(_ value: Decimal?) -> String {
@@ -278,8 +285,8 @@ final class AppState: ObservableObject {
                 fetchedAt: now,
                 status: .available,
                 windows: [
-                    UsageWindow(id: "openai-5h", label: "5 heures", usedPercent: 78, durationMinutes: 300, resetsAt: now.addingTimeInterval(6_120)),
-                    UsageWindow(id: "openai-week", label: "7 jours", usedPercent: 46, durationMinutes: 10_080, resetsAt: now.addingTimeInterval(172_800))
+                    UsageWindow(id: "openai-5h", label: L("5 heures"), usedPercent: 78, durationMinutes: 300, resetsAt: now.addingTimeInterval(6_120)),
+                    UsageWindow(id: "openai-week", label: L("7 jours"), usedPercent: 46, durationMinutes: 10_080, resetsAt: now.addingTimeInterval(172_800))
                 ]
             ),
             "deepseek": ProviderUsageSnapshot(
@@ -291,7 +298,7 @@ final class AppState: ObservableObject {
                     granted: Decimal(string: "2.00"),
                     toppedUp: Decimal(string: "16.42"),
                     currency: "USD",
-                    label: "Crédit API"
+                    label: L("Crédit API")
                 )
             ),
             "glm": ProviderUsageSnapshot(
@@ -299,7 +306,7 @@ final class AppState: ObservableObject {
                 fetchedAt: now,
                 status: .available,
                 planLabel: "Coding Plan",
-                windows: [UsageWindow(id: "glm-5h", label: "5 heures", usedPercent: 72, durationMinutes: 300)]
+                windows: [UsageWindow(id: "glm-5h", label: L("5 heures"), usedPercent: 72, durationMinutes: 300)]
             ),
             "openrouter": ProviderUsageSnapshot(
                 providerID: "openrouter",
@@ -309,7 +316,7 @@ final class AppState: ObservableObject {
                     available: Decimal(string: "32.70"),
                     total: Decimal(string: "50"),
                     currency: "USD",
-                    label: "Budget de la clé"
+                    label: L("Budget de la clé")
                 ),
                 note: "Reset : mensuel"
             ),
@@ -319,22 +326,22 @@ final class AppState: ObservableObject {
                 providerID: "opencode-go",
                 fetchedAt: now,
                 status: .unsupported,
-                note: "Quota Go non exposé ici ; consultez la console OpenCode."
+                note: L("Quota Go non exposé ici ; consultez la console OpenCode.")
             ),
-            "ollama": ProviderUsageSnapshot(providerID: "ollama", fetchedAt: now, status: .available, note: "Local · sans quota fournisseur.")
+            "ollama": ProviderUsageSnapshot(providerID: "ollama", fetchedAt: now, status: .available, note: L("Local · sans quota fournisseur."))
         ]
         let demoMessages = [
-            "DeepSeek sélectionné.",
-            "Modèles rafraîchis.",
-            "Solde DeepSeek · 18,42 USD disponibles.",
-            "Codex CLI lancé."
+            L("DeepSeek sélectionné."),
+            L("Modèles rafraîchis."),
+            L("Solde DeepSeek · 18,42 USD disponibles."),
+            L("Codex CLI lancé.")
         ]
         for (offset, message) in demoMessages.enumerated() {
             let entry = LogEntry(id: offset + 1, date: now.addingTimeInterval(Double(offset - 4) * 28), message: message)
             logs.append(entry)
         }
         nextLogID = demoMessages.count + 1
-        statusMessage = "Démonstration prête · aucun secret réel utilisé."
+        statusMessage = L("Démonstration prête · aucun secret réel utilisé.")
     }
 
     // MARK: Bootstrap (read-only detection — never modifies native config)
@@ -369,14 +376,14 @@ final class AppState: ObservableObject {
             ensureProxiesRunning()
             startConfigWatcher()
             log(nativeConfigDetected
-                ? "Codex natif détecté (\(configStore.paths.codexHome.path))."
-                : "Aucun ~/.codex/config.toml ; lancez Codex une fois, puis « Installer les providers ».")
+                ? L("Codex natif détecté (%@).", configStore.paths.codexHome.path)
+                : L("Aucun ~/.codex/config.toml ; lancez Codex une fois, puis « Installer les providers »."))
         } catch {
-            log("Init error: \(error.localizedDescription)")
+        log(L("Init error: %@", error.localizedDescription))
         }
         refreshRunningApps()
         await detectOpenCode()
-        log("Catalogue chargé : \(catalog.providers.map(\.displayName).joined(separator: ", ")).")
+        log(L("Catalogue chargé : %@.", catalog.providers.map(\.displayName).joined(separator: ", ")))
         // Proxies are up now, so the providers can be asked what they serve.
         await refreshModels(announce: false)
         // Quota endpoints can be slower than startup; this stays behind the
@@ -414,14 +421,14 @@ final class AppState: ObservableObject {
         applyDiscovered(found)
         try? discoveredStore.save(found)
         if !changed.isEmpty {
-            log("Modèles rafraîchis : \(changed.joined(separator: ", ")).")
+            log(L("Modèles rafraîchis : %@.", changed.joined(separator: ", ")))
             // Adapters advertise the list, so they restart with the new pairing.
             ensureProxiesRunning()
             // Only the active provider's catalog is on disk; leave config.toml
             // alone otherwise, every write makes Codex reconnect.
             if activeChanged { installProviders() }
         } else if announce {
-            log("Modèles à jour : aucun changement côté providers.")
+            log(L("Modèles à jour : aucun changement côté providers."))
         }
     }
 
@@ -455,11 +462,11 @@ final class AppState: ObservableObject {
         guard !screenshotMode else { return }
         openCode = await Task.detached(priority: .utility) { OpenCodeCLI.detect() }.value
         guard let install = openCode else {
-            log("OpenCode CLI absent : la passerelle Zen publique reste utilisable.")
+            log(L("OpenCode CLI absent : la passerelle Zen publique reste utilisable."))
             return
         }
-        let credential = install.hasZenCredential ? "clé Zen OpenCode" : "palier gratuit (clé publique)"
-        log("OpenCode CLI \(install.version ?? "?") détecté (\(install.executable.path)) · \(credential).")
+        let credential = install.hasZenCredential ? L("clé Zen OpenCode") : L("palier gratuit (clé publique)")
+        log(L("OpenCode CLI %@ détecté (%@) · %@.", install.version ?? "?", install.executable.path, credential))
     }
 
     /// Seeds the key store from OpenCode's own credentials (`auth.json`). The
@@ -475,7 +482,7 @@ final class AppState: ObservableObject {
             imported.append(provider.displayName)
         }
         if !imported.isEmpty {
-            log("Clé(s) importée(s) depuis OpenCode : \(imported.joined(separator: ", ")).")
+            log(L("Clé(s) importée(s) depuis OpenCode : %@.", imported.joined(separator: ", ")))
         }
     }
 
@@ -616,10 +623,10 @@ final class AppState: ObservableObject {
             providersInstalled = true
             catalogConflict = !report.catalogInstalled && selectedProviderID != "openai"
             log(catalogConflict
-                ? "Providers installés, mais le catalogue Codex existant est conservé : vérifiez model_catalog_json."
-                : "Providers ajoutés (additif): \(report.providersAdded.joined(separator: ", ")). OpenAI inchangé.")
+                ? L("Providers installés, mais le catalogue Codex existant est conservé : vérifiez model_catalog_json.")
+                : L("Providers ajoutés (additif): %@. OpenAI inchangé.", report.providersAdded.joined(separator: ", ")))
         } catch {
-            log("Install échouée: \(error.localizedDescription)")
+            log(L("Install échouée: %@", error.localizedDescription))
         }
     }
 
@@ -628,9 +635,9 @@ final class AppState: ObservableObject {
         do {
             _ = try configStore.uninstall()
             providersInstalled = computeInstalled()
-            log("Providers retirés. Codex/OpenAI revient à l'état natif.")
+            log(L("Providers retirés. Codex/OpenAI revient à l'état natif."))
         } catch {
-            log("Uninstall échouée: \(error.localizedDescription)")
+            log(L("Uninstall échouée: %@", error.localizedDescription))
         }
     }
 
@@ -655,15 +662,15 @@ final class AppState: ObservableObject {
                 _ = try configStore.revertOverride(allowLegacyUnmarked: true)
                 installProviders(activeProviderID: "openai")
                 snapshot = try await router.setActive(providerID: "openai", model: model)
-                log("OpenAI natif : override supprimé, relance de ChatGPT/Codex…")
+                log(L("OpenAI natif : override supprimé, relance de ChatGPT/Codex…"))
             } else {
                 guard let provider else { return }
                 let effective = effectiveCatalog[id: provider.id] ?? provider
                 if provider.requiresKey && !hasKey(for: provider.id) {
                     let persisted = keyStore.persistedProviderIDs().contains(provider.id)
                     log(persisted
-                        ? "Clé \(provider.displayName) présente sur disque mais pas en mémoire : relancez l'app pour la recharger."
-                        : "Saisissez d'abord la clé pour \(provider.displayName)\(persistenceEnabled ? "" : " (persistance locale désactivée)"), puis cliquez sa carte à nouveau.")
+                        ? L("Clé %@ présente sur disque mais pas en mémoire : relancez l'app pour la recharger.", provider.displayName)
+                        : L("Saisissez d'abord la clé pour %1$@%2$@, puis cliquez sa carte à nouveau.", provider.displayName, persistenceEnabled ? "" : L(" (persistance locale désactivée)")))
                     applySelectionAfterKeyInjection = true
                     applySelectionTargetID = provider.id
                     presentKeySheet(for: provider.id)
@@ -675,14 +682,14 @@ final class AppState: ObservableObject {
                 _ = try configStore.applyOverride(provider: effective, model: model)
                 installProviders(activeProviderID: providerID)
                 snapshot = try await router.setActive(providerID: providerID, model: model)
-                log("Sélection : \(provider.displayName) · \(model). Relance de ChatGPT/Codex…")
+                log(L("Sélection : %@ · %@. Relance de ChatGPT/Codex…", provider.displayName, model))
             }
             await runTest()
             await refreshUsage(for: providerID, force: false)
             refreshRunningApps()
             await relaunchChatGPT()
         } catch {
-            log("Select échouée: \(error.localizedDescription)")
+            log(L("Select échouée: %@", error.localizedDescription))
         }
     }
 
@@ -702,13 +709,13 @@ final class AppState: ObservableObject {
                 // provider catalog, avoiding a transient old-provider state.
                 _ = try configStore.applyOverride(provider: effective, model: model)
                 installProviders(activeProviderID: provider.id)
-                log("Modèle : \(model). Relance de ChatGPT/Codex…")
+                log(L("Modèle : %@. Relance de ChatGPT/Codex…", model))
                 await relaunchChatGPT()
             } else {
-                log("Modèle : \(model).")
+                log(L("Modèle : %@.", model))
             }
         } catch {
-            log("Changement de modèle échoué: \(error.localizedDescription)")
+            log(L("Changement de modèle échoué: %@", error.localizedDescription))
         }
     }
 
@@ -739,10 +746,10 @@ final class AppState: ObservableObject {
         ensureProxiesRunning()
         if targetID == snapshot.activeProviderID {
             installProviders(activeProviderID: targetID)
-            log("Modèles exposés (\(next.count)/\(modelSlots)) : \(next.joined(separator: ", ")). Relance de ChatGPT/Codex…")
+            log(L("Modèles exposés (%1$lld/%2$lld) : %3$@. Relance de ChatGPT/Codex…", next.count, modelSlots, next.joined(separator: ", ")))
             await relaunchChatGPT()
         } else {
-            log("Modèles exposés pour \(provider.displayName) : \(next.joined(separator: ", ")).")
+            log(L("Modèles exposés pour %@ : %@.", provider.displayName, next.joined(separator: ", ")))
         }
     }
 
@@ -765,37 +772,37 @@ final class AppState: ObservableObject {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if provider.id == "glm" {
             if trimmed.hasPrefix("sk-") {
-                log("Attention : cette clé commence par « sk- » (format DeepSeek/OpenRouter). Une clé Z.ai se présente comme ID.secret — elle sera quand même testée.")
+                log(L("Attention : cette clé commence par « sk- » (format DeepSeek/OpenRouter). Une clé Z.ai se présente comme ID.secret — elle sera quand même testée."))
             } else if !trimmed.contains(".") {
-                log("Attention : une clé Z.ai se présente comme ID.secret (ex. 6e6c…54d8.xxxx). La clé collée n'a pas ce format — elle sera quand même testée.")
+                log(L("Attention : une clé Z.ai se présente comme ID.secret (ex. 6e6c…54d8.xxxx). La clé collée n'a pas ce format — elle sera quand même testée."))
             }
         }
         // A common failure mode is pasting an OpenRouter key while another card
         // owns the shared key field. Refuse it instead of silently creating an
         // unusable credential under DeepSeek or GLM.
         if trimmed.hasPrefix("sk-or-v1-"), provider.id != "openrouter" {
-            log("Clé OpenRouter détectée dans le champ \(provider.displayName). Ouvrez la clé de la carte OpenRouter.")
+            log(L("Clé OpenRouter détectée dans le champ %@. Ouvrez la clé de la carte OpenRouter.", provider.displayName))
             editingProviderID = "openrouter"
             editingKey = true
             return
         }
         keyStore.setKey(value, for: provider.id)
         guard keyStore.hasKey(provider.id) else {
-            log("Échec : clé non enregistrée pour \(provider.displayName).")
+            log(L("Échec : clé non enregistrée pour %@.", provider.displayName))
             return
         }
         // A credential change must restart the managed proxy synchronously;
         // otherwise the running adapter would keep serving the previous key.
         log(keyStore.lastPersistenceError == nil
-            ? "Clé enregistrée pour \(provider.displayName). Activation…"
-            : "Clé en mémoire pour \(provider.displayName), mais écriture disque impossible : \(keyStore.lastPersistenceError!)")
+            ? L("Clé enregistrée pour %@. Activation…", provider.displayName)
+            : L("Clé en mémoire pour %@, mais écriture disque impossible : %@", provider.displayName, keyStore.lastPersistenceError!))
         Task { await refreshUsage(for: provider.id, force: true) }
         ensureProxiesRunning()
         applySelectionAfterKeyInjection = false
         applySelectionTargetID = nil
         await select(providerID: provider.id)
         guard snapshot.activeProviderID == provider.id else { return }
-        log("Clé \(provider.displayName) active · dernière tentative : consultez l’état du fournisseur.")
+        log(L("Clé %@ active · dernière tentative : consultez l’état du fournisseur.", provider.displayName))
     }
 
     func clearKey(for providerID: String? = nil) {
@@ -803,7 +810,7 @@ final class AppState: ObservableObject {
         let targetID = providerID ?? editingProviderID ?? snapshot.activeProviderID
         guard let provider = catalog[id: targetID] else { return }
         keyStore.clear(providerID: provider.id)
-        log("Clé effacée pour \(provider.displayName).")
+        log(L("Clé effacée pour %@.", provider.displayName))
     }
 
     /// Shows the key editor for a specific provider. Presented inline in the
@@ -852,8 +859,8 @@ final class AppState: ObservableObject {
             if provider.requiresKey && secret == nil {
                 await router.setCompatibility(
                     for: provider.id,
-                    state: .incompatible(reason: "Clé manquante"),
-                    error: "Saisissez la clé pour \(provider.displayName)."
+                    state: .incompatible(reason: L("Clé manquante")),
+                    error: L("Saisissez la clé pour %@.", provider.displayName)
                 )
                 continue
             }
@@ -869,7 +876,7 @@ final class AppState: ObservableObject {
                 )
             }
         }
-        log("Test de tous les providers : \(ok)/\(testable.count) connectés.")
+        log(L("Test de tous les providers : %1$lld/%2$lld connectés.", ok, testable.count))
     }
 
     // MARK: Launch Codex CLI (native: --profile + env-key; OpenAI = bare)
@@ -881,12 +888,12 @@ final class AppState: ObservableObject {
         guard !screenshotMode, let provider = activeProvider else { return }
         let key = keyStore.secret(for: provider.id)
         if provider.requiresKey && provider.id != "openai" && key == nil {
-            log("Saisir d'abord la clé pour \(provider.displayName).")
+            log(L("Saisir d'abord la clé pour %@.", provider.displayName))
             presentKeySheet()
             return
         }
         guard let binary = AppState.findCodexExecutable() else {
-            log("codex introuvable — installez le CLI Codex (npm i -g @openai/codex).")
+            log(L("codex introuvable — installez le CLI Codex (npm i -g @openai/codex)."))
             return
         }
         let profile = provider.id == "openai" ? nil : provider.id
@@ -911,9 +918,9 @@ final class AppState: ObservableObject {
         var error: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&error)
         if error == nil {
-            log("Codex CLI lancé dans Terminal (\(provider.displayName) · \(model)\(profile.map { ", profil \($0)" } ?? ", natif OpenAI")).")
+            log(L("Codex CLI lancé dans Terminal (%1$@ · %2$@%3$@).", provider.displayName, model, profile.map { L(", profil %@", $0) } ?? L(", natif OpenAI")))
         } else {
-            log("Lancement refusé (permission Automatisation). Autorisez AI Provider Switcher à contrôler Terminal.")
+            log(L("Lancement refusé (permission Automatisation). Autorisez AI Provider Switcher à contrôler Terminal."))
         }
     }
 
@@ -924,9 +931,9 @@ final class AppState: ObservableObject {
         do {
             _ = try keyStore.enablePersistence(at: KeyStore.defaultPersistentURL())
             persistenceEnabled = true
-            log("Persistance locale activée (0600, hors iCloud). Moins sûr que le Trousseau.")
+            log(L("Persistance locale activée (0600, hors iCloud). Moins sûr que le Trousseau."))
         } catch {
-            log("Persistence: \(error.localizedDescription)")
+            log(L("Persistence: %@", error.localizedDescription))
         }
     }
 
@@ -989,13 +996,13 @@ final class AppState: ObservableObject {
             let url = bundleIDs.lazy.compactMap { ws.urlForApplication(withBundleIdentifier: $0) }.first
                 ?? URL(fileURLWithPath: "/Applications/ChatGPT.app")
             guard FileManager.default.fileExists(atPath: url.path) else {
-                log("ChatGPT introuvable.")
+                log(L("ChatGPT introuvable."))
                 return
             }
             _ = try await ws.openApplication(at: url, configuration: config)
-            log("ChatGPT/Codex relancé — clés servies par les adaptateurs locaux.")
+            log(L("ChatGPT/Codex relancé — clés servies par les adaptateurs locaux."))
         } catch {
-            log("Relance échouée: \(error.localizedDescription)")
+            log(L("Relance échouée: %@", error.localizedDescription))
         }
         refreshRunningApps()
     }
@@ -1064,13 +1071,13 @@ final class AppState: ObservableObject {
                 } else {
                     let metadataURL = proxyMetadataURL(for: port)
                     if !FileManager.default.fileExists(atPath: metadataURL.path) {
-                        log("Port proxy \(port) déjà occupé pour \(provider.displayName) : processus externe conservé, redémarrage manuel nécessaire.")
+                        log(L("Port proxy %1$lld déjà occupé pour %2$@ : processus externe conservé, redémarrage manuel nécessaire.", port, provider.displayName))
                     }
                     continue
                 }
             }
             guard FileManager.default.fileExists(atPath: script.path) else {
-                log("Proxy manquant pour \(provider.displayName): \(script.path)")
+                log(L("Proxy manquant pour %@: %@", provider.displayName, script.path))
                 continue
             }
             let proc = Process()
@@ -1107,9 +1114,9 @@ final class AppState: ObservableObject {
                     provider: provider,
                     pid: proc.processIdentifier
                 )
-                log("Proxy local \(provider.displayName) démarré (port \(port)).")
+                log(L("Proxy local %@ démarré (port %lld).", provider.displayName, port))
             } catch {
-                log("Proxy \(provider.displayName) échoué: \(error.localizedDescription)")
+                log(L("Proxy %@ échoué: %@", provider.displayName, error.localizedDescription))
             }
         }
     }
@@ -1323,9 +1330,9 @@ final class AppState: ObservableObject {
                     providerID: "openai",
                     model: catalog[id: "openai"]?.defaultModel ?? model
                 )
-                log("Retour au natif détecté dans config.toml : \(model).")
+                log(L("Retour au natif détecté dans config.toml : %@.", model))
             } catch {
-                log("Revert config échoué: \(error.localizedDescription)")
+                log(L("Revert config échoué: %@", error.localizedDescription))
             }
             return
         }
@@ -1355,10 +1362,10 @@ final class AppState: ObservableObject {
             }
             if snapshot.activeProviderID != provider.id || snapshot.activeModel != resolved {
                 snapshot = try await router.setActive(providerID: provider.id, model: resolved)
-                log("Sélection synchronisée depuis Codex : \(provider.displayName) · \(resolved).")
+                log(L("Sélection synchronisée depuis Codex : %@ · %@.", provider.displayName, resolved))
             }
         } catch {
-            log("Sync config échouée: \(error.localizedDescription)")
+            log(L("Sync config échouée: %@", error.localizedDescription))
         }
     }
 

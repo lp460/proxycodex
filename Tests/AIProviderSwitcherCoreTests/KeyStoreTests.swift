@@ -97,6 +97,23 @@ final class KeyStoreTests: XCTestCase {
         XCTAssertTrue(store2.hasKey("openai"))
     }
 
+    func testPersistentUpsertDoesNotEraseAnotherInstanceEntry() throws {
+        let first = KeyStore()
+        let fileURL = tempDir.appendingPathComponent("providers.json")
+        try first.enablePersistence(at: fileURL)
+        first.setKey("sk-first-deepseek-000", for: "deepseek")
+
+        // A second menu-bar instance can be alive with an older in-memory set.
+        let second = KeyStore()
+        try second.enablePersistence(at: fileURL)
+        second.setKey("sk-second-go-0000000", for: "opencode-go")
+
+        let raw = try Data(contentsOf: fileURL)
+        let entries = try JSONDecoder().decode([KeyStore.PersistentEntry].self, from: raw)
+        XCTAssertEqual(Set(entries.map(\.providerID)), ["deepseek", "opencode-go"])
+        XCTAssertTrue(entries.contains { $0.providerID == "opencode-go" })
+    }
+
     func testClearRewritesFileWithoutKey() throws {
         let store = KeyStore()
         let fileURL = tempDir.appendingPathComponent("providers.json")

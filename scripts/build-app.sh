@@ -17,6 +17,8 @@ BUNDLE_NAME="AI Provider Switcher"
 INFO_PLIST="Resources/Info.plist"
 ENTITLEMENTS="Resources/AIProviderSwitcher.entitlements"
 BUILD_DIR="$REPO_ROOT/.build/release"
+SCRATCH_DIR="${AI_PROVIDER_SWITCHER_SCRATCH_DIR:-.build}"
+BUILD_DIR="$REPO_ROOT/$SCRATCH_DIR/release"
 OUT_DIR="$REPO_ROOT/build"
 APP_BUNDLE="$OUT_DIR/$EXEC.app"
 
@@ -34,7 +36,7 @@ for arg in "$@"; do
 done
 
 echo ">> Building release executable…"
-swift build -c release
+swift build -c release --scratch-path "$SCRATCH_DIR"
 
 BIN="$BUILD_DIR/$EXEC"
 if [[ ! -x "$BIN" ]]; then
@@ -50,6 +52,12 @@ mkdir -p "$ROOT/Contents/MacOS" "$ROOT/Contents/Resources"
 
 cp "$BIN" "$ROOT/Contents/MacOS/$EXEC"
 cp "$INFO_PLIST" "$ROOT/Contents/Info.plist"
+# SwiftPM emits localized resources in a resource bundle. Copy the language
+# directories directly next to Info.plist so Bundle.main can resolve them.
+RESOURCE_BUNDLE="$BUILD_DIR/${EXEC}_AIProviderSwitcher.bundle"
+for language_bundle in "$RESOURCE_BUNDLE"/*.lproj; do
+    [[ -d "$language_bundle" ]] && cp -R "$language_bundle" "$ROOT/Contents/Resources/"
+done
 # The adapter proxy must ship inside the bundle: an installed app cannot rely on
 # this checkout still being there.
 cp "$REPO_ROOT/Resources/provider-proxy.py" "$ROOT/Contents/Resources/provider-proxy.py"

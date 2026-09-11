@@ -72,7 +72,7 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
         lock.unlock()
         if let previous { SecretRegistry.shared.unregister(previous) }
         Log.info("Key loaded into memory for provider '\(providerID)' (len=\(new.length))")
-        writeToDiskIfNeeded()
+        persistUpsert(secret: new, providerID: providerID)
     }
 
     /// Whether a key is currently resident for the provider.
@@ -95,7 +95,7 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
         lock.unlock()
         if let removed { SecretRegistry.shared.unregister(removed) }
         Log.info("Key cleared and wiped for provider '\(providerID)'")
-        writeToDiskIfNeeded()
+        persistRemove(providerID: providerID)
     }
 
     /// Clears and wipes all resident keys.
@@ -107,7 +107,7 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
         lock.unlock()
         for s in removed { SecretRegistry.shared.unregister(s) }
         Log.info("All session keys cleared and wiped (\(removed.count))")
-        writeToDiskIfNeeded()
+        persistRemoveAll()
     }
 
     // MARK: - Optional local file persistence (0600, no iCloud)
@@ -213,6 +213,58 @@ public final class KeyStore: KeyResolver, @unchecked Sendable {
                 model: catalog?[id: id]?.defaultModel ?? ""
             )
         }
+    }
+
+    private func readPersistentEntries() -> [PersistentEntry]? {
+        guard let url = currentPersistenceURL(), isPersistenceEnabled(),
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return [] }
+        return try? JSONDecoder().decode([PersistentEntry].self, from: data)
+    }
+
+    private func writePersistentEntries(_ entries: [PersistentEntry]) {
+        guard let url = currentPersistenceURL(), isPersistenceEnabled() else { return }
+        do {
+            let json = try JSONEncoder().encode(entries)
+            try json.write(to: url, options: [.atomic])
+            try? applyRestrictivePermissions(at: url)
+            lastPersistenceError = nil
+        } catch {
+            lastPersistenceError = error.localizedDescription
+            Log.error("Failed to persist key update: \(error.localizedDescription)")
+        }
+    }
+
+    /// Update one provider without replacing entries written by another app
+    /// instance. OpenCode Go was disappearing when a second menu-bar instance
+    /// still held the older in-memory snapshot and rewrote the whole file.
+    private func persistUpsert(secret: Secret, providerID: String) {
+        guard currentPersistenceURL() != nil, isPersistenceEnabled() else { return }
+        var entries = readPersistentEntries() ?? []
+        let entry = PersistentEntry(
+            providerID: providerID,
+            key: secret.asString() ?? "",
+            baseURL: "",
+            model: ""
+        )
+        if let index = entries.firstIndex(where: { $0.providerID == providerID }) {
+            entries[index] = entry
+        } else {
+            entries.append(entry)
+        }
+        writePersistentEntries(entries)
+    }
+
+    private func persistRemove(providerID: String) {
+        guard currentPersistenceURL() != nil, isPersistenceEnabled() else { return }
+        guard var entries = readPersistentEntries() else { return }
+        entries.removeAll { $0.providerID == providerID }
+        writePersistentEntries(entries)
+    }
+
+    private func persistRemoveAll() {
+        guard currentPersistenceURL() != nil, isPersistenceEnabled() else { return }
+        writePersistentEntries([])
     }
 
     private func writeToDiskIfNeeded(catalog: ProviderCatalog? = nil) {

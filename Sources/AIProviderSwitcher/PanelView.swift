@@ -49,6 +49,8 @@ struct PanelView: View {
         }
         .frame(width: 540)
         .background(Color(nsColor: .windowBackgroundColor))
+        .environment(\.locale, Locale(identifier: state.language.rawValue))
+        .id(state.language)
     }
 
     // MARK: Header
@@ -65,7 +67,7 @@ struct PanelView: View {
             .frame(width: 40, height: 40)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("AI Provider Switcher")
+                Text(L("AI Provider Switcher"))
                     .font(.system(size: 15, weight: .semibold))
                 Text(activeSummary)
                     .font(.callout)
@@ -73,15 +75,49 @@ struct PanelView: View {
                     .lineLimit(1)
             }
             Spacer()
+            languagePicker
             statusBadge
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var languagePicker: some View {
+        HStack(spacing: 5) {
+            ForEach(AppLanguage.allCases) { language in
+                Button {
+                    state.setLanguage(language)
+                } label: {
+                    Text(language.flag)
+                        .font(.system(size: 14))
+                        .frame(width: 27, height: 24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(state.language == language ? Color.accentColor.opacity(0.16) : .clear)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .strokeBorder(
+                                    state.language == language ? Color.accentColor.opacity(0.50) : Color.secondary.opacity(0.14),
+                                    lineWidth: 1
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(state.language == language
+                      ? L("Langue actuelle : %@", language.accessibilityName)
+                      : L("Afficher en %@", language.accessibilityName))
+                .accessibilityLabel(Text(language.accessibilityName))
+                .accessibilityAddTraits(state.language == language ? .isSelected : [])
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Text(L("Langue")))
     }
 
     private var activeSummary: String {
-        let providerName = state.activeProvider?.displayName ?? "Provider"
+        let providerName = state.activeProvider?.displayName ?? L("Provider")
         guard !state.snapshot.activeModel.isEmpty else { return providerName }
         return "\(providerName) · \(state.snapshot.activeModel)"
     }
@@ -98,7 +134,7 @@ struct PanelView: View {
         .padding(.vertical, 4)
         .background(Capsule().fill(statusColor.opacity(0.14)))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("État de la configuration")
+        .accessibilityLabel(L("État de la configuration"))
         .accessibilityValue(statusLabel)
     }
 
@@ -113,8 +149,8 @@ struct PanelView: View {
     private var statusLabel: String {
         switch state.snapshot.compatibility {
         case .compatible: return "OK"
-        case .incompatible: return "Erreur"
-        case .untested: return state.isActiveNative ? "Native" : "Non testé"
+        case .incompatible: return L("Erreur")
+        case .untested: return state.isActiveNative ? L("Native") : L("Non testé")
         }
     }
 
@@ -122,7 +158,7 @@ struct PanelView: View {
 
     private var providerSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Fournisseur")
+            SectionHeader(L("Fournisseur"))
             LazyVGrid(columns: providerColumns, spacing: 10) {
                 ForEach(state.catalog.providers) { provider in
                     ProviderCard(
@@ -140,7 +176,7 @@ struct PanelView: View {
             }
 
             SecondaryInfoRow(
-                text: "Un clic applique la configuration et relance ChatGPT/Codex.",
+                text: L("Un clic applique la configuration et relance ChatGPT/Codex."),
                 symbol: "info.circle"
             )
         }
@@ -150,9 +186,9 @@ struct PanelView: View {
 
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Modèle")
+            SectionHeader(L("Modèle"))
 
-            Picker("Modèle", selection: Binding(
+            Picker(L("Modèle"), selection: Binding(
                 get: { state.snapshot.activeModel },
                 set: { newValue in Task { await state.setModel(newValue) } }
             )) {
@@ -168,7 +204,7 @@ struct PanelView: View {
 
             if let exposed = state.exposedModel {
                 SecondaryInfoRow(
-                    text: "Codex voit « \(exposed) » : contrat natif complet (outils, MCP, plugins).",
+                    text: L("Codex voit « %@ » : contrat natif complet (outils, MCP, plugins).", exposed),
                     symbol: "info.circle"
                 )
             }
@@ -207,7 +243,7 @@ struct PanelView: View {
                 }
 
                 SecondaryInfoRow(
-                    text: "Le modèle par défaut et le modèle actif restent verrouillés.",
+                    text: L("Le modèle par défaut et le modèle actif restent verrouillés."),
                     symbol: "lock.fill"
                 )
             }
@@ -215,7 +251,7 @@ struct PanelView: View {
             .padding(.leading, 2)
         } label: {
             HStack {
-                Text("Modèles exposés")
+                Text(L("Modèles exposés"))
                     .font(.callout.weight(.medium))
                     .foregroundStyle(.primary)
 
@@ -232,13 +268,13 @@ struct PanelView: View {
     private var catalogConflictNotice: some View {
         VStack(alignment: .leading, spacing: 5) {
             Label(
-                "Catalogue Codex personnalisé détecté",
+                L("Catalogue Codex personnalisé détecté"),
                 systemImage: "exclamationmark.triangle.fill"
             )
             .font(.callout.weight(.semibold))
             .foregroundStyle(.orange)
 
-            Text("La liste générée par Proxycodex n’est pas active.")
+            Text(L("La liste générée par Proxycodex n’est pas active."))
                 .font(.caption)
                 .foregroundStyle(.primary.opacity(0.82))
         }
@@ -248,14 +284,14 @@ struct PanelView: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(Color.orange.opacity(0.10))
         )
-        .accessibilityLabel("Avertissement : catalogue Codex personnalisé détecté")
+        .accessibilityLabel(L("Avertissement : catalogue Codex personnalisé détecté"))
     }
 
     // MARK: Quota & usage
 
     private var usageSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Quota & utilisation")
+            SectionHeader(L("Quota & utilisation"))
 
             if let provider = state.activeProvider {
                 UsageCard(
@@ -293,18 +329,18 @@ struct PanelView: View {
         DisclosureGroup(isExpanded: $journalExpanded) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Journal")
+                    Text(L("Journal"))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Effacer") { state.clearLogs() }
+                    Button(L("Effacer")) { state.clearLogs() }
                         .buttonStyle(.plain)
                         .controlSize(.small)
                         .foregroundStyle(.secondary)
                 }
 
                 if state.logs.isEmpty {
-                    Text("Aucun événement.")
+                    Text(L("Aucun événement."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -316,10 +352,10 @@ struct PanelView: View {
             .padding(.top, 10)
         } label: {
             HStack {
-                Text("Journal")
+                Text(L("Journal"))
                     .font(.callout.weight(.medium))
                 Spacer()
-                Text("\(state.logs.count) événements")
+                Text(L("%lld événements", state.logs.count))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -334,11 +370,11 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 12) {
             if state.editingKey {
                 SectionHeader(
-                    "Clé API",
+                    L("Clé API"),
                     accessory: state.keyEditingProvider?.displayName
                 )
             } else {
-                SectionHeader("Clé API")
+                SectionHeader(L("Clé API"))
             }
 
             if state.editingKey && !state.isScreenshotMode {
@@ -387,19 +423,19 @@ struct PanelView: View {
     }
 
     private var keyStatusText: String {
-        let providerName = state.activeProvider?.displayName ?? "ce provider"
+        let providerName = state.activeProvider?.displayName ?? L("ce provider")
         if state.activeProvider?.isKeyless == true || state.isActiveNative {
-            return "Aucune clé requise"
+            return L("Aucune clé requise")
         }
         return state.hasKeyForActive
-            ? "Clé enregistrée pour \(providerName)"
-            : "Aucune clé pour \(providerName)"
+            ? L("Clé enregistrée pour %@", providerName)
+            : L("Aucune clé pour %@", providerName)
     }
 
     private var keyActionButtonTitle: String {
         state.activeProvider?.isKeyless == true || state.isActiveNative
-            ? "Modifier"
-            : (state.hasKeyForActive ? "Modifier" : "Ajouter une clé")
+            ? L("Modifier")
+            : (state.hasKeyForActive ? L("Modifier") : L("Ajouter une clé"))
     }
 
     /// Inline key editor. A `.sheet` would close the MenuBarExtra window, so the
@@ -434,25 +470,25 @@ struct PanelView: View {
             )
 
             if let provider = state.keyEditingProvider {
-                Text("Cible : \(provider.displayName)")
+                Text(L("Cible : %@", provider.displayName))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             HStack(spacing: 8) {
-                Button("Coller") { pasteKey() }
+                Button(L("Coller")) { pasteKey() }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
 
                 if let provider = state.keyEditingProvider, state.hasKey(for: provider.id) {
-                    Button("Voir la clé") { showExistingKey() }
+                    Button(L("Voir la clé")) { showExistingKey() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
 
                 Spacer(minLength: 8)
 
-                Button("Annuler") {
+                Button(L("Annuler")) {
                     draftKey = ""
                     state.dismissKeyEditor()
                 }
@@ -460,7 +496,7 @@ struct PanelView: View {
                 .controlSize(.small)
                 .foregroundStyle(.secondary)
 
-                Button("Injecter") { injectKey() }
+                Button(L("Injecter")) { injectKey() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(trimmedKey.isEmpty || misroutedOpenRouterKey)
@@ -476,14 +512,14 @@ struct PanelView: View {
             let trimmed = trimmedKey
             if trimmed.hasPrefix("sk-") {
                 Label(
-                    "Format DeepSeek/OpenRouter détecté — une clé Z.ai est de la forme ID.secret.",
+                    L("Format DeepSeek/OpenRouter détecté — une clé Z.ai est de la forme ID.secret."),
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
                 .foregroundStyle(.orange)
             } else if !trimmed.isEmpty && !trimmed.contains(".") {
                 Label(
-                    "Format attendu : ID.secret (la clé Z.ai contient un point).",
+                    L("Format attendu : ID.secret (la clé Z.ai contient un point)."),
                     systemImage: "info.circle.fill"
                 )
                 .font(.caption)
@@ -495,7 +531,7 @@ struct PanelView: View {
            let provider = state.keyEditingProvider,
            provider.id != "openrouter" {
             Label(
-                "Clé OpenRouter détectée dans le champ \(provider.displayName). Utilisez la clé de la carte OpenRouter.",
+                L("Clé OpenRouter détectée dans le champ %@. Utilisez la clé de la carte OpenRouter.", provider.displayName),
                 systemImage: "exclamationmark.triangle.fill"
             )
             .font(.caption)
@@ -507,28 +543,28 @@ struct PanelView: View {
 
     private var launchSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader("Ouvrir")
+            SectionHeader(L("Ouvrir"))
 
             Button {
                 state.launchCodexCLI()
             } label: {
-                Label("Lancer Codex CLI", systemImage: "terminal.fill")
+                Label(L("Lancer Codex CLI"), systemImage: "terminal.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .help("Lance Codex avec revue automatique des approbations (workspace-write) et la clé du provider actif")
+            .help(L("Lance Codex avec revue automatique des approbations (workspace-write) et la clé du provider actif"))
             .disabled(state.isScreenshotMode)
 
             Button {
                 Task { await state.relaunchChatGPT() }
             } label: {
-                Label("Relancer ChatGPT / Codex", systemImage: "arrow.counterclockwise")
+                Label(L("Relancer ChatGPT / Codex"), systemImage: "arrow.counterclockwise")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
-            .help("Redémarre l'app ChatGPT pour appliquer les clés injectées au sélecteur de modèles")
+            .help(L("Redémarre l'app ChatGPT pour appliquer les clés injectées au sélecteur de modèles"))
             .disabled(state.isScreenshotMode)
         }
     }
@@ -541,9 +577,9 @@ struct PanelView: View {
                         Task { await state.runAllTests() }
                     } label: {
                         if state.testing {
-                            Label("Test en cours…", systemImage: "hourglass")
+                            Label(L("Test en cours…"), systemImage: "hourglass")
                         } else {
-                            Label("Tester tous", systemImage: "checkmark.shield")
+                            Label(L("Tester tous"), systemImage: "checkmark.shield")
                         }
                     }
                     .buttonStyle(.bordered)
@@ -554,19 +590,19 @@ struct PanelView: View {
                         Task { await state.refreshModels() }
                     } label: {
                         Label(
-                            state.refreshingModels ? "Lecture…" : "Rafraîchir les modèles",
+                            state.refreshingModels ? L("Lecture…") : L("Rafraîchir les modèles"),
                             systemImage: "arrow.triangle.2.circlepath"
                         )
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("Demande à chaque provider la liste des modèles qu'il sert réellement")
+                    .help(L("Demande à chaque provider la liste des modèles qu'il sert réellement"))
                     .disabled(state.refreshingModels || state.isScreenshotMode)
 
                     Button {
                         Task { await state.refreshAllUsage() }
                     } label: {
-                        Label("Actualiser tous les quotas", systemImage: "gauge.with.needle")
+                        Label(L("Actualiser tous les quotas"), systemImage: "gauge.with.needle")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -585,12 +621,12 @@ struct PanelView: View {
             .padding(.top, 10)
         } label: {
             HStack {
-                Text("Maintenance")
+                Text(L("Maintenance"))
                     .font(.callout.weight(.medium))
                     .foregroundStyle(.primary)
 
                 Spacer()
-                Text("Diagnostics")
+                Text(L("Diagnostics"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -601,7 +637,7 @@ struct PanelView: View {
 
     private var openCodeStatus: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("OpenCode")
+            Text(L("OpenCode"))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
 
@@ -615,27 +651,27 @@ struct PanelView: View {
 
     private var openCodeStatusText: String {
         guard let install = state.openCode else {
-            return "CLI non détectée · saisissez une clé Zen, ou exécutez `opencode auth login`"
+            return L("CLI non détectée · saisissez une clé Zen, ou exécutez `opencode auth login`")
         }
 
         let version = install.version.map { "CLI \($0)" } ?? "CLI"
         if state.hasKey(for: "opencode") {
-            let go = state.hasKey(for: "opencode-go") ? " · clé Go enregistrée" : ""
-            return "\(version) détectée · clé Zen enregistrée\(go)"
+            let go = state.hasKey(for: "opencode-go") ? L(" · clé Go enregistrée") : ""
+            return "\(version) " + L("détectée") + " · " + L("clé Zen enregistrée") + go
         }
-        let zen = install.hasZenCredential ? "clé Zen réutilisée" : "pas de clé Zen"
-        let go = state.hasKey(for: "opencode-go") ? "clé Go enregistrée" : "pas de clé Go"
-        return "\(version) détectée · \(zen) · \(go)"
+        let zen = install.hasZenCredential ? L("clé Zen réutilisée") : L("pas de clé Zen")
+        let go = state.hasKey(for: "opencode-go") ? L("clé Go enregistrée") : L("pas de clé Go")
+        return "\(version) " + L("détectée") + " · \(zen) · \(go)"
     }
 
     private var modelSourceText: String {
-        if state.testing { return "Test en cours…" }
+        if state.testing { return L("Test en cours…") }
         guard let date = state.lastModelRefresh else {
-            return "Modèles : listes déclarées. « Rafraîchir » interroge chaque provider."
+            return L("Modèles : listes déclarées. « Rafraîchir » interroge chaque provider.")
         }
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
-        return "Dernière synchronisation : \(formatter.string(from: date)). Données interrogées auprès des providers ; Codex expose ses propres slugs."
+        return L("Dernière synchronisation : %@. Données interrogées auprès des providers ; Codex expose ses propres slugs.", formatter.string(from: date))
     }
     // MARK: Footer
 
@@ -661,18 +697,18 @@ struct PanelView: View {
             }
 
             HStack(spacing: 12) {
-                Toggle("Mémoriser les clés localement", isOn: Binding(
+                Toggle(L("Mémoriser les clés localement"), isOn: Binding(
                     get: { state.persistenceEnabled },
                     set: { on in on ? state.enablePersistence() : state.disablePersistence() }
                 ))
                 .font(.callout)
                 .toggleStyle(.checkbox)
-                .help("Fichier local avec permissions 0600, exclu d’iCloud")
+                .help(L("Fichier local avec permissions 0600, exclu d’iCloud"))
                 .disabled(state.isScreenshotMode)
 
                 Spacer(minLength: 10)
 
-                Button("Quitter") { NSApplication.shared.terminate(nil) }
+                Button(L("Quitter")) { NSApplication.shared.terminate(nil) }
                     .buttonStyle(.plain)
                     .keyboardShortcut("q")
                     .controlSize(.small)
@@ -739,12 +775,12 @@ struct PanelView: View {
     /// `ID.secret`, everything else in this app is `sk-…`.
     private var keyPlaceholder: String {
         guard let provider = state.keyEditingProvider else { return "sk-…" }
-        if state.hasKey(for: provider.id) { return "Clé existante — tapez pour remplacer" }
+        if state.hasKey(for: provider.id) { return L("Clé existante — tapez pour remplacer") }
         switch provider.id {
-        case "glm": return "ID.secret (clé Z.ai, ex. 6e6c…54d8.xxxx)"
-        case "opencode": return "sk-… (optionnelle — la clé Zen remplace le palier gratuit)"
-        case "opencode-go": return "sk-… (clé Go — requise, abonnement OpenCode Go)"
-        case "claude": return "sk-ant-… (optionnelle — sinon Claude Code/ANTHROPIC_AUTH_TOKEN)"
+        case "glm": return L("ID.secret (clé Z.ai, ex. 6e6c…54d8.xxxx)")
+        case "opencode": return L("sk-… (optionnelle — la clé Zen remplace le palier gratuit)")
+        case "opencode-go": return L("sk-… (clé Go — requise, abonnement OpenCode Go)")
+        case "claude": return L("sk-ant-… (optionnelle — sinon Claude Code/ANTHROPIC_AUTH_TOKEN)")
         default: return "sk-…"
         }
     }
@@ -780,7 +816,7 @@ private struct UsageCard: View {
                     HStack(spacing: 5) {
                         Image(systemName: "arrow.triangle.2.circlepath")
                             .foregroundStyle(isRefreshing ? Color.secondary : Color.accentColor)
-                        Text(isRefreshing ? "Actualisation…" : "Actualiser")
+                        Text(isRefreshing ? L("Actualisation…") : L("Actualiser"))
                     }
                 }
                 .buttonStyle(.bordered)
@@ -793,7 +829,7 @@ private struct UsageCard: View {
 
                 if !isRefreshing, snapshot.hasUsefulData, let errorMessage {
                     Label {
-                        Text("\(errorMessage) · dernière donnée conservée.")
+                        Text(L("%@ · dernière donnée conservée.", errorMessage))
                             .fixedSize(horizontal: false, vertical: true)
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -803,18 +839,18 @@ private struct UsageCard: View {
                 }
 
                 HStack(spacing: 4) {
-                    Text("Mis à jour")
+                    Text(L("Mis à jour"))
                         .foregroundStyle(.secondary)
                     Text(snapshot.fetchedAt, style: .relative)
                         .foregroundStyle(.secondary)
                 }
                 .font(.caption2.monospacedDigit())
             } else if isRefreshing {
-                Label("Actualisation…", systemImage: "hourglass")
+                Label(L("Actualisation…"), systemImage: "hourglass")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                Text("Quota indisponible")
+                Text(L("Quota indisponible"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -836,7 +872,7 @@ private struct UsageCard: View {
         VStack(alignment: .leading, spacing: 10) {
             if let balance = snapshot.balance {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(balance.available == nil && balance.used != nil ? "Consommation connue" : balance.label)
+                    Text(balance.available == nil && balance.used != nil ? L("Consommation connue") : balance.label)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(UsageFormatting.currency(balance.available ?? balance.used, code: balance.currency))
@@ -878,19 +914,19 @@ private struct UsageCard: View {
 
     private static func statusTitle(_ status: ProviderUsageStatus) -> String {
         switch status {
-        case .authenticationRequired: return "Clé requise"
-        case .unsupported: return "Non exposé"
-        case .unavailable: return "Indisponible"
-        case .failed: return "Impossible d'actualiser"
-        case .available: return "Aucune donnée"
+        case .authenticationRequired: return L("Clé requise")
+        case .unsupported: return L("Non exposé")
+        case .unavailable: return L("Indisponible")
+        case .failed: return L("Impossible d'actualiser")
+        case .available: return L("Aucune donnée")
         }
     }
 
     private static func statusNote(_ status: ProviderUsageStatus) -> String? {
         switch status {
-        case .authenticationRequired: return "Ajoutez la clé provider pour lire le quota."
-        case .unavailable: return "Le provider n'a pas fourni de valeur utilisable."
-        case .failed: return "Dernière donnée conservée si disponible ; détail dans le journal."
+        case .authenticationRequired: return L("Ajoutez la clé provider pour lire le quota.")
+        case .unavailable: return L("Le provider n'a pas fourni de valeur utilisable.")
+        case .failed: return L("Dernière donnée conservée si disponible ; détail dans le journal.")
         case .unsupported, .available: return nil
         }
     }
@@ -921,7 +957,7 @@ private struct UsageWindowRow: View {
 
     private var remainingText: String {
         guard let remaining = window.remainingPercent else { return "—" }
-        return "\(Int(remaining.rounded())) % restant"
+        return L("%lld %% restant", Int(remaining.rounded()))
     }
 
     private var color: Color {
@@ -935,11 +971,11 @@ private struct UsageWindowRow: View {
         if let reset = window.resetsAt {
             let interval = reset.timeIntervalSinceNow
             if interval > 0 {
-                return "Reset \(UsageFormatting.relativeCountdown(reset)) · \(UsageFormatting.clock(reset))"
+                return L("Reset %@ · %@", UsageFormatting.relativeCountdown(reset), UsageFormatting.clock(reset))
             }
-            return "Reset \(UsageFormatting.clock(reset))"
+            return L("Reset %@", UsageFormatting.clock(reset))
         }
-        return window.detail ?? "Reset non exposé"
+        return window.detail ?? L("Reset non exposé")
     }
 }
 
@@ -957,7 +993,7 @@ private struct UsageProgressBar: View {
         }
         .frame(height: 5)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Quota restant")
+        .accessibilityLabel(L("Quota restant"))
         .accessibilityValue(remainingText)
     }
 
@@ -973,7 +1009,7 @@ private struct UsageProgressBar: View {
     }
 
     private var remainingText: String {
-        guard let remainingPercent else { return "inconnu" }
+        guard let remainingPercent else { return L("inconnu") }
         return "\(Int(remainingPercent.rounded())) %"
     }
 }
@@ -1032,18 +1068,18 @@ private struct UsageMiniCard: View {
     }
 
     private var summary: String {
-        guard let snapshot else { return "Aucune donnée" }
+        guard let snapshot else { return L("Aucune donnée") }
         if let window = snapshot.windows.first, let remaining = window.remainingPercent {
-            return "\(Int(remaining.rounded())) % · \(window.label)"
+            return L("%lld %% · %@", Int(remaining.rounded()), window.label)
         }
         if let available = snapshot.balance?.available {
             return UsageFormatting.currency(available, code: snapshot.balance?.currency ?? "USD")
         }
         switch snapshot.status {
-        case .authenticationRequired: return "Clé requise"
-        case .unsupported: return provider.id == "ollama" ? "Local" : "Non exposé"
-        case .unavailable, .failed: return "Indisponible"
-        case .available: return snapshot.note?.isEmpty == false ? snapshot.note! : "Aucune donnée"
+        case .authenticationRequired: return L("Clé requise")
+        case .unsupported: return provider.id == "ollama" ? L("Local") : L("Non exposé")
+        case .unavailable, .failed: return L("Indisponible")
+        case .available: return snapshot.note?.isEmpty == false ? snapshot.note! : L("Aucune donnée")
         }
     }
 }
@@ -1083,13 +1119,13 @@ enum UsageFormatting {
     static func balanceDetail(_ balance: UsageBalance) -> String? {
         var parts: [String] = []
         if let toppedUp = balance.toppedUp {
-            parts.append("\(currency(toppedUp, code: balance.currency)) rechargés")
+            parts.append(L("%@ rechargés", currency(toppedUp, code: balance.currency)))
         }
         if let granted = balance.granted {
-            parts.append("\(currency(granted, code: balance.currency)) offerts")
+            parts.append(L("%@ offerts", currency(granted, code: balance.currency)))
         }
         if let total = balance.total {
-            parts.append("sur \(currency(total, code: balance.currency))")
+            parts.append(L("sur %@", currency(total, code: balance.currency)))
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -1104,11 +1140,11 @@ enum UsageFormatting {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         if Calendar.current.isDateInTomorrow(date) {
-            return "demain \(formatter.string(from: date))"
+            return L("demain %@", formatter.string(from: date))
         }
         if Calendar.current.isDate(date, equalTo: .now, toGranularity: .weekOfYear) {
             formatter.setLocalizedDateFormatFromTemplate("EEE")
-            return "\(formatter.string(from: date)) \(shortTime.string(from: date))"
+            return L("%1$@ %2$@", formatter.string(from: date), shortTime.string(from: date))
         }
         return shortTime.string(from: date)
     }
@@ -1122,12 +1158,12 @@ enum UsageFormatting {
     static func relativeCountdown(_ date: Date) -> String {
         let components = Calendar.current.dateComponents([.day, .hour, .minute], from: .now, to: date)
         if let day = components.day, day > 0 {
-            return "dans \(day) j \(components.hour ?? 0) h"
+            return L("dans %1$lld j %2$lld h", day, components.hour ?? 0)
         }
         if let hour = components.hour, hour > 0 {
-            return "dans \(hour) h \(components.minute ?? 0) min"
+            return L("dans %1$lld h %2$lld min", hour, components.minute ?? 0)
         }
-        return "dans \(max(0, components.minute ?? 0)) min"
+        return L("dans %lld min", max(0, components.minute ?? 0))
     }
 }
 
@@ -1246,8 +1282,8 @@ struct ProviderCard: View {
         .buttonStyle(.plain)
         .accessibilityAddTraits(.isButton)
         .accessibilityLabel("\(provider.displayName), \(detailText)")
-        .accessibilityHint(isActive ? "Provider actif" : "Activer ce provider")
-        .help(isActive ? "Provider actif : \(provider.displayName)" : "Activer \(provider.displayName)")
+        .accessibilityHint(isActive ? L("Provider actif") : L("Activer ce provider"))
+        .help(isActive ? L("Provider actif : %@", provider.displayName) : L("Activer %@", provider.displayName))
         .disabled(isInteractionDisabled)
     }
 
@@ -1269,7 +1305,7 @@ struct ProviderCard: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 14))
                 .foregroundStyle(Color.accentColor)
-                .accessibilityLabel("Provider actif")
+                .accessibilityLabel(L("Provider actif"))
         } else {
             Circle()
                 .fill(statusDotColor)
@@ -1291,8 +1327,8 @@ struct ProviderCard: View {
         }
         .buttonStyle(.plain)
         .onHover { isKeyHovered = $0 }
-        .accessibilityLabel(hasKey ? "Modifier la clé \(provider.displayName)" : "Saisir la clé \(provider.displayName)")
-        .help(hasKey ? "Modifier la clé \(provider.displayName)" : "Saisir la clé \(provider.displayName)")
+        .accessibilityLabel(hasKey ? L("Modifier la clé %@", provider.displayName) : L("Saisir la clé %@", provider.displayName))
+        .help(hasKey ? L("Modifier la clé %@", provider.displayName) : L("Saisir la clé %@", provider.displayName))
         .disabled(isInteractionDisabled)
     }
 
@@ -1316,11 +1352,11 @@ struct ProviderCard: View {
     }
 
     private var detailText: String {
-        if !hasKey && provider.requiresKey { return "Clé manquante" }
+        if !hasKey && provider.requiresKey { return L("Clé manquante") }
         switch status {
-        case .compatible: return "Connecté"
-        case .incompatible(let reason): return "Erreur · \(reason)"
-        case .untested: return "Non testé"
+        case .compatible: return L("Connecté")
+        case .incompatible(let reason): return L("Erreur · %@", reason)
+        case .untested: return L("Non testé")
         }
     }
 
