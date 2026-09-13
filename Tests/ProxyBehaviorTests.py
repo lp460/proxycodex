@@ -177,6 +177,48 @@ class ProxyBehaviorTests(unittest.TestCase):
         # Unknown slugs are not invented away either.
         self.assertEqual(self.proxy.upstream_model("gpt-9"), "gpt-9")
 
+    def test_no_tools_note_uses_a_portable_role(self):
+        req, _, _, _ = self.proxy.prepare_upstream_request({
+            "model": "model",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        })
+        self.assertEqual(req["input"][-1]["role"], "system")
+        chat = self.proxy.responses_to_chat(req)
+        self.assertEqual([message["role"] for message in chat["messages"]],
+                         ["system", "user"])
+        self.assertNotIn("developer", json.dumps(chat))
+
+    def test_developer_history_is_folded_into_system_for_chat_upstreams(self):
+        chat = self.proxy.responses_to_chat({
+            "model": "model",
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "follow this"}],
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            }],
+        })
+        self.assertEqual(chat["messages"][0], {
+            "role": "system",
+            "content": "follow this",
+        })
+        self.assertEqual(chat["messages"][1]["role"], "user")
+
+    def test_developer_history_is_normalized_before_responses_relay(self):
+        req, _, _, _ = self.proxy.prepare_upstream_request({
+            "model": "model",
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "follow this"}],
+            }],
+            "tools": [{"type": "function", "name": "read_file"}],
+        })
+        self.assertEqual(req["input"][0]["role"], "system")
+
     def test_masquerade_catalog_uses_native_slugs_and_flavor(self):
         models = json.loads(self.proxy.models_response())["models"]
         self.assertEqual([m["slug"] for m in models], ["gpt-5.6-sol", "gpt-5.5"])
@@ -538,6 +580,28 @@ trust_level = "trusted"
         blocks = self.proxy.responses_to_anthropic(body)["messages"][0]["content"]
         self.assertEqual(blocks[1], {"type": "image", "source": {
             "type": "base64", "media_type": "image/png", "data": "QUJD"}})
+
+    def test_chat_upstreams_never_receive_responses_image_parts(self):
+        body = {
+            "model": "model",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "describe this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ]}],
+        }
+        chat = self.proxy.responses_to_chat(body)
+        self.assertEqual(chat["messages"][0]["content"][1], {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        })
+        direct = self.proxy.normalize_chat_request({
+            "messages": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ]}],
+        })
+        self.assertEqual(direct["messages"][0]["content"][0]["type"], "image_url")
+        self.assertNotIn("input_image", json.dumps(chat))
+        self.assertNotIn("input_image", json.dumps(direct))
 
     def test_web_search_maps_to_the_anthropic_server_tool(self):
         original = self.proxy.SUPPORTS_WEB_SEARCH
