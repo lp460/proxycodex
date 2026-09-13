@@ -90,6 +90,24 @@ final class CompatibilityCheckerTests: XCTestCase {
         XCTAssertTrue(mock.recorded.isEmpty, "no request should be spent without a key")
     }
 
+    func testCompatibilityMessagesUseInjectedLocalizer() async throws {
+        let translations = [
+            "Clé manquante pour %@.": "Missing key for %@."
+        ]
+        let checker = CompatibilityChecker(
+            client: MockHTTPClient(responses: []),
+            localize: { translations[$0] ?? $0 }
+        )
+        let provider = ProviderCatalog.default[id: "openrouter"]!
+        let result = try await checker.check(provider: provider, secret: nil)
+
+        if case .incompatible(let reason) = result.state {
+            XCTAssertEqual(reason, "Missing key for OpenRouter.")
+        } else {
+            XCTFail("expected missing-key incompatibility")
+        }
+    }
+
     /// OpenCode Zen answers 2xx with an error envelope on a restricted free
     /// tier; a 2xx must not be reported as connected.
     func test200WithGenericErrorEnvelopeIsIncompatible() async throws {

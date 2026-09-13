@@ -803,7 +803,7 @@ private struct UsageCard: View {
                     Text(provider.displayName)
                         .font(.callout.weight(.semibold))
                     if let plan = snapshot?.planLabel {
-                        Text(plan)
+                        Text(L(plan))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -873,7 +873,11 @@ private struct UsageCard: View {
         VStack(alignment: .leading, spacing: 10) {
             if let balance = snapshot.balance {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(balance.available == nil && balance.used != nil ? L("Consommation connue") : balance.label)
+                    Text(L(
+                        balance.available == nil && balance.used != nil
+                            ? "Consommation connue"
+                            : balance.label
+                    ))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(UsageFormatting.currency(balance.available ?? balance.used, code: balance.currency))
@@ -893,7 +897,7 @@ private struct UsageCard: View {
 
             if !snapshot.windows.isEmpty || snapshot.balance != nil {
                 if let note = snapshot.note, !note.isEmpty {
-                    Text(note)
+                    Text(L(note))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -903,7 +907,7 @@ private struct UsageCard: View {
                     Text(Self.statusTitle(snapshot.status))
                         .font(.callout.weight(.medium))
                     if let note = snapshot.note ?? Self.statusNote(snapshot.status) {
-                        Text(note)
+                        Text(L(note))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -939,7 +943,7 @@ private struct UsageWindowRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
-                Text(window.label)
+                Text(L(window.label))
                     .font(.callout.weight(.medium))
                 Spacer()
                 Text(remainingText)
@@ -976,7 +980,7 @@ private struct UsageWindowRow: View {
             }
             return L("Reset %@", UsageFormatting.clock(reset))
         }
-        return window.detail ?? L("Reset non exposé")
+        return L(window.detail ?? "Reset non exposé")
     }
 }
 
@@ -1071,7 +1075,7 @@ private struct UsageMiniCard: View {
     private var summary: String {
         guard let snapshot else { return L("Aucune donnée") }
         if let window = snapshot.windows.first, let remaining = window.remainingPercent {
-            return L("%lld %% · %@", Int(remaining.rounded()), window.label)
+            return L("%lld %% · %@", Int(remaining.rounded()), L(window.label))
         }
         if let available = snapshot.balance?.available {
             return UsageFormatting.currency(available, code: snapshot.balance?.currency ?? "USD")
@@ -1080,7 +1084,7 @@ private struct UsageMiniCard: View {
         case .authenticationRequired: return L("Clé requise")
         case .unsupported: return provider.id == "ollama" ? L("Local") : L("Non exposé")
         case .unavailable, .failed: return L("Indisponible")
-        case .available: return snapshot.note?.isEmpty == false ? snapshot.note! : L("Aucune donnée")
+        case .available: return snapshot.note?.isEmpty == false ? L(snapshot.note!) : L("Aucune donnée")
         }
     }
 }

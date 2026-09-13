@@ -24,10 +24,16 @@ public struct CompatibilityResult: Sendable, Equatable {
 public final class CompatibilityChecker: Sendable {
     public let client: HTTPClient
     public let timeout: TimeInterval
+    public let localize: @Sendable (String) -> String
 
-    public init(client: HTTPClient = URLSessionHTTPClient(), timeout: TimeInterval = 12) {
+    public init(
+        client: HTTPClient = URLSessionHTTPClient(),
+        timeout: TimeInterval = 12,
+        localize: @escaping @Sendable (String) -> String = { $0 }
+    ) {
         self.client = client
         self.timeout = timeout
+        self.localize = localize
     }
 
     public func check(provider: Provider, secret: Secret?) async throws -> CompatibilityResult {
@@ -35,7 +41,7 @@ public final class CompatibilityChecker: Sendable {
         // directly instead of spending a round trip that returns a 401.
         if provider.requiresKey, secret?.asString()?.isEmpty != false {
             return CompatibilityResult(
-                state: .incompatible(reason: "Clé manquante pour \(provider.displayName)."),
+                state: .incompatible(reason: localized("Clé manquante pour %@.", provider.displayName)),
                 detail: "no key"
             )
         }
@@ -80,7 +86,10 @@ public final class CompatibilityChecker: Sendable {
             (response, data) = try await client.send(request)
         } catch {
             let reason = throughProxy
-                ? "Adaptateur local arrêté pour \(provider.displayName) : lancez l'app puis réessayez."
+                ? localized(
+                    "Adaptateur local arrêté pour %@ : lancez l'app puis réessayez.",
+                    provider.displayName
+                )
                 : "Cannot reach \(provider.displayName): \(error.localizedDescription)"
             return CompatibilityResult(state: .incompatible(reason: reason), detail: error.localizedDescription)
         }
@@ -94,7 +103,11 @@ public final class CompatibilityChecker: Sendable {
             Log.info("Compatibility probe for \(provider.displayName) -> embedded auth failure (HTTP \(code))")
             return CompatibilityResult(
                 state: .incompatible(reason: Self.userFacingFailure(
-                    providerDisplayName: provider.displayName, code: code, failure: failure)),
+                    providerDisplayName: provider.displayName,
+                    code: code,
+                    failure: failure,
+                    localize: localize
+                )),
                 detail: "HTTP \(code) auth"
             )
         }
@@ -112,7 +125,9 @@ public final class CompatibilityChecker: Sendable {
         case 401, 403:
             let detail = Self.embeddedErrorMessage(data: data) ?? "HTTP \(code)"
             return CompatibilityResult(
-                state: .incompatible(reason: "\(provider.displayName) a refusé la clé : \(detail)"),
+                state: .incompatible(
+                    reason: localized("%@ a refusé la clé : %@", provider.displayName, detail)
+                ),
                 detail: "HTTP \(code)"
             )
         case 404, 405:
@@ -124,7 +139,9 @@ public final class CompatibilityChecker: Sendable {
             if code >= 500 {
                 let detail = Self.embeddedErrorMessage(data: data) ?? "HTTP \(code)"
                 return CompatibilityResult(
-                    state: .incompatible(reason: "\(provider.displayName) : erreur serveur — \(detail)"),
+                    state: .incompatible(
+                        reason: localized("%@ : erreur serveur — %@", provider.displayName, detail)
+                    ),
                     detail: "HTTP \(code)"
                 )
             }
@@ -186,12 +203,28 @@ public final class CompatibilityChecker: Sendable {
     static func userFacingFailure(
         providerDisplayName: String,
         code: Int,
-        failure: (code: String?, message: String?)
+        failure: (code: String?, message: String?),
+        localize: @Sendable (String) -> String = { $0 }
     ) -> String {
-        let detail = failure.message ?? "erreur \(failure.code ?? String(code))"
+        let detail = failure.message
+            ?? String(format: localize("erreur %@"), failure.code ?? String(code))
         if failure.code == "402" || code == 402 {
-            return "\(providerDisplayName) a refusé la requête : crédit ou budget de sortie insuffisant — \(detail)"
+            return String(
+                format: localize("%@ a refusé la requête : crédit ou budget de sortie insuffisant — %@"),
+                providerDisplayName,
+                detail
+            )
         }
-        return "\(providerDisplayName) a refusé la clé : \(detail)"
+        return String(
+            format: localize("%@ a refusé la clé : %@"),
+            providerDisplayName,
+            detail
+        )
+    }
+
+    private func localized(_ key: String, _ arguments: CVarArg...) -> String {
+        let format = localize(key)
+        guard !arguments.isEmpty else { return format }
+        return String(format: format, arguments: arguments)
     }
 }

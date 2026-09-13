@@ -25,12 +25,12 @@ final class AppState: ObservableObject {
     /// Providers, with model lists refreshed from what each provider answers.
     @Published private(set) var catalog = ProviderCatalog.default
     let keyStore = KeyStore()
-    let checker = CompatibilityChecker()
+    let checker = CompatibilityChecker(localize: { L($0) })
     let configStore = CodexConfigStore()
     let discovery = ModelDiscovery()
     let discoveredStore = DiscoveredModelStore(url: DiscoveredModelStore.defaultURL())
     let selectionStore = ModelSelectionStore(url: ModelSelectionStore.defaultURL())
-    let usageService = ProviderUsageService(timeout: 6)
+    let usageService = ProviderUsageService(timeout: 6, localize: { L($0) })
     private var discovered: [String: DiscoveredModels] = [:]
     /// Per-provider subset of models exposed through Codex's finite native
     /// slugs, as chosen by the user. Absent = keep the provider's first models.
@@ -210,8 +210,9 @@ final class AppState: ObservableObject {
             usageErrors[providerID] = nil
             log(usageLogMessage(snapshot))
         } catch {
-            let description = (error as? LocalizedError)?.errorDescription
+            let rawDescription = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
+            let description = L(rawDescription)
             if providerUsage[providerID] == nil {
                 providerUsage[providerID] = ProviderUsageSnapshot(
                     providerID: providerID,
@@ -219,7 +220,11 @@ final class AppState: ObservableObject {
                 )
             }
             usageErrors[providerID] = description
-            log("Échec lecture quota \(provider.displayName) : \(description). Dernière donnée conservée si disponible.")
+            log(L(
+                "Échec lecture quota %@ : %@. Dernière donnée conservée si disponible.",
+                provider.displayName,
+                description
+            ))
         }
     }
 
@@ -257,9 +262,9 @@ final class AppState: ObservableObject {
         }
         let details = snapshot.windows.map { window -> String in
             guard let remaining = window.remainingPercent else {
-                return window.label
+                return L(window.label)
             }
-            return L("%@ : %lld %% restant", window.label, Int(remaining.rounded()))
+            return L("%@ : %lld %% restant", L(window.label), Int(remaining.rounded()))
         }
         return L("Quota %@ · %@.", provider, details.joined(separator: " · "))
     }
@@ -318,7 +323,7 @@ final class AppState: ObservableObject {
                     currency: "USD",
                     label: L("Budget de la clé")
                 ),
-                note: "Reset : mensuel"
+                note: L("Reset : mensuel")
             ),
             "claude": ProviderUsageSnapshot(providerID: "claude", fetchedAt: now, status: .unsupported),
             "opencode": ProviderUsageSnapshot(providerID: "opencode", fetchedAt: now, status: .unsupported),
@@ -856,8 +861,13 @@ final class AppState: ObservableObject {
             await router.setCompatibility(for: provider.id, state: result.state, error: result.errorDescription)
             log(result.errorDescription ?? "\(provider.displayName) /v1/responses OK.")
         } catch {
-            await router.setCompatibility(for: provider.id, state: .incompatible(reason: error.localizedDescription), error: error.localizedDescription)
-            log(error.localizedDescription)
+            let description = L(error.localizedDescription)
+            await router.setCompatibility(
+                for: provider.id,
+                state: .incompatible(reason: description),
+                error: description
+            )
+            log(description)
         }
     }
 
@@ -884,10 +894,11 @@ final class AppState: ObservableObject {
                 if result.state == .compatible { ok += 1 }
                 await router.setCompatibility(for: provider.id, state: result.state, error: result.errorDescription)
             } catch {
+                let description = L(error.localizedDescription)
                 await router.setCompatibility(
                     for: provider.id,
-                    state: .incompatible(reason: error.localizedDescription),
-                    error: error.localizedDescription
+                    state: .incompatible(reason: description),
+                    error: description
                 )
             }
         }

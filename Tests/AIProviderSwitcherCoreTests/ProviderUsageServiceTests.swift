@@ -4,8 +4,14 @@ import XCTest
 final class ProviderUsageServiceTests: XCTestCase {
     private let url = URL(string: "https://example.invalid/usage")!
 
-    private func service(_ response: Result<(HTTPURLResponse, Data), Error>) -> ProviderUsageService {
-        ProviderUsageService(client: MockHTTPClient(responses: [response]))
+    private func service(
+        _ response: Result<(HTTPURLResponse, Data), Error>,
+        localize: @escaping @Sendable (String) -> String = { $0 }
+    ) -> ProviderUsageService {
+        ProviderUsageService(
+            client: MockHTTPClient(responses: [response]),
+            localize: localize
+        )
     }
 
     private func response(_ status: Int, _ payload: String) -> Result<(HTTPURLResponse, Data), Error> {
@@ -55,6 +61,32 @@ final class ProviderUsageServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.balance?.total, 100)
         XCTAssertTrue(snapshot.note?.contains("7 jours : 8.4 $") == true)
         XCTAssertTrue(snapshot.note?.contains("Reset : monthly") == true)
+    }
+
+    func testUsageLabelsAndNotesUseInjectedLocalizer() async throws {
+        let body = """
+        {"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly",
+                 "usage":25.5,"usage_daily":1.2,"usage_weekly":8.4,"usage_monthly":25.5}}
+        """
+        let translations = [
+            "Budget de la clé": "Key budget",
+            "Aujourd'hui : %@ $": "Today: $%@",
+            "7 jours : %@ $": "7 days: $%@",
+            "Ce mois : %@ $": "This month: $%@",
+            "Reset : %@": "Reset: %@"
+        ]
+        let snapshot = try await service(response(200, body)) { key in
+            translations[key] ?? key
+        }.snapshot(
+            for: ProviderCatalog.default[id: "openrouter"]!,
+            secret: Secret("sk-or-v1-test-value")
+        )
+
+        XCTAssertEqual(snapshot.balance?.label, "Key budget")
+        XCTAssertEqual(
+            snapshot.note,
+            "Today: $1.2 · 7 days: $8.4 · This month: $25.5 · Reset: monthly"
+        )
     }
 
     func testOpenRouterWithoutLimitShowsKnownUsageOnly() async throws {

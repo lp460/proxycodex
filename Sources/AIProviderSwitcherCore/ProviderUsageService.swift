@@ -6,10 +6,16 @@ import Foundation
 public struct ProviderUsageService: Sendable {
     public let client: HTTPClient
     public let timeout: TimeInterval
+    public let localize: @Sendable (String) -> String
 
-    public init(client: HTTPClient = URLSessionHTTPClient(), timeout: TimeInterval = 8) {
+    public init(
+        client: HTTPClient = URLSessionHTTPClient(),
+        timeout: TimeInterval = 8,
+        localize: @escaping @Sendable (String) -> String = { $0 }
+    ) {
         self.client = client
         self.timeout = timeout
+        self.localize = localize
     }
 
     // MARK: Public API
@@ -38,13 +44,13 @@ public struct ProviderUsageService: Sendable {
             return ProviderUsageSnapshot(
                 providerID: provider.id,
                 status: .unsupported,
-                note: "Quota abonnement non exposé par une API supportée. Consultez /usage dans Claude Code."
+                note: localized("Quota abonnement non exposé par une API supportée. Consultez /usage dans Claude Code.")
             )
         case "opencode":
             return ProviderUsageSnapshot(
                 providerID: provider.id,
                 status: .unsupported,
-                note: "Quota détaillé non exposé."
+                note: localized("Quota détaillé non exposé.")
             )
         case "opencode-go":
             guard let secret, !(secret.asString() ?? "").isEmpty else {
@@ -55,7 +61,7 @@ public struct ProviderUsageService: Sendable {
             return ProviderUsageSnapshot(
                 providerID: provider.id,
                 status: .available,
-                note: "Local · sans quota fournisseur."
+                note: localized("Local · sans quota fournisseur.")
             )
         default:
             return ProviderUsageSnapshot(providerID: provider.id, status: .unsupported)
@@ -91,7 +97,7 @@ public struct ProviderUsageService: Sendable {
             granted: Self.decimal(selected?["granted_balance"]),
             toppedUp: Self.decimal(selected?["topped_up_balance"]),
             currency: currency,
-            label: "Crédit API"
+            label: localized("Crédit API")
         )
         let apiAvailable = object["is_available"] as? Bool ?? true
         return ProviderUsageSnapshot(
@@ -99,7 +105,7 @@ public struct ProviderUsageService: Sendable {
             fetchedAt: Date(),
             status: apiAvailable ? .available : .unavailable,
             balance: balance,
-            note: apiAvailable ? nil : "Les appels API ne sont plus disponibles."
+            note: apiAvailable ? nil : localized("Les appels API ne sont plus disponibles.")
         )
     }
 
@@ -123,23 +129,23 @@ public struct ProviderUsageService: Sendable {
             total: Self.decimal(key["limit"]),
             used: Self.decimal(key["usage"]),
             currency: "USD",
-            label: "Budget de la clé"
+            label: localized("Budget de la clé")
         )
         var notes: [String] = []
         if let daily = Self.decimal(key["usage_daily"]) {
-            notes.append("Aujourd'hui : \(Self.text(daily)) $")
+            notes.append(localized("Aujourd'hui : %@ $", Self.text(daily)))
         }
         if let weekly = Self.decimal(key["usage_weekly"]) {
-            notes.append("7 jours : \(Self.text(weekly)) $")
+            notes.append(localized("7 jours : %@ $", Self.text(weekly)))
         }
         if let monthly = Self.decimal(key["usage_monthly"]) {
-            notes.append("Ce mois : \(Self.text(monthly)) $")
+            notes.append(localized("Ce mois : %@ $", Self.text(monthly)))
         }
         if let reset = key["limit_reset"] as? String, !reset.isEmpty {
-            notes.append("Reset : \(reset)")
+            notes.append(localized("Reset : %@", reset))
         }
         if key["is_free_tier"] as? Bool == true {
-            notes.append("Palier gratuit")
+            notes.append(localized("Palier gratuit"))
         }
         return ProviderUsageSnapshot(
             providerID: "openrouter",
@@ -165,7 +171,12 @@ public struct ProviderUsageService: Sendable {
         guard let object = try? JSONSerialization.jsonObject(with: data) else {
             throw ProviderUsageError.invalidResponse
         }
-        return ZAIUsageParser.snapshot(from: object, providerID: "glm", fetchedAt: Date())
+        return ZAIUsageParser.snapshot(
+            from: object,
+            providerID: "glm",
+            fetchedAt: Date(),
+            localize: localize
+        )
     }
 
     // MARK: OpenCode Go
@@ -182,7 +193,11 @@ public struct ProviderUsageService: Sendable {
               let usage = object["usage"] as? [String: Any] else {
             throw ProviderUsageError.invalidResponse
         }
-        return OpenCodeGoUsageParser.snapshot(from: usage, fetchedAt: Date())
+        return OpenCodeGoUsageParser.snapshot(
+            from: usage,
+            fetchedAt: Date(),
+            localize: localize
+        )
     }
 
     // MARK: Helpers
@@ -218,6 +233,12 @@ public struct ProviderUsageService: Sendable {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter.string(from: value as NSDecimalNumber) ?? "\(value)"
     }
+
+    private func localized(_ key: String, _ arguments: CVarArg...) -> String {
+        let format = localize(key)
+        guard !arguments.isEmpty else { return format }
+        return String(format: format, arguments: arguments)
+    }
 }
 
 /// Tolerant parser for Z.ai. `TOKENS_LIMIT` is currently the coding-plan token
@@ -226,15 +247,16 @@ public enum ZAIUsageParser {
     public static func snapshot(
         from root: Any,
         providerID: String,
-        fetchedAt: Date = Date()
+        fetchedAt: Date = Date(),
+        localize: @escaping @Sendable (String) -> String = { $0 }
     ) -> ProviderUsageSnapshot {
         var windows: [UsageWindow] = []
         var seen = Set<String>()
         for entry in quotaEntries(in: root) where !seen.contains(entry.type) {
             seen.insert(entry.type)
             if entry.type == "TOKENS_LIMIT" || entry.type.contains("TOKEN") {
-                windows.append(entry.window)
-            } else if let window = entry.windowWithKnownDuration {
+                windows.append(entry.window(localize: localize))
+            } else if let window = entry.windowWithKnownDuration(localize: localize) {
                 windows.append(window)
             }
         }
@@ -244,7 +266,9 @@ public enum ZAIUsageParser {
             status: windows.isEmpty ? .unavailable : .available,
             planLabel: "Coding Plan",
             windows: windows,
-            note: windows.isEmpty ? "Quota non exposé par Z.ai." : nil
+            note: windows.isEmpty
+                ? localized("Quota non exposé par Z.ai.", localize: localize)
+                : nil
         )
     }
 
@@ -255,19 +279,23 @@ public enum ZAIUsageParser {
         let durationMinutes: Int?
         let resetDate: Date?
 
-        var window: UsageWindow {
+        func window(localize: @Sendable (String) -> String) -> UsageWindow {
             UsageWindow(
                 id: type,
-                label: label ?? "Utilisation",
+                label: label ?? localized("Utilisation", localize: localize),
                 usedPercent: percentage,
                 durationMinutes: durationMinutes,
                 resetsAt: resetDate,
-                detail: resetDate == nil ? "Reset non exposé par Z.ai" : nil
+                detail: resetDate == nil
+                    ? localized("Reset non exposé par Z.ai", localize: localize)
+                    : nil
             )
         }
 
-        var windowWithKnownDuration: UsageWindow? {
-            durationMinutes == nil ? nil : window
+        func windowWithKnownDuration(
+            localize: @Sendable (String) -> String
+        ) -> UsageWindow? {
+            durationMinutes == nil ? nil : window(localize: localize)
         }
     }
 
@@ -321,19 +349,30 @@ public enum ZAIUsageParser {
         }
         return nil
     }
+
+    private static func localized(
+        _ key: String,
+        localize: @Sendable (String) -> String
+    ) -> String {
+        localize(key)
+    }
 }
 
 /// Parses OpenCode Go's three subscription windows: rolling, weekly, monthly.
 public enum OpenCodeGoUsageParser {
     public static func snapshot(
         from usage: [String: Any],
-        fetchedAt: Date = Date()
+        fetchedAt: Date = Date(),
+        localize: @escaping @Sendable (String) -> String = { $0 }
     ) -> ProviderUsageSnapshot {
-        let labels = [
-            "rolling": "Glissant",
-            "weekly": "7 jours",
-            "monthly": "30 jours"
+        let labels: [String: String] = [
+            "rolling": localized("Glissant", localize: localize),
+            "weekly": localized("7 jours", localize: localize),
+            "monthly": localized("30 jours", localize: localize)
         ]
+        let rateLimitedKeys = Set(["rolling", "weekly", "monthly"].filter { key in
+            (usage[key] as? [String: Any])?["status"] as? String == "rate-limited"
+        })
         let windows = ["rolling", "weekly", "monthly"].compactMap { key -> UsageWindow? in
             guard let entry = usage[key] as? [String: Any] else { return nil }
             return UsageWindow(
@@ -341,20 +380,20 @@ public enum OpenCodeGoUsageParser {
                 label: labels[key] ?? key,
                 usedPercent: Self.double(entry["percent"] ?? entry["usagePercent"]),
                 resetsAt: Self.date(entry["resetsAt"] ?? entry["reset_at"]),
-                detail: (entry["status"] as? String) == "rate-limited"
-                    ? "Limite atteinte" : nil
+                detail: rateLimitedKeys.contains(key)
+                    ? localized("Limite atteinte", localize: localize)
+                    : nil
             )
         }
-        let rateLimited = windows.filter { $0.detail == "Limite atteinte" }
         return ProviderUsageSnapshot(
             providerID: "opencode-go",
             fetchedAt: fetchedAt,
             status: windows.isEmpty
                 ? .unavailable
-                : (rateLimited.count == windows.count ? .unavailable : .available),
+                : (rateLimitedKeys.count == windows.count ? .unavailable : .available),
             planLabel: "OpenCode Go",
             windows: windows,
-            note: windows.isEmpty ? "Quota Go non exposé." : nil
+            note: windows.isEmpty ? localized("Quota Go non exposé.", localize: localize) : nil
         )
     }
 
@@ -368,6 +407,13 @@ public enum OpenCodeGoUsageParser {
         guard let text = value as? String else { return nil }
         return ISO8601DateFormatter().date(from: text)
     }
+
+    private static func localized(
+        _ key: String,
+        localize: @Sendable (String) -> String
+    ) -> String {
+        localize(key)
+    }
 }
 
 /// Parser for the supported local Codex app-server rate-limit response.
@@ -376,22 +422,27 @@ public enum OpenCodeGoUsageParser {
 public enum CodexUsageParser {
     public static func snapshot(
         from response: [String: Any],
-        fetchedAt: Date = Date()
+        fetchedAt: Date = Date(),
+        localize: @escaping @Sendable (String) -> String = { $0 }
     ) -> ProviderUsageSnapshot {
         let account = response["result"] as? [String: Any] ?? response
         let codexLimits = ((account["rateLimitsByLimitId"] as? [String: Any])?["codex"]) as? [String: Any]
         let selected = ((codexLimits?["rateLimits"] as? [String: Any])
             ?? (account["rateLimits"] as? [String: Any])
             ?? codexLimits)
-        var windows = parseWindows(from: selected)
+        var windows = parseWindows(from: selected, localize: localize)
 
         if windows.isEmpty, let list = selected?["limits"] as? [[String: Any]] {
-            windows = list.compactMap(parse(window:))
+            windows = list.compactMap { parse(window: $0, localize: localize) }
         }
         let credits = account["credits"] as? [String: Any] ?? selected?["credits"] as? [String: Any]
         let balance = credits.flatMap { credits in
             Self.decimal(credits["balance"]).map {
-                UsageBalance(available: $0, currency: "USD", label: "Crédits")
+                UsageBalance(
+                    available: $0,
+                    currency: "USD",
+                    label: localized("Crédits", localize: localize)
+                )
             }
         }
         return ProviderUsageSnapshot(
@@ -400,24 +451,34 @@ public enum CodexUsageParser {
             status: windows.isEmpty && balance == nil ? .unavailable : .available,
             balance: balance,
             windows: windows,
-            note: windows.isEmpty && balance == nil ? "Quota non exposé par Codex." : nil
+            note: windows.isEmpty && balance == nil
+                ? localized("Quota non exposé par Codex.", localize: localize)
+                : nil
         )
     }
 
-    static func parseWindows(from rateLimits: [String: Any]?) -> [UsageWindow] {
+    static func parseWindows(
+        from rateLimits: [String: Any]?,
+        localize: @Sendable (String) -> String = { $0 }
+    ) -> [UsageWindow] {
         guard let rateLimits else { return [] }
         let named = [
             ("primary", rateLimits["primary"] as? [String: Any]),
             ("secondary", rateLimits["secondary"] as? [String: Any])
         ].compactMap { $0.1.map { $0 } }
-        let parsed = named.compactMap(parse(window:))
+        let parsed = named.compactMap { parse(window: $0, localize: localize) }
             .sorted { ($0.durationMinutes ?? 0) < ($1.durationMinutes ?? 0) }
         return parsed.isEmpty
-            ? ((rateLimits["windows"] as? [[String: Any]]) ?? []).compactMap(parse(window:))
+            ? ((rateLimits["windows"] as? [[String: Any]]) ?? []).compactMap {
+                parse(window: $0, localize: localize)
+            }
             : parsed
     }
 
-    static func parse(window object: [String: Any]) -> UsageWindow? {
+    static func parse(
+        window object: [String: Any],
+        localize: @Sendable (String) -> String = { $0 }
+    ) -> UsageWindow? {
         guard let duration = Self.integer(object["windowDurationMins"]
             ?? object["window_duration_mins"]) else {
             return nil
@@ -426,24 +487,31 @@ public enum CodexUsageParser {
         let reset = Self.date(object["resetsAt"])
         return UsageWindow(
             id: "window-\(duration)",
-            label: Self.label(forMinutes: duration),
+            label: Self.label(forMinutes: duration, localize: localize),
             usedPercent: used,
             durationMinutes: duration,
             resetsAt: reset
         )
     }
 
-    static func label(forMinutes minutes: Int) -> String {
+    static func label(
+        forMinutes minutes: Int,
+        localize: @Sendable (String) -> String = { $0 }
+    ) -> String {
         switch minutes {
-        case 60: return "1 heure"
-        case 300: return "5 heures"
-        case 1440: return "24 heures"
-        case 10080: return "7 jours"
-        case 43200: return "30 jours"
+        case 60: return localized("1 heure", localize: localize)
+        case 300: return localized("5 heures", localize: localize)
+        case 1440: return localized("24 heures", localize: localize)
+        case 10080: return localized("7 jours", localize: localize)
+        case 43200: return localized("30 jours", localize: localize)
         default:
-            if minutes % 1440 == 0 { return "\(minutes / 1440) jours" }
-            if minutes % 60 == 0 { return "\(minutes / 60) heures" }
-            return "\(minutes) minutes"
+            if minutes % 1440 == 0 {
+                return String(format: localized("%lld jours", localize: localize), minutes / 1440)
+            }
+            if minutes % 60 == 0 {
+                return String(format: localized("%lld heures", localize: localize), minutes / 60)
+            }
+            return String(format: localized("%lld minutes", localize: localize), minutes)
         }
     }
 
@@ -466,6 +534,13 @@ public enum CodexUsageParser {
         if let number = value as? NSNumber { return Decimal(number.doubleValue) }
         if let text = value as? String { return Decimal(string: text, locale: Locale(identifier: "en_US_POSIX")) }
         return nil
+    }
+
+    private static func localized(
+        _ key: String,
+        localize: @Sendable (String) -> String
+    ) -> String {
+        localize(key)
     }
 }
 
