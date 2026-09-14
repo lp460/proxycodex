@@ -60,6 +60,13 @@ final class AppState: ObservableObject {
     @Published private(set) var lastUsageRefresh: Date?
     @Published private(set) var usageErrors: [String: String] = [:]
     @Published private(set) var language = LocalizationManager.language
+    /// Codex Multi-Agent V2 as read from `config.toml` (read-only until the user
+    /// acts in the panel; a hand-written entry stays the user's own).
+    @Published private(set) var multiAgentConfig = CodexMultiAgentConfig.absent()
+    @Published var applyingMultiAgentConfig = false
+    /// Set when `config.toml` could not be read; the panel then says so instead
+    /// of pretending the feature is simply off.
+    @Published private(set) var multiAgentReadError: String?
 
     private var observationTask: Task<Void, Never>?
     private var nextLogID = 1
@@ -112,6 +119,13 @@ final class AppState: ObservableObject {
             nativeConfigDetected = true
             providersInstalled = true
             statusMessage = L("Démonstration prête · aucun secret réel utilisé.")
+            // Deterministic demo state for the README capture: enabled, 8
+            // threads, owned by Proxycodex. Nothing is read from ~/.codex.
+            multiAgentConfig = CodexMultiAgentConfig(
+                enabled: true,
+                maxConcurrentThreads: CodexMultiAgentConfig.defaultThreads,
+                source: .proxycodexManaged
+            )
             loadScreenshotUsage()
         } else {
             // Keep keys across restarts: persistence is ON by default (0600 file,
@@ -290,7 +304,7 @@ final class AppState: ObservableObject {
                 fetchedAt: now,
                 status: .available,
                 windows: [
-                    UsageWindow(id: "openai-5h", label: L("5 heures"), usedPercent: 78, durationMinutes: 300, resetsAt: now.addingTimeInterval(6_120)),
+                    UsageWindow(id: "openai-5h", label: L("5 heures"), usedPercent: 22, durationMinutes: 300, resetsAt: now.addingTimeInterval(6_120)),
                     UsageWindow(id: "openai-week", label: L("7 jours"), usedPercent: 46, durationMinutes: 10_080, resetsAt: now.addingTimeInterval(172_800))
                 ]
             ),
@@ -339,6 +353,7 @@ final class AppState: ObservableObject {
             L("DeepSeek sélectionné."),
             L("Modèles rafraîchis."),
             L("Solde DeepSeek · 18,42 USD disponibles."),
+            L("Multi-Agent V2 activé · %lld threads maximum.", CodexMultiAgentConfig.defaultThreads),
             L("Codex CLI lancé.")
         ]
         for (offset, message) in demoMessages.enumerated() {
@@ -347,6 +362,130 @@ final class AppState: ObservableObject {
         }
         nextLogID = demoMessages.count + 1
         statusMessage = L("Démonstration prête · aucun secret réel utilisé.")
+    }
+
+    // MARK: Codex Multi-Agent V2 (additive: only its own marked block)
+
+    /// Reads `[features.multi_agent_v2]` from `config.toml`.
+    ///
+    /// Never blocks the bootstrap: a malformed file is reported in the journal
+    /// and the panel keeps its last known state.
+    func refreshMultiAgentConfig(announce: Bool = false) {
+        guard !screenshotMode else { return }
+        do {
+            let config = try configStore.readMultiAgentConfig()
+            multiAgentReadError = nil
+            multiAgentConfig = config
+            if announce, config.isUserManaged {
+                log(L(
+                    "Configuration Multi-Agent externe détectée · %lld threads.",
+                    config.maxConcurrentThreads
+                ))
+            }
+        } catch {
+            let description = error.localizedDescription
+            multiAgentReadError = description
+            log(L("Multi-Agent : configuration illisible (%@)", description))
+        }
+    }
+
+    /// Turns Multi-Agent V2 on (first activation: the recommended 8 threads) or
+    /// off. Disabling keeps the block with `enabled = false`, so the setting
+    /// stays reversible and the thread count is remembered.
+    func setMultiAgentEnabled(_ enabled: Bool) {
+        guard !screenshotMode, !multiAgentConfig.isUserManaged else { return }
+        applyMultiAgent(enabled: enabled, threads: multiAgentConfig.maxConcurrentThreads) { config in
+            enabled
+                ? L("Multi-Agent V2 activé · %lld threads maximum.", config.maxConcurrentThreads)
+                : L("Multi-Agent V2 désactivé.")
+        }
+    }
+
+    /// Sets the session thread count (main agent included) and enables the
+    /// feature: a limit without delegation would have no effect.
+    func setMultiAgentThreads(_ threads: Int) {
+        guard !screenshotMode, !multiAgentConfig.isUserManaged else { return }
+        let resolved = Self.clampedMultiAgentThreads(threads)
+        guard resolved != multiAgentConfig.maxConcurrentThreads || !multiAgentConfig.enabled else { return }
+        applyMultiAgent(enabled: true, threads: resolved) { config in
+            L("Concurrence Multi-Agent réglée sur %lld threads.", config.maxConcurrentThreads)
+        }
+    }
+
+    /// Applies a preset. `.custom` keeps the current value: the panel's numeric
+    /// field then drives ``setMultiAgentThreads(_:)``.
+    func setMultiAgentPreset(_ preset: MultiAgentPreset) {
+        guard let threads = preset.threadCount else { return }
+        setMultiAgentThreads(threads)
+    }
+
+    /// UI ceiling: the store accepts more, but the panel never writes a value it
+    /// would not recommend.
+    static func clampedMultiAgentThreads(_ threads: Int) -> Int {
+        min(
+            max(threads, CodexMultiAgentConfig.minimumThreads),
+            CodexMultiAgentConfig.recommendedMaximumThreads
+        )
+    }
+
+    private func applyMultiAgent(
+        enabled: Bool,
+        threads: Int,
+        message: (CodexMultiAgentConfig) -> String
+    ) {
+        applyingMultiAgentConfig = true
+        defer { applyingMultiAgentConfig = false }
+        // Codex reads config.toml when a session starts; the watcher must never
+        // treat the app's own write as an external change.
+        stopConfigWatcher()
+        defer { startConfigWatcher() }
+        do {
+            let written = try configStore.setMultiAgentConfig(enabled: enabled, threads: threads)
+            multiAgentConfig = written
+            multiAgentReadError = nil
+            log(message(written))
+        } catch {
+            let description = error.localizedDescription
+            multiAgentReadError = description
+            log(L("Impossible de mettre à jour Multi-Agent : %@", description))
+            // Resynchronise: the file may have been taken over by the user.
+            refreshMultiAgentConfig()
+        }
+    }
+
+    /// Opens `config.toml` — or `~/.codex` when it does not exist yet — with the
+    /// system's default editor. Never forces a specific one.
+    func openConfigToml() {
+        guard !screenshotMode else { return }
+        let url = configStore.paths.configToml
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.open(url)
+        } else {
+            NSWorkspace.shared.open(url.deletingLastPathComponent())
+        }
+    }
+
+    /// Shortest quota window of the active provider, falling back to the
+    /// Codex-native one: delegation happens inside a Codex session, so that
+    /// reading stays the relevant one when a routed provider is active.
+    var multiAgentQuotaRemainingPercent: Double? {
+        shortestRemainingPercent(for: snapshot.activeProviderID)
+            ?? shortestRemainingPercent(for: "openai")
+    }
+
+    private func shortestRemainingPercent(for providerID: String) -> Double? {
+        guard let usage = providerUsage[providerID],
+              usage.status != .unsupported,
+              usage.status != .authenticationRequired else { return nil }
+        return usage.windows
+            .filter { $0.remainingPercent != nil }
+            .min { ($0.durationMinutes ?? .max) < ($1.durationMinutes ?? .max) }?
+            .remainingPercent
+    }
+
+    /// Recommendation only — the user's setting is never changed behind them.
+    var multiAgentQuotaAdvice: MultiAgentQuotaAdvice {
+        MultiAgentQuotaAdvice(remainingPercent: multiAgentQuotaRemainingPercent)
     }
 
     // MARK: Bootstrap (read-only detection — never modifies native config)
@@ -383,6 +522,9 @@ final class AppState: ObservableObject {
             log(nativeConfigDetected
                 ? L("Codex natif détecté (%@).", configStore.paths.codexHome.path)
                 : L("Aucun ~/.codex/config.toml ; lancez Codex une fois, puis « Installer les providers »."))
+            // Multi-Agent V2 lives in config.toml too: read it once here, and
+            // never let a malformed file abort the rest of the bootstrap.
+            refreshMultiAgentConfig(announce: true)
         } catch {
         log(L("Init error: %@", error.localizedDescription))
         }
@@ -1343,6 +1485,9 @@ final class AppState: ObservableObject {
         guard !screenshotMode, let router,
               let model = configStore.topLevelValue(of: "model"),
               !model.isEmpty else { return }
+        // The same write may have changed the Multi-Agent block (the user edits
+        // config.toml by hand): re-read it so the panel reflects the file.
+        refreshMultiAgentConfig()
         let configProvider = configStore.topLevelValue(of: "model_provider")
         let state = configStore.overrideState()
 

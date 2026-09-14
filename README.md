@@ -12,6 +12,7 @@ Barre de menus macOS pour piloter les providers compatibles avec **Codex** depui
 
 - Affiche l’état de connexion et la présence d’une clé pour chaque provider.
 - Affiche une section « Quota & utilisation » : fenêtres réelles, soldes/budgets, resets exposés et mini-résumés par provider.
+- Pilote **Codex Multi-Agent V2** depuis la section « Agents Codex » : activation, nombre maximum de threads (l’agent principal inclus), avertissements de concurrence et recommandation issue du quota — sans jamais écraser une configuration écrite à la main.
 - Journalise les événements techniques et les lectures de quota dans le journal local existant, sans jamais y écrire une clé.
 - Change le provider et le modèle actifs depuis la barre.
 - Quand une carte demande une clé absente, ouvre le champ de clé pour ce provider précis ; une fois la clé injectée, applique la sélection et relance Codex sans second clic.
@@ -76,6 +77,75 @@ wire_api = "responses"
 `requires_openai_auth = false` est important : Codex ne doit pas essayer d’appliquer le flux d’authentification OpenAI à un endpoint tiers. **Aucun `env_key`** : une seule source de vérité pour les clés, l’adaptateur local, alimenté par le panneau. Une clé déclarée dans l’environnement de Codex deviendrait périmée dès qu’on la change dans le panneau, c’est exactement ce que cette architecture supprime. Les clés ne sont jamais écrites dans `config.toml`.
 
 GLM (Z.ai) expose le catalogue Responses sous `https://api.z.ai/api/v1` — la base historique `/api/paas/v4` ne sert que `/chat/completions` et renvoyait 404 sur `/v1/responses`. Les modèles proposés sont ceux du **coding plan** Z.AI (`glm-5.2`, `glm-5.2-highspeed`, `glm-5-turbo`, `glm-5.3`, `glm-4.7`) et la clé attendue est de la forme `ID.secret` (et non `sk-…`), vérifiée à la saisie.
+
+## Codex Multi-Agent V2
+
+![Section « Agents Codex » — Multi-Agent V2 activé, preset Recommandé, quota confortable](docs/screenshots/panel-multi-agent.png)
+
+> Capture du panneau en mode démonstration : activation, preset `Recommandé · 8 threads`, décomposition « 1 agent principal + jusqu’à 7 sous-agents » et recommandation issue du quota.
+
+La section **Agents Codex** du panneau pilote la parallélisation de Codex elle-même. C’est une capacité d’orchestration de Codex : elle ne dépend pas du provider actif, et le panneau ne parle donc jamais d’« agents DeepSeek » ou d’« agents GLM ».
+
+```toml
+# >>> provider-switcher multi-agent >>>
+[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 8
+# <<< provider-switcher multi-agent <<<
+```
+
+`max_concurrent_threads_per_session` compte **tous les threads de la session, l’agent principal inclus**. Le nombre de sous-agents vaut donc toujours `threads − 1` :
+
+| Réglage | Composition réelle |
+|---|---|
+| 4 threads | 1 agent principal + jusqu’à 3 sous-agents |
+| 8 threads | 1 agent principal + jusqu’à 7 sous-agents |
+| 12 threads | 1 agent principal + jusqu’à 11 sous-agents |
+| 16 threads | 1 agent principal + jusqu’à 15 sous-agents |
+
+Le panneau n’affiche jamais « 8 threads = 8 sous-agents ».
+
+### Presets
+
+| Preset | Threads | Intention |
+|---|---:|---|
+| Économe | 4 | consommation modérée |
+| Recommandé | 8 | valeur par défaut lors de la première activation |
+| Intensif | 12 | consommation élevée |
+| Très intensif | 16 | concurrence très élevée |
+| Personnalisé | 1 → 40 | valeur libre ; 1 thread ne permet aucun sous-agent |
+
+`40` threads reste possible en Personnalisé, mais le panneau le signale comme très agressif. Les valeurs hors bornes (`0`, négatives, ou au-delà du plafond accepté) sont refusées par le magasin de configuration, qui ne réécrit alors rien.
+
+### Fonction Codex stable, désactivée par défaut
+
+`multi_agent_v2` est une fonctionnalité avancée de Codex : elle est stable, mais désactivée par défaut. Proxycodex peut donc légitimement proposer de l’activer — il ne la présente pas comme expérimentale.
+
+### Ce que l’activation change (et ne change pas)
+
+Activer Multi-Agent signifie que **Codex peut** utiliser des sous-agents, pas qu’il en lancera 7 à chaque demande : la délégation dépend du prompt, de la tâche, du modèle et du contexte. Le panneau parle donc de « jusqu’à 7 sous-agents », jamais de « 7 agents actifs » — aucun suivi live des sous-agents n’est exposé dans cette version. Proxycodex n’injecte jamais « utilise des sous-agents » dans vos prompts à votre place.
+
+Exemple de prompt :
+
+```text
+Utilise plusieurs sous-agents en parallèle pour les tâches indépendantes.
+Répartis le travail puis fais une synthèse et une validation finale.
+```
+
+### Risque de quota
+
+Une concurrence élevée peut consommer plus rapidement les quotas Codex et provoquer des erreurs de rate limit / HTTP 429. Le panneau gradué suit cette échelle : consommation modérée (4), recommandé (8), consommation élevée (12), concurrence très élevée (16 et plus), puis avertissement explicite à partir de 24 threads (risque élevé d’erreurs 429 et d’épuisement rapide du quota).
+
+La section réutilise la lecture de quota existante (aucun second service) pour recommander une valeur : « quota confortable → 8 à 12 threads confortables », « 40–69 % → 8 threads recommandé », « 20–39 % → 4 à 8 threads conseillés », « moins de 20 % → mode Économe recommandé ». C’est une **recommandation d’affichage uniquement** : aucun auto-throttling, le réglage ne change jamais tout seul. Si le quota n’est pas disponible, le panneau le dit et Multi-Agent reste utilisable.
+
+### Respect de votre `config.toml`
+
+- **Configuration utilisateur** : un `[features.multi_agent_v2]` écrit à la main, sans marqueurs Proxycodex, est détecté comme externe. Le panneau affiche « Configuration externe détectée » avec le nombre de threads, désactive le toggle, propose « Ouvrir config.toml » et n’édite rien : un `16` utilisateur n’est jamais remplacé par `8`. La forme inline `multi_agent_v2 = { enabled = true, max_concurrent_threads_per_session = 8 }` dans `[features]` est reconnue de la même façon.
+- **Configuration gérée** : seul le bloc encadré `provider-switcher multi-agent` est réécrit. Les autres clés de `[features]`, les tables imbriquées (`[features.other]`), les valeurs personnalisées et les commentaires sont préservés — comme pour le reste des blocs gérés. Une configuration existante (`[features]` déjà présent) reste un TOML valide une fois le sous-table `[features.multi_agent_v2]` ajouté.
+- **Désactivation** : le bloc reste en place avec `enabled = false`. Le réglage est donc réversible, le nombre de threads est conservé, et les autres features ne sont pas touchées.
+- **Prise en compte** : Codex lit `config.toml` au démarrage d’une session. La nouvelle limite s’applique **à la prochaine session Codex** ; le panneau le rappelle et ne relance pas ChatGPT/Codex pour un simple changement de threads.
+
+`multi_agent_version`, présent dans le catalogue des modèles, est une métadonnée de modèle : elle n’a rien à voir avec `features.multi_agent_v2`, qui est un réglage global de session. Les deux ne sont pas confondus.
 
 ## Comment un changement de provider fonctionne
 
@@ -261,7 +331,9 @@ Codex recharge toute sa configuration — et relance sa connexion — à chaque 
 - une écriture au contenu identique n'a pas lieu, et ne crée donc pas de sauvegarde ;
 - quand Codex a lui-même écrit la sélection voulue — l'utilisateur change de modèle dans le Desktop — seul l'état sidecar est mis à jour, `config.toml` n'est pas retouché.
 
-La disposition des blocs gérés est déterministe (providers puis `[tools]`, catalogue en tête). Sans cela, chaque installation permutait leur ordre : le fichier différait à chaque fois, Codex rechargeait, et les lignes vides laissées par les retraits s'accumulaient — un `config.toml` observé avait 483 lignes vides consécutives sur 886 lignes.
+La disposition des blocs gérés est déterministe (providers, puis `[features.multi_agent_v2]`, puis `[tools]`, catalogue en tête). Sans cela, chaque installation permutait leur ordre : le fichier différait à chaque fois, Codex rechargeait, et les lignes vides laissées par les retraits s'accumulaient — un `config.toml` observé avait 483 lignes vides consécutives sur 886 lignes.
+
+Tous ces blocs sont édités **en texte**, jamais via un encodeur TOML : commentaires, ordre et sections utilisateur restent intacts. Le bloc Multi-Agent suit la même règle et n’est réécrit que lorsqu’il appartient à Proxycodex (marqueurs `provider-switcher multi-agent`).
 
 ## Surveillance de config.toml
 
@@ -317,7 +389,7 @@ Le mode `--panel-screenshot` utilise des données fictives, désactive les actio
 ## Fichiers générés
 
 ```text
-~/.codex/config.toml                         configuration additive et override actif
+~/.codex/config.toml                         configuration additive, override actif et réglage Multi-Agent V2 géré
 ~/.codex/<provider>.config.toml              profil CLI sans secret
 ~/.codex/catalog.json                        catalogue du provider actif
 ~/.codex/provider-switcher-state.json       état réversible de l’override

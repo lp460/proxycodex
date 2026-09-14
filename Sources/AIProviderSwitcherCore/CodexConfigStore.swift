@@ -28,13 +28,21 @@ public struct CodexPaths: Sendable {
     }
 }
 
-public enum CodexConfigError: Error, LocalizedError {
+public enum CodexConfigError: Error, LocalizedError, Equatable {
     case cannotReadConfig(URL)
     case reservedProviderDeclared(String)
+    /// `config.toml` already carries a hand-written Multi-Agent entry: the user
+    /// owns it, and Proxycodex refuses to touch it.
+    case multiAgentIsUserManaged
+    case invalidMultiAgentThreads(Int)
     public var errorDescription: String? {
         switch self {
         case .cannotReadConfig(let url): return "Cannot read \(url.path)"
         case .reservedProviderDeclared(let id): return "Refused to redeclare reserved provider '\(id)'"
+        case .multiAgentIsUserManaged:
+            return "Multi-Agent V2 is configured by hand in config.toml"
+        case .invalidMultiAgentThreads(let threads):
+            return "Refused Multi-Agent thread count \(threads)"
         }
     }
 }
@@ -589,9 +597,79 @@ public final class CodexConfigStore: Sendable {
         removeManagedBlocksNamed("override", in: config)
     }
 
+    // MARK: Multi-Agent V2 (additive, only ever its own marked block)
+
+    /// Reads `[features.multi_agent_v2]`, flagged with the ownership the file
+    /// proves: Proxycodex markers, hand-written by the user, or absent.
+    public func readMultiAgentConfig() throws -> CodexMultiAgentConfig {
+        CodexMultiAgentTOML.config(in: try readConfig())
+    }
+
+    /// Writes (or updates) the managed Multi-Agent block. Only the marked block
+    /// is touched: other `[features]` keys, nested tables and comments stay
+    /// byte-for-byte identical.
+    ///
+    /// Refuses to write when the user manages the setting themselves, and when
+    /// the thread count is out of the supported range.
+    @discardableResult
+    public func setMultiAgentConfig(enabled: Bool, threads: Int) throws -> CodexMultiAgentConfig {
+        guard threads >= CodexMultiAgentConfig.minimumThreads,
+              threads <= CodexMultiAgentConfig.maximumThreads else {
+            throw CodexConfigError.invalidMultiAgentThreads(threads)
+        }
+        var config = try readConfig()
+        guard !CodexMultiAgentTOML.config(in: config).isUserManaged else {
+            throw CodexConfigError.multiAgentIsUserManaged
+        }
+        config = removeManagedBlocksNamed("multi-agent", in: config)
+        let block = wrappedBlock(
+            name: "multi-agent",
+            body: multiAgentBody(enabled: enabled, threads: threads)
+        )
+        // Kept before the managed `[tools]` block when there is one, so the
+        // managed layout stays deterministic across installs and edits.
+        config = insertBlock(block, beforeManagedBlock: "tools", in: config)
+        try writeConfig(config)
+        return CodexMultiAgentConfig(
+            enabled: enabled,
+            maxConcurrentThreads: threads,
+            source: .proxycodexManaged
+        )
+    }
+
+    /// Removes the managed Multi-Agent block, leaving any user-written entry in
+    /// place. Returns whether anything changed.
+    @discardableResult
+    public func removeManagedMultiAgentConfig() throws -> Bool {
+        let config = try readConfig()
+        let cleaned = removeManagedBlocksNamed("multi-agent", in: config)
+        guard cleaned != config else { return false }
+        try writeConfig(cleaned)
+        return true
+    }
+
+    private func multiAgentBody(enabled: Bool, threads: Int) -> String {
+        var lines = ["[features.multi_agent_v2]"]
+        lines.append("enabled = \(enabled)")
+        lines.append("max_concurrent_threads_per_session = \(threads)")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Inserts a marked block just before another marked block, or at the end
+    /// of the file when that block is absent.
+    private func insertBlock(_ block: String, beforeManagedBlock name: String, in config: String) -> String {
+        let marker = "# >>> \(beginToken) \(name) >>>"
+        guard let range = config.range(of: marker) else {
+            return appendBlock(config, block)
+        }
+        var text = config
+        text.insert(contentsOf: block, at: range.lowerBound)
+        return text
+    }
+
     private func removeManagedBlocks(in config: String) -> String {
         var t = config
-        for name in ["override", "catalog", "tools", "provider:deepseek", "provider:glm", "provider:openrouter", "provider:ollama", "provider:lmstudio"] {
+        for name in ["override", "catalog", "tools", "multi-agent", "provider:deepseek", "provider:glm", "provider:openrouter", "provider:ollama", "provider:lmstudio"] {
             t = removeManagedBlocksNamed(name, in: t)
         }
         // Also strip any provider block for catalog ids (custom) generically.

@@ -12,6 +12,7 @@ struct PanelView: View {
     @State private var maintenanceExpanded = false
     @State private var exposedModelsExpanded = false
     @State private var journalExpanded = false
+    @State private var agentOptionsExpanded = false
     @FocusState private var keyFieldFocused: Bool
 
     private let providerColumns: [GridItem] = [
@@ -31,6 +32,7 @@ struct PanelView: View {
                     providerSection
                     modelSection
                     usageSection
+                    agentSection
                     keySection
                     launchSection
                     maintenanceSection
@@ -320,6 +322,360 @@ struct PanelView: View {
                     )
                 }
             }
+        }
+    }
+
+    // MARK: Agents Codex (Codex Multi-Agent V2)
+
+    /// Codex orchestration only: the setting is a Codex one, whatever provider
+    /// currently answers. The thread count always includes the main agent, hence
+    /// the “up to N sub-agents” wording everywhere.
+    private var agentSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader(L("Agents Codex"))
+
+            VStack(alignment: .leading, spacing: 10) {
+                agentHeaderRow
+
+                if state.multiAgentReadError != nil {
+                    SecondaryInfoRow(
+                        text: L("Multi-Agent : configuration illisible"),
+                        symbol: "exclamationmark.triangle.fill",
+                        symbolColor: .red
+                    )
+                } else if state.multiAgentConfig.isUserManaged {
+                    agentExternalContent
+                } else if state.multiAgentConfig.enabled {
+                    agentEnabledContent
+                } else {
+                    agentDisabledContent
+                }
+
+                agentOptions
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.secondary.opacity(0.12), lineWidth: 1)
+            )
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    private var agentHeaderRow: some View {
+        HStack(spacing: 9) {
+            Circle()
+                .fill(state.multiAgentConfig.enabled ? Color.green : Color.secondary.opacity(0.45))
+                .frame(width: 7, height: 7)
+                .accessibilityHidden(true)
+
+            Toggle(isOn: Binding(
+                get: { state.multiAgentConfig.enabled },
+                set: { state.setMultiAgentEnabled($0) }
+            )) {
+                Text(L("Multi-Agent V2"))
+                    .font(.callout.weight(.semibold))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .tint(Color.accentColor)
+            .disabled(state.isScreenshotMode || state.multiAgentConfig.isUserManaged || state.applyingMultiAgentConfig)
+            .help(state.multiAgentConfig.isUserManaged
+                  ? L("Configuration gérée dans ~/.codex/config.toml : modifiez-la dans le fichier.")
+                  : L("Autorise Codex à déléguer des tâches indépendantes à des sous-agents."))
+            .accessibilityLabel(Text(L("Multi-Agent V2")))
+            .accessibilityValue(Text(agentStateLabel))
+
+            Spacer(minLength: 8)
+
+            Text(agentStateLabel)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(state.multiAgentConfig.enabled ? Color.green : Color.secondary)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var agentStateLabel: String {
+        state.multiAgentConfig.enabled ? L("Activé") : L("Désactivé")
+    }
+
+    @ViewBuilder
+    private var agentEnabledContent: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text(L("Concurrence"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker(L("Concurrence"), selection: Binding(
+                    get: { state.multiAgentConfig.preset },
+                    set: { state.setMultiAgentPreset($0) }
+                )) {
+                    ForEach(MultiAgentPreset.allCases) { preset in
+                        Text(agentPresetTitle(preset)).tag(preset)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .controlSize(.small)
+                .disabled(state.isScreenshotMode || state.applyingMultiAgentConfig)
+                .help(L("Nombre maximum de threads Multi-Agent"))
+                .accessibilityLabel(Text(L("Nombre maximum de threads Multi-Agent")))
+                .accessibilityValue(Text(agentPresetTitle(state.multiAgentConfig.preset)))
+
+                Spacer(minLength: 0)
+            }
+
+            if state.multiAgentConfig.preset == .custom {
+                agentCustomThreadsStepper
+            }
+
+            SecondaryInfoRow(
+                text: agentThreadsExplanation,
+                symbol: "person.2.fill",
+                symbolColor: .secondary
+            )
+
+            if let warning = agentConcurrencyWarning {
+                SecondaryInfoRow(text: warning.text, symbol: warning.symbol, symbolColor: warning.color)
+            }
+
+            SecondaryInfoRow(
+                text: agentQuotaText,
+                symbol: agentQuotaSymbol,
+                symbolColor: agentQuotaColor
+            )
+
+            if state.activeProvider?.id != "openai" {
+                SecondaryInfoRow(
+                    text: L("La délégation est pilotée par Codex. La compatibilité dépend du modèle et des outils exposés."),
+                    symbol: "info.circle",
+                    symbolColor: .secondary
+                )
+            }
+        }
+    }
+
+    /// The free-form value, reachable from the `Personnalisé…` preset. The UI
+    /// tops out at 40; beyond that the setting only burns quota faster.
+    private var agentCustomThreadsStepper: some View {
+        Stepper(value: Binding(
+            get: { state.multiAgentConfig.maxConcurrentThreads },
+            set: { state.setMultiAgentThreads($0) }
+        ), in: CodexMultiAgentConfig.minimumThreads...CodexMultiAgentConfig.recommendedMaximumThreads) {
+            HStack(spacing: 6) {
+                Text(L("Threads personnalisés"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("\(state.multiAgentConfig.maxConcurrentThreads)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+            }
+        }
+        .controlSize(.small)
+        .disabled(state.isScreenshotMode || state.applyingMultiAgentConfig)
+        .accessibilityLabel(Text(L("Threads personnalisés")))
+    }
+
+    @ViewBuilder
+    private var agentDisabledContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L("Permet à Codex de déléguer des tâches indépendantes à plusieurs sous-agents."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            SecondaryInfoRow(
+                text: L("Fonction stable de Codex, désactivée par défaut."),
+                symbol: "info.circle",
+                symbolColor: .secondary
+            )
+        }
+    }
+
+    /// The user wrote `[features.multi_agent_v2]` themselves: show it, and point
+    /// at the file instead of editing it.
+    @ViewBuilder
+    private var agentExternalContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L("Configuration externe détectée"))
+                .font(.callout.weight(.medium))
+
+            SecondaryInfoRow(
+                text: agentThreadsExplanation,
+                symbol: "person.2.fill",
+                symbolColor: .secondary
+            )
+
+            SecondaryInfoRow(
+                text: L("Configuration gérée dans ~/.codex/config.toml"),
+                symbol: "lock.doc",
+                symbolColor: .secondary
+            )
+
+            Button {
+                state.openConfigToml()
+            } label: {
+                Label(L("Ouvrir config.toml"), systemImage: "arrow.up.forward.square")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(state.isScreenshotMode)
+            .help(L("Ouvre ~/.codex/config.toml dans l’éditeur par défaut"))
+        }
+    }
+
+    /// Advanced, collapsed by default: nothing essential hides here — the
+    /// enabled state, the preset and the sub-agent count stay visible above.
+    private var agentOptions: some View {
+        DisclosureGroup(isExpanded: $agentOptionsExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Text(L("Source de configuration"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(agentSourceText)
+                        .font(.caption.weight(.medium))
+                    Spacer(minLength: 0)
+                }
+
+                if !state.multiAgentConfig.isUserManaged {
+                    agentCustomThreadsStepper
+                }
+
+                SecondaryInfoRow(
+                    text: L("Cette limite inclut l’agent principal."),
+                    symbol: "info.circle",
+                    symbolColor: .secondary
+                )
+                SecondaryInfoRow(
+                    text: L("Pris en compte à la prochaine session Codex."),
+                    symbol: "clock.arrow.circlepath",
+                    symbolColor: .secondary
+                )
+                SecondaryInfoRow(
+                    text: L("Pour demander explicitement la délégation : %@", L("Utilise des sous-agents en parallèle pour les tâches indépendantes.")),
+                    symbol: "text.quote",
+                    symbolColor: .secondary
+                )
+
+                Button {
+                    state.openConfigToml()
+                } label: {
+                    Label(L("Ouvrir config.toml"), systemImage: "arrow.up.forward.square")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(state.isScreenshotMode)
+            }
+            .padding(.top, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            HStack {
+                Text(L("Options avancées"))
+                    .font(.caption.weight(.medium))
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .controlSize(.small)
+    }
+
+    private var agentSourceText: String {
+        switch state.multiAgentConfig.source {
+        case .proxycodexManaged: return L("Gérée par Proxycodex")
+        case .userManaged: return L("Gérée dans config.toml")
+        case .absent: return L("Absente de config.toml")
+        }
+    }
+
+    private func agentPresetTitle(_ preset: MultiAgentPreset) -> String {
+        guard let threads = preset.threadCount else { return L("Personnalisé") + "…" }
+        return "\(L(agentPresetName(preset))) · \(threads) \(L("threads"))"
+    }
+
+    private func agentPresetName(_ preset: MultiAgentPreset) -> String {
+        switch preset {
+        case .economical: return "Économe"
+        case .recommended: return "Recommandé"
+        case .intensive: return "Intensif"
+        case .veryIntensive: return "Très intensif"
+        case .custom: return "Personnalisé"
+        }
+    }
+
+    /// “8 threads = 1 agent principal + jusqu’à 7 sous-agents” — never
+    /// “8 threads = 8 sous-agents”.
+    private var agentThreadsExplanation: String {
+        let threads = state.multiAgentConfig.maxConcurrentThreads
+        let subagents = state.multiAgentConfig.maxSubagents
+        guard subagents > 0 else { return L("1 thread = aucun sous-agent disponible") }
+        return L("%lld threads = 1 agent principal + jusqu’à %lld sous-agents", threads, subagents)
+    }
+
+    private var agentConcurrencyWarning: (text: String, symbol: String, color: Color)? {
+        switch state.multiAgentConfig.concurrencyLevel {
+        case .noSubagents:
+            return (L("1 thread = aucun sous-agent disponible"), "info.circle", .secondary)
+        case .moderate:
+            return (L("Consommation modérée"), "gauge.with.needle", .secondary)
+        case .recommended:
+            return (L("Recommandé"), "checkmark.circle", .green)
+        case .high:
+            return (L("Consommation élevée"), "exclamationmark.triangle", .orange)
+        case .veryHigh:
+            return (
+                "\(L("Concurrence très élevée")) — \(L("Peut accélérer fortement la consommation du quota."))",
+                "exclamationmark.triangle",
+                .orange
+            )
+        case .risky:
+            return (
+                L("Risque élevé d’erreurs 429 et d’épuisement rapide du quota."),
+                "exclamationmark.triangle.fill",
+                .red
+            )
+        }
+    }
+
+    private var agentQuotaText: String {
+        let advice = state.multiAgentQuotaAdvice
+        let remaining = state.multiAgentQuotaRemainingPercent.map { Int($0.rounded()) }
+        switch advice {
+        case .unavailable:
+            return L("Quota non disponible · Multi-Agent reste utilisable.")
+        case .comfortable:
+            return L("Quota confortable · %lld %% restant", remaining ?? 0)
+        case .adequate:
+            return L("Quota correct · %lld %% restant", remaining ?? 0) + " · " + L("8 threads recommandé.")
+        case .limited:
+            return L("Quota limité · %lld %% restant", remaining ?? 0) + " · " + L("4 à 8 threads conseillés.")
+        case .low:
+            return L("Quota faible · %lld %% restant", remaining ?? 0) + " · " + L("Mode Économe recommandé.")
+        }
+    }
+
+    private var agentQuotaSymbol: String {
+        switch state.multiAgentQuotaAdvice {
+        case .unavailable: return "questionmark.circle"
+        case .comfortable: return "checkmark.circle.fill"
+        case .adequate: return "checkmark.circle"
+        case .limited: return "exclamationmark.circle"
+        case .low: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var agentQuotaColor: Color {
+        switch state.multiAgentQuotaAdvice {
+        case .unavailable: return .secondary
+        case .comfortable: return .green
+        case .adequate: return .green
+        case .limited: return .orange
+        case .low: return .red
         }
     }
 
