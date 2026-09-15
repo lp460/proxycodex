@@ -280,3 +280,36 @@
 "Concurrence Multi-Agent réglée sur %lld threads." = "Multi-Agent concurrency set to %lld threads.";
 "Impossible de mettre à jour Multi-Agent : %@" = "Could not update Multi-Agent: %@";
 "Multi-Agent : configuration illisible (%@)" = "Multi-Agent: unreadable configuration (%@)";
+
+/* Multi-Agent V2 — compatibility observed during real use. */
+"Multi-Agent V2 · support natif Codex" = "Multi-Agent V2 · native Codex support";
+"Multi-Agent V2 · non vérifié avec ce modèle" = "Multi-Agent V2 · not verified with this model";
+"Multi-Agent V2 · utilisation observée" = "Multi-Agent V2 · use observed";
+"Multi-Agent V2 · validé avec ce modèle" = "Multi-Agent V2 · verified with this model";
+"Multi-Agent V2 · non vérifié" = "Multi-Agent V2 · not verified";
+"Multi-Agent V2 · non compatible avec ce modèle" = "Multi-Agent V2 · not compatible with this model";
+"Multi-Agent V2 · à revalider" = "Multi-Agent V2 · to re-verify";
+"Dernier essai non concluant" = "Last attempt inconclusive";
+"À revalider à la prochaine utilisation" = "Will be re-verified on next use";
+"En attente d’un cycle complet" = "Waiting for a full cycle";
+"Aucun test lancé : la compatibilité est apprise pendant l’utilisation réelle." = "No test is run: compatibility is learned during real use.";
+"Authentification requise" = "Authentication required";
+"Quota insuffisant" = "Insufficient quota";
+"Accès refusé" = "Access denied";
+"Endpoint introuvable" = "Endpoint not found";
+"Délai dépassé" = "Timed out";
+"Rate limit" = "Rate limited";
+"Provider indisponible" = "Provider unavailable";
+"Réseau indisponible" = "Network unavailable";
+"Requête invalide" = "Invalid request";
+"Requête non supportée" = "Unsupported request";
+"Erreur de protocole fournisseur" = "Provider protocol error";
+"Incompatibilité de protocole" = "Protocol incompatibility";
+"Cause inconnue" = "Unknown cause";
+"Multi-Agent · %@ : première utilisation observée." = "Multi-Agent · %@: first use observed.";
+"Multi-Agent · %@ : sous-agent créé avec succès · compatibilité validée." = "Multi-Agent · %@: sub-agent created successfully · compatibility verified.";
+"Multi-Agent · %@ : essai non concluant · %@." = "Multi-Agent · %@: inconclusive attempt · %@.";
+"Multi-Agent · %@ : compatibilité conservée · essai non concluant · %@." = "Multi-Agent · %@: compatibility kept · inconclusive attempt · %@.";
+"Multi-Agent · %@ : non compatible (%@)." = "Multi-Agent · %@: not compatible (%@).";
+"Multi-Agent · %@ : validation à revalider à la prochaine utilisation." = "Multi-Agent · %@: verification will be repeated on next use.";
+"Multi-Agent · %@ : aucune observation pour l’instant." = "Multi-Agent · %@: nothing observed yet.";

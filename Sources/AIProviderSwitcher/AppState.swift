@@ -31,6 +31,10 @@ final class AppState: ObservableObject {
     let discoveredStore = DiscoveredModelStore(url: DiscoveredModelStore.defaultURL())
     let selectionStore = ModelSelectionStore(url: ModelSelectionStore.defaultURL())
     let usageService = ProviderUsageService(timeout: 6, localize: { L($0) })
+    /// Passive Multi-Agent compatibility: learned from the adapter proxy's
+    /// structured observations, never from a launched probe.
+    let capabilityStore = MultiAgentCapabilityStore(url: MultiAgentCapabilityStore.defaultURL())
+    let capabilityLog = MultiAgentEventLog(url: MultiAgentEventLog.defaultURL())
     private var discovered: [String: DiscoveredModels] = [:]
     /// Per-provider subset of models exposed through Codex's finite native
     /// slugs, as chosen by the user. Absent = keep the provider's first models.
@@ -67,8 +71,15 @@ final class AppState: ObservableObject {
     /// Set when `config.toml` could not be read; the panel then says so instead
     /// of pretending the feature is simply off.
     @Published private(set) var multiAgentReadError: String?
+    /// Per `providerID + modelID` Multi-Agent evidence, as observed in real
+    /// sessions. Refreshed from the proxy's event log; never probed.
+    @Published private(set) var capabilityRecords: [String: ModelCapabilityRecord] = [:]
+    /// Cached `codex --version`, read at most once per launch.
+    @Published private(set) var codexVersion: String?
 
     private var observationTask: Task<Void, Never>?
+    private var capabilityTask: Task<Void, Never>?
+    private var lastEventLogSize: UInt64 = 0
     private var nextLogID = 1
     private let maxLogs = 100
     private var configWatcher: DispatchSourceFileSystemObject?
@@ -126,6 +137,9 @@ final class AppState: ObservableObject {
                 maxConcurrentThreads: CodexMultiAgentConfig.defaultThreads,
                 source: .proxycodexManaged
             )
+            // Deterministic compatibility example: a model that really ran a
+            // sub-agent cycle in a past session. No network, no file read.
+            loadScreenshotCapabilities()
             loadScreenshotUsage()
         } else {
             // Keep keys across restarts: persistence is ON by default (0600 file,
@@ -179,6 +193,104 @@ final class AppState: ObservableObject {
     }
 
     // MARK: Quota & usage
+
+    // MARK: Passive Multi-Agent compatibility
+
+    /// How a provider reaches Codex, which decides what a status can mean.
+    /// OpenAI speaks Codex's native protocol; Ollama is implemented by Codex
+    /// itself without an adapter; everything else goes through the bridge.
+    func supportPath(for providerID: String) -> MultiAgentSupportPath {
+        if providerID == "openai" { return .nativeCodex }
+        return CodexConfigGenerator.proxyPort(for: providerID) == nil ? .unbridged : .bridged
+    }
+
+    /// Observed compatibility for one provider+model. Nothing is inferred from
+    /// the model's name or from the provider's claimed capabilities.
+    func multiAgentCompatibility(for providerID: String, model: String) -> MultiAgentCompatibility {
+        let key = ModelCapabilityRecord(providerID: providerID, modelID: model).key
+        return MultiAgentCompatibility(
+            path: supportPath(for: providerID),
+            record: capabilityRecords[key]?.multiAgent
+        )
+    }
+
+    /// Observed compatibility for what Codex is currently talking to.
+    var activeMultiAgentCompatibility: MultiAgentCompatibility {
+        multiAgentCompatibility(for: snapshot.activeProviderID, model: snapshot.activeModel)
+    }
+
+    /// Watches the proxy's observation log. A local file read, on a slow timer:
+    /// it never contacts a provider and adds no request to a session.
+    private func startCapabilityObservation() {
+        guard !screenshotMode, capabilityTask == nil else { return }
+        capabilityTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.ingestMultiAgentObservations()
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+            }
+        }
+    }
+
+    /// Reads what the proxies observed since the last pass. The log is only
+    /// touched when its size changed, so the steady-state cost is one `stat`.
+    func ingestMultiAgentObservations() async {
+        guard !screenshotMode, capabilityLog.exists() else { return }
+        let size = capabilityLog.currentSize()
+        guard size > 0, size != lastEventLogSize else { return }
+        let events = capabilityLog.drain()
+        lastEventLogSize = capabilityLog.currentSize()
+        guard !events.isEmpty else { return }
+        let version: String?
+        if let known = codexVersion {
+            version = known
+        } else {
+            version = await resolveCodexVersion()
+        }
+        let changes = await capabilityStore.apply(events, codexVersion: version)
+        capabilityRecords = Dictionary(
+            uniqueKeysWithValues: await capabilityStore.all().map { ($0.key, $0) })
+        for change in changes {
+            log(multiAgentLogMessage(for: change))
+        }
+    }
+
+    /// What the journal says about a status transition. Technical vocabulary
+    /// stays out of it: the user reads "validé", not "namespace restored".
+    private func multiAgentLogMessage(for change: MultiAgentCapabilityChange) -> String {
+        let model = change.modelID
+        let reason = L(MultiAgentFailureReason(code: change.reason).localizationKey)
+        if change.current == change.previous {
+            // No status movement: new information only. An established
+            // conclusion, if any, is preserved.
+            return L("Multi-Agent · %@ : compatibilité conservée · essai non concluant · %@.",
+                     model, reason)
+        }
+        switch change.current {
+        case .validated:
+            return L("Multi-Agent · %@ : sous-agent créé avec succès · compatibilité validée.", model)
+        case .observed:
+            return L("Multi-Agent · %@ : première utilisation observée.", model)
+        case .inconclusive:
+            return L("Multi-Agent · %@ : essai non concluant · %@.", model, reason)
+        case .incompatible:
+            return L("Multi-Agent · %@ : non compatible (%@).", model, reason)
+        case .stale:
+            return L("Multi-Agent · %@ : validation à revalider à la prochaine utilisation.", model)
+        case .unknown:
+            return L("Multi-Agent · %@ : aucune observation pour l’instant.", model)
+        }
+    }
+
+    /// `codex --version`, run at most once per launch and cached.
+    private func resolveCodexVersion() async -> String? {
+        if let codexVersion { return codexVersion }
+        guard let executable = AppState.findCodexExecutable() else { return nil }
+        let version = await Task.detached(priority: .utility) {
+            CodexVersionProbe.version(of: executable)
+        }.value
+        codexVersion = version
+        return version
+    }
 
     /// Background refresh, with a small in-memory TTL. A quota problem never
     /// invalidates model routing or provider compatibility.
@@ -294,6 +406,41 @@ final class AppState: ObservableObject {
 
     private struct MissingCodexError: LocalizedError {
         var errorDescription: String? { "Codex CLI introuvable." }
+    }
+
+    /// Screenshot-only capability state: deterministic, secret-free, and never
+    /// written to disk. Mirrors what a real validated session looks like.
+    private func loadScreenshotCapabilities() {
+        let validatedAt = Date().addingTimeInterval(-3_600)
+        let records = [
+            ModelCapabilityRecord(
+                providerID: "openai", modelID: "gpt-5.6",
+                multiAgent: MultiAgentCapabilityRecord(status: .unknown)),
+            ModelCapabilityRecord(
+                providerID: "deepseek", modelID: "deepseek-v4-flash",
+                multiAgent: MultiAgentCapabilityRecord(
+                    status: .validated, validatedAt: validatedAt,
+                    lastObservedAt: validatedAt, codexVersion: "0.154.0-alpha.6.2",
+                    bridgeVersion: MultiAgentCapabilityStore.bridgeCapabilityVersion)),
+            ModelCapabilityRecord(
+                providerID: "opencode-go", modelID: "grok-4.6",
+                multiAgent: MultiAgentCapabilityRecord(
+                    status: .validated, validatedAt: validatedAt,
+                    lastObservedAt: validatedAt, codexVersion: "0.154.0-alpha.6.2",
+                    bridgeVersion: MultiAgentCapabilityStore.bridgeCapabilityVersion)),
+            ModelCapabilityRecord(
+                providerID: "openrouter", modelID: "openrouter/free",
+                multiAgent: MultiAgentCapabilityRecord(
+                    status: .inconclusive, lastObservedAt: validatedAt,
+                    reason: "rate_limited")),
+            ModelCapabilityRecord(
+                providerID: "glm", modelID: "glm-5.3",
+                multiAgent: MultiAgentCapabilityRecord(
+                    status: .stale, validatedAt: validatedAt, lastObservedAt: validatedAt,
+                    bridgeVersion: MultiAgentCapabilityStore.bridgeCapabilityVersion - 1))
+        ]
+        capabilityRecords = Dictionary(uniqueKeysWithValues: records.map { ($0.key, $0) })
+        codexVersion = "0.154.0-alpha.6.2"
     }
 
     private func loadScreenshotUsage() {
@@ -525,6 +672,11 @@ final class AppState: ObservableObject {
             // Multi-Agent V2 lives in config.toml too: read it once here, and
             // never let a malformed file abort the rest of the bootstrap.
             refreshMultiAgentConfig(announce: true)
+            // Compatibility evidence already recorded by earlier sessions.
+            _ = await capabilityStore.load()
+            capabilityRecords = Dictionary(
+                uniqueKeysWithValues: await capabilityStore.all().map { ($0.key, $0) })
+            startCapabilityObservation()
         } catch {
         log(L("Init error: %@", error.localizedDescription))
         }
@@ -1212,7 +1364,14 @@ final class AppState: ObservableObject {
     // Bumped whenever the adapter contract changes (base URLs, pairing, flags):
     // a stale running proxy would otherwise be kept because its metadata still
     // matches everything this version compares.
-    private let proxyVersion = "2026-09-11-opencode-go-v9"
+    // v10: the adapter now normalizes Codex-only *input items* (`agent_message`,
+    // an encrypted reasoning blob, `additional_tools`). A running v9 proxy would
+    // keep rejecting every child thread with 422/400, so the version bump is
+    // what makes the panel replace it instead of trusting the stale process.
+    // v11: a namespaced `function_call` whose namespace is no longer in the
+    // bridge (restarted proxy) used to be forwarded with its `namespace` key
+    // intact; the wrapper is now always dropped before the provider sees it.
+    private let proxyVersion = "2026-09-14-opencode-go-v11"
 
     /// Stable, non-reversible metadata used to detect credential changes and
     /// restart a proxy that still carries an older key.
@@ -1270,6 +1429,11 @@ final class AppState: ObservableObject {
             var environment = ProcessInfo.processInfo.environment
             environment["AI_PROVIDER_SWITCHER_PROXY_VERSION"] = proxyVersion
             environment["AI_PROVIDER_SWITCHER_PROXY_STATE"] = proxyMetadataURL(for: port).path
+            // Identity the proxy stamps on its Multi-Agent observations, so the
+            // app keys them by provider + model instead of guessing from a name.
+            environment["AI_PROVIDER_SWITCHER_PROVIDER_ID"] = provider.id
+            environment["AI_PROVIDER_SWITCHER_STATE_DIR"] =
+                KeyStore.defaultPersistentURL().deletingLastPathComponent().path
             if let key = keyStore.secret(for: provider.id)?.asString(), !key.isEmpty {
                 environment["AI_PROVIDER_SWITCHER_PROXY_API_KEY"] = key
             }

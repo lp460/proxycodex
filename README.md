@@ -82,7 +82,7 @@ GLM (Z.ai) expose le catalogue Responses sous `https://api.z.ai/api/v1` — la b
 
 ![Section « Agents Codex » — Multi-Agent V2 activé, preset Recommandé, quota confortable](docs/screenshots/panel-multi-agent.png)
 
-> Capture du panneau en mode démonstration : activation, preset `Recommandé · 8 threads`, décomposition « 1 agent principal + jusqu’à 7 sous-agents » et recommandation issue du quota.
+> Capture de la section en mode démonstration : activation, preset `Recommandé · 8 threads`, décomposition « 1 agent principal + jusqu’à 7 sous-agents », recommandation issue du quota et statut Multi-Agent du modèle actif.
 
 La section **Agents Codex** du panneau pilote la parallélisation de Codex elle-même. C’est une capacité d’orchestration de Codex : elle ne dépend pas du provider actif, et le panneau ne parle donc jamais d’« agents DeepSeek » ou d’« agents GLM ».
 
@@ -147,6 +147,56 @@ La section réutilise la lecture de quota existante (aucun second service) pour 
 
 `multi_agent_version`, présent dans le catalogue des modèles, est une métadonnée de modèle : elle n’a rien à voir avec `features.multi_agent_v2`, qui est un réglage global de session. Les deux ne sont pas confondus.
 
+### Compatibilité Multi-Agent apprise à l’usage
+
+Activer Multi-Agent n’est pas la même chose que savoir si un modèle donné sait réellement s’en servir. Proxycodex répond à cette seconde question par l’observation, jamais par un test :
+
+- **Proxycodex ne benchmarke pas automatiquement tous les modèles.** Aucun scan, aucune boucle de certification, aucun bouton « Tester ». Ouvrir le panneau, rafraîchir les modèles, changer de provider ou changer de modèle ne déclenche **aucune requête** vers un modèle.
+- **La compatibilité est apprise passivement, pendant l’utilisation réelle.** Le proxy note uniquement ce que le protocole montre : les outils du namespace `collaboration` exposés par Codex, l’appel de fonction réellement émis par le provider, l’appel restauré pour Codex, la création d’un thread enfant, le retour du résultat. Le texte du modèle n’est jamais une preuve : « j’ai créé un sous-agent » ne valide rien.
+- **Un modèle est marqué « Validé » uniquement lorsqu’un vrai sous-agent a été créé par Codex dans une session réelle** : le modèle a émis l’appel, le bridge l’a restauré pour Codex, et Codex a démarré un thread enfant dont la requête est revenue au proxy avec le `parent_thread_id` de la session. Le proxy ne lit jamais le contenu d’un sous-agent : il ne sait pas ce qu’il a répondu, seulement que le cycle a réellement démarré. Si une erreur provider interrompt le cycle juste après la création du sous-agent, la validation n’est pas accordée. Si le modèle ne délègue jamais, le statut reste « Non vérifié » — c’est un résultat parfaitement normal, et il n’est jamais forcé.
+- **Les erreurs de quota, d’authentification, de réseau ou de rate limit ne signifient pas qu’un modèle est incompatible** : 401, 402, 403, 429, timeouts, DNS, 5xx, crédit épuisé ou clé absente produisent « Non vérifié · dernier essai non concluant » avec la cause, et une validation déjà acquise est conservée. Un statut « Non compatible » est réservé à une incompatibilité technique reproductible.
+
+Les statuts affichés sont volontairement courts :
+
+| Statut | Signification |
+|---|---|
+| Non vérifié | Jamais observé, ou dernier essai non concluant (quota, auth, réseau) |
+| Utilisation observée | Un vrai appel Multi-Agent est passé par le bridge, le cycle complet n’est pas encore prouvé |
+| Validé avec ce modèle | Un sous-agent réellement créé par Codex dans une session, sans erreur provider interrompant le cycle |
+| Non compatible | Incompatibilité technique reproductible, jamais déduite d’une erreur temporaire |
+| À revalider | Validation acquise avec un bridge plus ancien ; se revalidera toute seule à la prochaine utilisation réelle |
+
+La compatibilité est enregistrée par **provider + modèle** (`glm/glm-5.3` et `opencode-go/grok-4.6` sont deux entrées distinctes), avec la version de Codex et la version du bridge qui ont servi à la validation. Une nouvelle version du bridge rend les anciennes validations « À revalider », sans lancer aucune requête. Le fichier ne contient que ces métadonnées : jamais de prompt, d’arguments d’outil, de résultat de sous-agent, de clé ni de jeton.
+
+### Bridge des namespaces Codex (providers routés)
+
+Codex expose une partie de ses outils sous forme de **namespaces** (par exemple `collaboration`, avec `spawn_agent`, `wait_agent`, `send_message`, `list_agents`, `interrupt_agent`, `followup_task`). Les providers routés ne connaissent pas cette forme : leur API n’accepte que des fonctions classiques. Sans traitement, ces outils disparaissent et Multi-Agent devient inutilisable avec GLM, DeepSeek, OpenRouter, Claude ou OpenCode.
+
+Le proxy applique donc trois étapes, génériques et sans nom codé en dur :
+
+```text
+Codex : namespace collaboration + spawn_agent
+   ↓  flatten (bridge_tools)
+provider : function collaboration__spawn_agent
+   ↓  le provider répond function_call collaboration__spawn_agent
+   ↓  restore (restore_output_items), via le mapping du bridge — jamais en découpant le nom
+Codex : function_call namespace=collaboration + name=spawn_agent
+   ↓  Codex exécute, renvoie l’historique
+   ↓  bridge_input_items re-aplatit pour le tour suivant
+provider : collaboration__spawn_agent, la conversation continue
+```
+
+Le mapping du bridge reste la source de vérité : le namespace n’est jamais déduit d’un `split("__")`, ce qui permet à une fonction `search`, à `alpha__search` et à `beta__search` de coexister. Les appels restaurés conservent `id`, `call_id`, `status` et `arguments` d’origine, donc la corrélation `function_call_output` reste intacte. Un namespace au format inattendu est ignoré avec un log technique minimal : la requête et les autres outils continuent de fonctionner.
+
+Chaque cycle observé alimente le journal (`Multi-Agent · glm-5.3 : compatibilité validée.`) et les logs du proxy restent techniques et sans contenu utilisateur :
+
+```text
+[proxy GLM] namespace collaboration.spawn_agent -> collaboration__spawn_agent
+[proxy GLM] restore collaboration__spawn_agent -> collaboration.spawn_agent
+```
+
+Ce chemin est identique pour tout futur namespace Codex : aucun code spécifique à `collaboration` n’est nécessaire.
+
 ## Comment un changement de provider fonctionne
 
 1. L’application vérifie la clé ou le mode sans clé. Si la clé manque, elle ouvre le champ pour ce provider précis ; l’injection applique ensuite la sélection et relance Codex.
@@ -191,7 +241,7 @@ La requête passe par l'adaptateur local (`GET /_switcher/upstream-models`), seu
 |---|---|
 | DeepSeek, GLM, OpenRouter | `/v1/models` de l'upstream (GLM : catalogue Responses sous `api.z.ai/api/v1/models`) |
 | OpenCode Zen | `opencode models opencode` via la CLI détectée — la passerelle ne distingue pas le palier gratuit |
-| OpenCode Go | `/v1/models` de la passerelle Go, filtré sur les modèles exposés par `/v1/responses` |
+| OpenCode Go | `/v1/models` de la passerelle Go, tel quel (plafonné à 64 entrées) ; l’adaptateur traduit ensuite Responses → Chat Completions pour les modèles qui ne parlent pas Responses nativement |
 | Claude Code | `/v1/models` d'Anthropic, avec le jeton de Claude Code |
 | Ollama | interrogé directement, sans adaptateur |
 
@@ -296,13 +346,15 @@ Le proxy convertit les messages et les tools entre le format Responses de Codex 
 
 ## OpenCode
 
-La CLI OpenCode est un agent, pas un backend HTTP : elle n'expose que son propre protocole de sessions (`opencode serve` → `POST /session/{id}/prompt`), inutilisable comme model provider. Ce qui est intégré ici est donc la passerelle que la CLI interroge elle-même : **OpenCode Zen** et, séparément, l'abonnement **OpenCode Go**. Les deux bases sont compatibles OpenAI et servent `/v1/responses`, ce qu'attend Codex.
+La CLI OpenCode est un agent, pas un backend HTTP : elle n'expose que son propre protocole de sessions (`opencode serve` → `POST /session/{id}/prompt`), inutilisable comme model provider. Ce qui est intégré ici est donc la passerelle que la CLI interroge elle-même : **OpenCode Zen** et, séparément, l'abonnement **OpenCode Go**. Les deux bases sont compatibles OpenAI ; chacune sert `/v1/responses` pour une partie de son catalogue et `/v1/chat/completions` pour le reste, et c'est l'adaptateur qui présente à Codex le contrat Responses qu'il attend.
 
 ### OpenCode Go
 
 `opencode-go` utilise `https://opencode.ai/zen/go/v1` (adaptateur `127.0.0.1:18893`) et demande une clé Go distincte d'une éventuelle clé Zen. Le proxy lit la clé saisie dans le panneau, puis l'entrée `opencode-go` de `~/.local/share/opencode/auth.json` créée par `/connect` → `OpenCode Go`. Contrairement à Zen, il n'y a pas de repli sur une clé publique.
 
-Go route ses modèles vers Responses, Chat Completions ou Anthropic Messages selon le modèle. L'adaptateur actuel parle Responses à Codex ; il n'expose donc que les modèles documentés sur `/v1/responses` : `grok-4.6`, `gpt-5.6-luna`, `muse-spark-1.3-contributor` et `muse-spark-1.2-contributor`. Les autres modèles Go restent utilisables dans OpenCode, mais ne sont pas annoncés ici pour éviter des requêtes vouées à un 404.
+Go route ses modèles vers Responses, Chat Completions ou Anthropic Messages selon le modèle. Codex, lui, parle toujours Responses à l’adaptateur : c’est l’adaptateur qui s’aligne sur le contrat réel du modèle. `grok-4.6`, `gpt-5.6-luna`, `muse-spark-1.3-contributor` et `muse-spark-1.2-contributor` répondent Responses directement ; tous les autres modèles du catalogue Go sont traduits vers `/v1/chat/completions` avant l’envoi. La découverte annonce donc l’ensemble du catalogue de la passerelle (source `gateway`) plutôt que de masquer un modèle dont le contrat diffère : la différence est absorbée par l’adaptateur, pas par l’utilisateur.
+
+Cette liste ne dit rien de la compatibilité Multi-Agent : elle est apprise passivement, modèle par modèle, pendant de vrais workflows (voir « Compatibilité Multi-Agent apprise à l’usage »). Rien ne garantit que les quelque soixante modèles Go se comportent tous de la même façon, et chacun garde son propre statut.
 
 Le proxy ajoute les en-têtes `x-opencode-session`, `x-opencode-request`, `x-opencode-client` et `User-Agent` attendus pour le routage et l'affinité de cache. L'identifiant de session est dérivé de façon stable à partir de l'ID explicite de la requête ou du premier message utilisateur ; aucune clé n'est écrite dans ces en-têtes ni dans les journaux.
 
@@ -398,6 +450,10 @@ Le mode `--panel-screenshot` utilise des données fictives, désactive les actio
                                              clés locales optionnelles, mode 0600
 ~/Library/Application Support/AI Provider Switcher/discovered-models.json
                                              dernières listes de modèles annoncées par les providers
+~/Library/Application Support/AI Provider Switcher/model-capabilities.json
+                                             compatibilité Multi-Agent observée, par provider + modèle
+~/Library/Application Support/AI Provider Switcher/multi-agent-events.jsonl
+                                             observations techniques du proxy, consommées puis vidées
 ~/Library/Application Support/AI Provider Switcher/provider-proxy.py
                                              copie exécutée de l’adaptateur, rafraîchie à chaque lancement
 ~/Library/Application Support/AI Provider Switcher/proxy-<port>.json

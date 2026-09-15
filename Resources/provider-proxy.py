@@ -31,6 +31,7 @@ import re
 import subprocess
 import ssl
 import sys
+import threading
 import time
 import uuid
 import urllib.request
@@ -582,16 +583,34 @@ TOOL_UNAVAILABLE_OUTPUT = ("Outil non disponible dans cette session : aucune ex�
 #   - function tools: `shell`, `update_plan`, `view_image` and every MCP tool;
 #   - freeform "custom" tools: `apply_patch`, `exec`, code-mode tools;
 #   - the `local_shell` tool;
-#   - hosted tools executed provider-side, such as `web_search`.
+#   - hosted tools executed provider-side, such as `web_search`;
+#   - namespaces: `{"type": "namespace", "name": "collaboration", "tools": [...]}`
+#     (`spawn_agent`, `wait_agent`, `send_message`, ...).
 # Only OpenAI implements the non-function flavors on the wire. Instead of
 # dropping them (which leaves a third-party provider unable to edit files or
 # run commands), the bridge rewrites them as function tools on the way out and
 # restores the exact item shape Codex expects on the way back. Codex then
 # executes them itself — shell, apply_patch, MCP servers, plugins — with any
 # provider. Hosted tools stay out unless the provider really serves them.
+#
+# Namespaces are flattened one level deep: each nested tool becomes the flat
+# function `<namespace>__<tool>`, and the round trip restores
+# `{"type": "function_call", "namespace": ..., "name": ...}`. Codex expects the
+# restored call to carry the namespace again, so the flat name is never used as
+# the logical identity — the bridge entry is.
 # ---------------------------------------------------------------------------
 
 SAFE_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Codex wraps related tools in a namespace (`collaboration`, `functions`, ...).
+# Providers only understand flat function tools, so nested tools are published
+# as `<namespace>__<tool>`.
+NAMESPACE_TOOL_TYPE = "namespace"
+NAMESPACE_SEPARATOR = "__"
+
+# Bumped whenever the flatten/restore contract changes, so recorded Multi-Agent
+# validations can be re-observed instead of trusted (`stale` in the app).
+BRIDGE_CAPABILITY_VERSION = 1
 
 # Freeform custom tools carry one raw string payload; this is the JSON property
 # used to transport it through a function tool.
@@ -622,6 +641,44 @@ OPENAI_ONLY_REQUEST_FIELDS = ("service_tier", "prompt_cache_key", "safety_identi
 # Reasoning efforts every provider understands. Codex may ask for OpenAI-only
 # levels (`xhigh`, `max`, `ultra`, `minimal`), which are clamped.
 PORTABLE_REASONING_EFFORTS = {"low", "medium", "high"}
+
+# ---------------------------------------------------------------------------
+# Codex-only *input items*
+#
+# Codex multi-agent sessions send protocol items that no third-party Responses
+# endpoint implements, and a strict gateway rejects the whole request over one
+# item it cannot parse instead of ignoring it:
+#
+#   * `agent_message` — the envelope a parent thread hands to a child thread
+#     (and the child's answer back). OpenCode Go answers `422`.
+#   * a `reasoning` item carrying `encrypted_content` (or `content: null`) —
+#     the blob is encrypted for the account that produced it. OpenCode Go
+#     answers `400`, even for the blob it sent itself one turn earlier.
+#
+# Both are translated here rather than relayed. `reasoning` summaries are
+# portable; `agent_message` becomes a plain user message, because that is what
+# it is to the model that reads it.
+# ---------------------------------------------------------------------------
+
+# Item type carrying an inter-agent message.
+CODEX_AGENT_MESSAGE_TYPE = "agent_message"
+
+# Item types every Responses-compatible endpoint accepts on input. Anything
+# else is Codex-only (or an OpenAI-side hosted-tool artifact), so it is dropped
+# instead of taking the whole request down with it.
+PORTABLE_INPUT_ITEM_TYPES = ("message", "reasoning", "function_call",
+                             "function_call_output", "custom_tool_call",
+                             "custom_tool_call_output", "local_shell_call",
+                             "local_shell_call_output", "item_reference")
+
+# Content parts that survive the trip to a third-party endpoint.
+PORTABLE_CONTENT_PART_TYPES = ("input_text", "output_text", "text")
+
+# `include` values scoped to an OpenAI account. The encrypted reasoning blob
+# only makes sense for the backend that produced it: a third-party gateway
+# rejects it on the way back (see `sanitize_input_items`), so it is neither
+# requested nor forwarded.
+OPENAI_ONLY_INCLUDE_VALUES = {"reasoning.encrypted_content"}
 
 
 def _tool_name(tool):
@@ -667,23 +724,99 @@ def _freeform_schema(tool):
     }
 
 
-def bridge_tools(tools):
-    """Translate Codex's tool list into tools this provider can actually call.
+def _namespace_tool_name(namespace, name):
+    """Provider-visible name for a tool nested in a Codex namespace."""
+    return "%s%s%s" % (namespace, NAMESPACE_SEPARATOR, name)
 
-    Returns `(upstream_tools, bridge)`. `bridge` maps the name seen by the
-    provider to `{"kind", "name"}`, which `restore_output_items` uses to rebuild
-    the original Responses item (`custom_tool_call`, `local_shell_call`, or a
-    renamed `function_call`).
+
+def _namespace_of(tool):
+    """Namespace a Codex namespace tool declares.
+
+    Current Codex sends `{"type": "namespace", "name": ..., "tools": [...]}`.
+    The `namespace` key is accepted too: it is the field name this tool family
+    uses elsewhere (dynamic tool specs), so a future revision may switch to it.
     """
-    if not SUPPORTS_TOOLS:
-        return [], {}
-    upstream = []
-    bridge = {}
-    taken = set()
-    seen_originals = set()
-    for tool in (tools or []):
-        if not isinstance(tool, dict):
+    return str(tool.get("name") or tool.get("namespace") or "").strip()
+
+
+def _bridge_namespace(tool, state):
+    """Flatten one namespace into provider-visible function tools.
+
+    Every nested tool is republished as `<namespace>__<tool>`. The bridge entry
+    keeps the namespace and the original name, so a provider call can be
+    restored to `{"type": "function_call", "namespace": ..., "name": ...}`
+    without ever parsing the flat name back apart.
+    """
+    namespace = _namespace_of(tool)
+    nested = tool.get("tools")
+    if not namespace or not isinstance(nested, list):
+        # Fail soft: an unknown future shape must never take the whole request
+        # down, and the other tools must keep working.
+        sys.stderr.write("[proxy %s] namespace non reconnu: %s\n"
+                         % (DISPLAY, json.dumps(tool, default=str)[:200]))
+        return
+    for sub in nested:
+        if not isinstance(sub, dict):
             continue
+        sub_type = sub.get("type")
+        name = str(sub.get("name") or "").strip()
+        if not name:
+            continue
+        if sub_type not in (None, "function"):
+            # A namespaced freeform/hosted tool has no portable wire form: the
+            # Responses `custom_tool_call` item carries no namespace to restore.
+            sys.stderr.write("[proxy %s] namespace %s: %s ignore (type %s)\n"
+                             % (DISPLAY, namespace, name, sub_type))
+            continue
+        logical = "%s/%s" % (namespace, name)
+        if logical.casefold() in state.seen_originals:
+            continue
+        state.seen_originals.add(logical.casefold())
+        provider_name = _safe_tool_name(_namespace_tool_name(namespace, name), state.taken)
+        state.taken.add(provider_name)
+        state.bridge[provider_name] = {"kind": "namespace",
+                                       "namespace": namespace,
+                                       "name": name}
+        state.upstream.append({
+            "type": "function",
+            "name": provider_name,
+            "description": sub.get("description") or "",
+            # Function sub-tools use `parameters`; the dynamic-tool spelling
+            # `inputSchema` is accepted so both shapes bridge.
+            "parameters": sub.get("parameters") or sub.get("inputSchema")
+            or {"type": "object", "properties": {}},
+        })
+        sys.stderr.write("[proxy %s] namespace %s.%s -> %s\n"
+                         % (DISPLAY, namespace, name, provider_name))
+
+
+class _ToolBridgeState:
+    """Provider-visible name bookkeeping for one request.
+
+    Tool lists arrive from more than one place (the top-level `tools` array and
+    `additional_tools` input items), so the mapping is built once per request
+    and shared. Sharing it is what keeps `collaboration__spawn_agent` and a
+    plain `spawn_agent` from colliding.
+    """
+
+    __slots__ = ("upstream", "bridge", "taken", "seen_originals")
+
+    def __init__(self):
+        self.upstream = []
+        self.bridge = {}
+        self.taken = set()
+        self.seen_originals = set()
+
+    def add(self, specs):
+        for tool in (specs or []):
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == NAMESPACE_TOOL_TYPE:
+                _bridge_namespace(tool, self)
+                continue
+            self._add_tool(tool)
+
+    def _add_tool(self, tool):
         tool_type = tool.get("type")
         original = _tool_name(tool)
         if tool_type == "function":
@@ -694,40 +827,337 @@ def bridge_tools(tools):
         elif tool_type in FREEFORM_TOOL_TYPES:
             if not SUPPORTS_APPLY_PATCH and (tool_type == "apply_patch"
                                              or original == "apply_patch"):
-                continue
+                return
             if SUPPORTS_CUSTOM_TOOLS:
                 # Native contract: forward the tool untouched, no restore needed.
-                if original and original.casefold() not in seen_originals:
-                    seen_originals.add(original.casefold())
-                    upstream.append(tool)
-                continue
+                if original and original.casefold() not in self.seen_originals:
+                    self.seen_originals.add(original.casefold())
+                    self.upstream.append(tool)
+                return
             kind = "custom"
             description = tool.get("description") or (
                 "Freeform tool. Send the payload in the `%s` string." % FREEFORM_INPUT_KEY)
             schema = _freeform_schema(tool)
         elif tool_type == "local_shell":
             if SUPPORTS_CUSTOM_TOOLS:
-                upstream.append(tool)
-                continue
+                self.upstream.append(tool)
+                return
             kind = "local_shell"
             description = tool.get("description") or "Run a command in the user's shell."
             schema = LOCAL_SHELL_SCHEMA
         elif tool_type in HOSTED_TOOL_TYPES:
             # Executed by the provider, never by Codex. The Anthropic adapter
             # maps web search to its own server tool; relay providers drop it.
-            continue
+            return
         else:
-            continue
+            return
         normalized = original.casefold()
-        if not original or normalized in seen_originals:
+        if not original or normalized in self.seen_originals:
+            return
+        self.seen_originals.add(normalized)
+        name = _safe_tool_name(original, self.taken)
+        self.taken.add(name)
+        self.bridge[name] = {"kind": kind, "name": original}
+        self.upstream.append({"type": "function", "name": name,
+                              "description": description, "parameters": schema})
+
+
+def bridge_tools(tools, state=None):
+    """Translate Codex's tool list into tools this provider can actually call.
+
+    Returns `(upstream_tools, bridge)`. `bridge` maps the name seen by the
+    provider to `{"kind", "name"}` — plus `{"namespace", ...}` for namespaced
+    tools — which `restore_output_items` uses to rebuild the original Responses
+    item (`custom_tool_call`, `local_shell_call`, a namespaced `function_call`,
+    or a renamed one).
+
+    `state` lets a caller keep building the same mapping from another tool list.
+    """
+    if not SUPPORTS_TOOLS:
+        return [], {}
+    state = state or _ToolBridgeState()
+    state.add(tools)
+    return state.upstream, state.bridge
+
+
+def bridge_additional_tools(input_items, state):
+    """Consume the `additional_tools` items Codex carries in its input.
+
+    Codex advertises the same tools in the top-level `tools` array (the path the
+    Desktop app uses with a model catalog) or inside an `additional_tools`
+    developer item (the fallback path). Both are bridged into the provider's
+    `tools` array, and the envelope itself is dropped: no third-party endpoint
+    implements that item type, and a strict one rejects the whole request over
+    it. The tools it carried must survive, so they are bridged, never discarded.
+    """
+    if not isinstance(input_items, list):
+        return input_items
+    out = []
+    for item in input_items:
+        if not (isinstance(item, dict) and item.get("type") == "additional_tools"
+                and isinstance(item.get("tools"), list)):
+            out.append(item)
             continue
-        seen_originals.add(normalized)
-        name = _safe_tool_name(original, taken)
-        taken.add(name)
-        bridge[name] = {"kind": kind, "name": original}
-        upstream.append({"type": "function", "name": name,
-                         "description": description, "parameters": schema})
-    return upstream, bridge
+        # Namespaces flatten to `<namespace>__<tool>`, the remaining tools bridge
+        # exactly as if they had arrived in the top-level array; duplicates
+        # already advertised there are not repeated.
+        state.add(item["tools"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Passive Multi-Agent compatibility observations
+#
+# Whether a routed provider+model can really run a Multi-Agent V2 workflow is
+# learned from real traffic only. The proxy appends one structured line per
+# meaningful protocol step to a sidecar JSONL the app reads; the app owns the
+# persisted status. Nothing here ever calls a model on its own, and a line
+# carries technical metadata only — never a prompt, a tool argument, a tool
+# result, or a credential.
+# ---------------------------------------------------------------------------
+
+EVENTS_FILE_NAME = "multi-agent-events.jsonl"
+
+# Threads can serve concurrent requests; the observation state must not race.
+_OBSERVATION_LOCK = threading.Lock()
+# call_id -> {namespace, tool} for calls the provider made and we restored.
+_RESTORED_CALLS = {}
+# Calls whose `function_call_output` already came back: Codex executed them.
+_COMPLETED_CALLS = {}
+# Thread ids that already produced a real child thread.
+_CHILD_THREADS = set()
+# Last bridged tool signature, so a long session writes one line, not thousands.
+_BRIDGED_SIGNATURE = None
+
+
+def provider_identifier():
+    """Stable provider id, set by the app; `DISPLAY` is the readable fallback."""
+    return (os.environ.get("AI_PROVIDER_SWITCHER_PROVIDER_ID") or DISPLAY).strip()
+
+
+def state_directory():
+    """Directory the app owns (its side-car home), shared with the Swift side."""
+    override = os.environ.get("AI_PROVIDER_SWITCHER_STATE_DIR")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"),
+                        "Library", "Application Support",
+                        "AI Provider Switcher")
+
+
+def events_path():
+    return os.path.join(state_directory(), EVENTS_FILE_NAME)
+
+
+def record_multi_agent_event(event, **fields):
+    """Append one observation. Failures are swallowed: observations must never
+    break a conversation."""
+    payload = {"event": event,
+               "provider": provider_identifier(),
+               "bridge_version": BRIDGE_CAPABILITY_VERSION,
+               "observed_at": time.time()}
+    payload.update(fields)
+    try:
+        line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        directory = state_directory()
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        descriptor = os.open(events_path(),
+                             os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(descriptor, line)
+        finally:
+            os.close(descriptor)
+    except Exception:
+        pass
+
+
+def _turn_metadata(headers):
+    """Codex's own per-turn metadata, decoded when present."""
+    raw = ""
+    if headers is not None:
+        for key, value in headers.items():
+            if key.lower() == "x-codex-turn-metadata":
+                raw = value or ""
+                break
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def request_thread_context(headers, body=None):
+    """Identify the thread a request belongs to, and whether it is a sub-agent.
+
+    A real child thread is the strongest proof a `spawn_agent` call was executed
+    rather than merely answered: Codex starts it itself and stamps the parent
+    thread id on its requests.
+    """
+    metadata = _turn_metadata(headers)
+    client = (body or {}).get("client_metadata")
+    client = client if isinstance(client, dict) else {}
+    thread_id = (metadata.get("thread_id") or client.get("thread_id")
+                 or client.get("session_id") or "")
+    parent_thread_id = (metadata.get("parent_thread_id")
+                        or client.get("x-codex-parent-thread-id")
+                        or (_header(headers, "x-codex-parent-thread-id")) or "")
+    source = metadata.get("thread_source") or ""
+    subagent = bool(parent_thread_id) or source == "subagent" \
+        or bool(metadata.get("subagent_kind"))
+    return {"thread_id": str(thread_id), "parent_thread_id": str(parent_thread_id),
+            "is_subagent": subagent}
+
+
+def _header(headers, name):
+    if headers is None:
+        return ""
+    for key, value in headers.items():
+        if key.lower() == name:
+            return value or ""
+    return ""
+
+
+def observe_bridged_tools(bridge, model, slug):
+    """Record that Codex's namespaced tools really reached this provider."""
+    global _BRIDGED_SIGNATURE
+    namespaced = sorted(
+        "%s.%s" % (entry.get("namespace", ""), entry.get("name", ""))
+        for entry in (bridge or {}).values()
+        if isinstance(entry, dict) and entry.get("kind") == "namespace")
+    if not namespaced:
+        return
+    signature = (model, tuple(namespaced))
+    with _OBSERVATION_LOCK:
+        if signature == _BRIDGED_SIGNATURE:
+            return
+        _BRIDGED_SIGNATURE = signature
+    record_multi_agent_event(
+        "multi_agent_tools_bridged", model=model, slug=slug,
+        namespaces=sorted({name.split(".", 1)[0] for name in namespaced}),
+        tools=namespaced)
+
+
+def observe_restored_call(item, context):
+    """Record a namespaced call restored into the shape Codex executes."""
+    entry = (context or {}).get("bridge", {}).get(item.get("name") or "")
+    if not isinstance(entry, dict) or entry.get("kind") != "namespace":
+        return
+    call_id = item.get("call_id") or ""
+    thread = (context or {}).get("thread") or {}
+    with _OBSERVATION_LOCK:
+        if call_id:
+            _RESTORED_CALLS[call_id] = {"namespace": entry.get("namespace", ""),
+                                        "tool": entry.get("name", ""),
+                                        "thread_id": thread.get("thread_id", "")}
+            if len(_RESTORED_CALLS) > 200:
+                _RESTORED_CALLS.pop(next(iter(_RESTORED_CALLS)))
+    record_multi_agent_event(
+        "multi_agent_tool_restored",
+        model=(context or {}).get("model"), slug=(context or {}).get("slug"),
+        namespace=entry.get("namespace", ""), tool=entry.get("name", ""),
+        call_id=call_id)
+
+
+def observe_request_history(input_items, context):
+    """Record what Codex sent back: tool results, and real child threads."""
+    thread = (context or {}).get("thread") or {}
+    parent = thread.get("parent_thread_id") or ""
+    results = []
+    with _OBSERVATION_LOCK:
+        for item in (input_items if isinstance(input_items, list) else []):
+            if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                continue
+            call_id = item.get("call_id") or ""
+            known = _RESTORED_CALLS.get(call_id)
+            if known and call_id not in _COMPLETED_CALLS:
+                _COMPLETED_CALLS[call_id] = known
+                results.append((call_id, known))
+        # A brand-new child thread is the strongest proof available here: Codex
+        # created it itself, and stamps the parent thread on every request.
+        seen_child = bool(thread.get("is_subagent") and parent
+                          and parent not in _CHILD_THREADS)
+        if seen_child:
+            _CHILD_THREADS.add(parent)
+    for call_id, known in results:
+        record_multi_agent_event(
+            "multi_agent_tool_result",
+            model=(context or {}).get("model"), slug=(context or {}).get("slug"),
+            namespace=known.get("namespace", ""), tool=known.get("tool", ""),
+            call_id=call_id)
+    if seen_child:
+        # A child thread exists under a parent we restored a call for: the full
+        # cycle really happened. Remember which tool started it.
+        with _OBSERVATION_LOCK:
+            started = [entry for entry in _COMPLETED_CALLS.values()
+                       if entry.get("thread_id") == parent]
+        record_multi_agent_event(
+            "multi_agent_child_thread",
+            model=(context or {}).get("model"), slug=(context or {}).get("slug"),
+            parent_thread_id=parent,
+            tools=sorted({"%s.%s" % (e.get("namespace", ""), e.get("tool", ""))
+                          for e in started}))
+
+
+INCONCLUSIVE_REASONS = {
+    400: "invalid_request",
+    401: "authentication_required",
+    402: "insufficient_balance",
+    403: "forbidden",
+    404: "endpoint_not_found",
+    408: "timeout",
+    422: "unsupported_request",
+    429: "rate_limited",
+}
+
+
+def classify_upstream_error(status):
+    """Map a transport failure to a Multi-Agent verdict.
+
+    A quota, auth, network or provider outage says nothing about whether the
+    model is *able* to run a Multi-Agent workflow, so those never count as
+    incompatibility.
+    """
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return "inconclusive", "network"
+    if status in INCONCLUSIVE_REASONS:
+        return "inconclusive", INCONCLUSIVE_REASONS[status]
+    if status >= 500:
+        return "inconclusive", "provider_error"
+    return "inconclusive", "http_%d" % status
+
+
+def observe_upstream_error(status, model=None, slug=None, detail=None):
+    """Record a refused turn. The provider's own message is kept, truncated,
+    so a 400/422 can be classified without exposing a request payload."""
+    verdict, reason = classify_upstream_error(status)
+    if detail:
+        detail = str(detail).strip().replace("\n", " ")[:200]
+    record_multi_agent_event("multi_agent_upstream_error", verdict=verdict,
+                             reason=reason, http_status=status,
+                             model=model, slug=slug, detail=detail or None)
+
+
+def upstream_error_detail(body):
+    """The provider's own error message, when the body carries one.
+
+    Providers that answer with an opaque `Upstream request failed` are left
+    as they are: the proxy never invents a reason it cannot prove.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    except Exception:
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or "")
+    if isinstance(error, str):
+        return error
+    return ""
 
 
 def bridge_needs_restore(bridge):
@@ -740,11 +1170,12 @@ def bridge_input_items(raw, bridge):
     """Rewrite Codex tool-call history into the shapes the provider understands.
 
     Without this, a conversation dies right after the first bridged tool call:
-    the upstream receives a `custom_tool_call` item it has never emitted.
+    the upstream receives a `custom_tool_call` item it has never emitted, or a
+    namespaced `function_call` under a name it was never offered.
     """
     if not isinstance(raw, list):
         return raw
-    upstream_names = {entry["name"]: name for name, entry in (bridge or {}).items()}
+    upstream_names, namespaced = _reverse_bridge_names(bridge)
     out = []
     for item in raw:
         if not isinstance(item, dict):
@@ -774,6 +1205,22 @@ def bridge_input_items(raw, bridge):
                 "output": item.get("output", ""),
             })
         elif item_type == "function_call":
+            namespace = item.get("namespace")
+            if namespace:
+                # Codex replays the call with its namespace and short name; the
+                # provider only ever saw the flat name. Drop the wrapper key it
+                # has no schema for.
+                flattened = namespaced.get((namespace, item.get("name", "")))
+                replayed = {k: v for k, v in item.items() if k != "namespace"}
+                if flattened:
+                    replayed["name"] = flattened
+                # When the bridge no longer maps the namespace (a restarted
+                # proxy, a rebuilt bridge), the call is still forwarded under
+                # its original name: no provider tool is ever declared with a
+                # `namespace` key, and a strict gateway rejects the whole
+                # request over one field it does not know.
+                out.append(replayed)
+                continue
             renamed = upstream_names.get(item.get("name", ""))
             out.append(dict(item, name=renamed) if renamed and renamed != item.get("name") else item)
         elif item_type == "message" and item.get("role") == "developer":
@@ -785,9 +1232,35 @@ def bridge_input_items(raw, bridge):
     return out
 
 
-def restore_output_items(output, bridge):
+def _reverse_bridge_names(bridge):
+    """Split the bridge into its two lookup tables.
+
+    Namespaced entries are keyed by `(namespace, tool)` because the flat name is
+    only a provider convenience: `collaboration.spawn_agent` and a hypothetical
+    top-level `collaboration__spawn_agent` must never be confused.
+    """
+    by_name = {}
+    namespaced = {}
+    for provider_name, entry in (bridge or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") == "namespace":
+            namespaced[(entry.get("namespace", ""), entry.get("name", ""))] = provider_name
+        else:
+            by_name[entry.get("name", "")] = provider_name
+    return by_name, namespaced
+
+
+def _restore_context(req, slug, headers):
+    """What the observation layer needs to attribute a restored call."""
+    return {"model": (req or {}).get("model"), "slug": slug,
+            "thread": request_thread_context(headers, req)}
+
+
+def restore_output_items(output, bridge, context=None):
     """Rebuild the Responses items Codex expects from the provider's function
-    calls: freeform custom tools, local_shell, and renamed function tools."""
+    calls: freeform custom tools, local_shell, namespaced tools, and renamed
+    function tools."""
     if not output or not bridge:
         return output
     restored = []
@@ -799,6 +1272,16 @@ def restore_output_items(output, bridge):
         kind, original = entry["kind"], entry["name"]
         if kind == "function":
             restored.append(dict(item, name=original) if original != item.get("name") else item)
+            continue
+        if kind == "namespace":
+            # Codex executes the call through its tool router, which reads the
+            # namespace back from this item. Keep `id`, `status`, `call_id` and
+            # the provider's arguments byte for byte.
+            namespace = entry.get("namespace", "")
+            sys.stderr.write("[proxy %s] restore %s -> %s.%s\n"
+                             % (DISPLAY, item.get("name"), namespace, original))
+            observe_restored_call(item, dict(context or {}, bridge=bridge))
+            restored.append(dict(item, namespace=namespace, name=original))
             continue
         try:
             arguments = json.loads(item.get("arguments") or "{}")
@@ -843,6 +1326,15 @@ def sanitize_upstream_request(req):
     values, so a third-party endpoint does not reject the whole request."""
     for field in OPENAI_ONLY_REQUEST_FIELDS:
         req.pop(field, None)
+    include = req.get("include")
+    if isinstance(include, list) and OPENAI_ONLY_INCLUDE_VALUES & set(include):
+        # Codex asks for the encrypted reasoning blob so a `store = false`
+        # session can replay it. A third-party endpoint cannot use that blob:
+        # the adapter strips it from the next request because strict gateways
+        # reject it (`400` on OpenCode Go). Asking for it would only produce a
+        # payload that is discarded, so the request stops asking.
+        req["include"] = [value for value in include
+                          if value not in OPENAI_ONLY_INCLUDE_VALUES]
     reasoning = req.get("reasoning")
     if isinstance(reasoning, dict):
         effort = reasoning.get("effort")
@@ -859,7 +1351,7 @@ def sanitize_upstream_request(req):
     return req
 
 
-def prepare_upstream_request(req, extra_tools=0):
+def prepare_upstream_request(req, extra_tools=0, headers=None):
     """Bridge tools + history and sanitize a Responses request in one pass.
 
     `extra_tools` counts tools the adapter adds itself (Anthropic's server-side
@@ -869,13 +1361,29 @@ def prepare_upstream_request(req, extra_tools=0):
     """
     slug = req.get("model")
     req["model"] = upstream_model(slug)
-    tools, bridge = bridge_tools(req.get("tools"))
+    state = _ToolBridgeState()
+    tools, bridge = bridge_tools(req.get("tools"), state)
     req["tools"] = tools
+    # Codex may advertise the same namespaces inside `additional_tools` items.
+    # Both paths share one mapping, so a tool name never resolves to two things.
+    req["input"] = bridge_additional_tools(req.get("input"), state)
     req["input"] = bridge_input_items(req.get("input"), bridge)
+    # Codex-only items (`agent_message`, encrypted reasoning) are translated
+    # last, once the tool history is already in the provider's shape.
+    req["input"] = sanitize_input_items(req.get("input"))
     req = apply_no_tools_note(req, len(tools) + extra_tools)
-    rewritten = ["%s->%s:%s" % (entry["name"], name, entry["kind"])
-                 for name, entry in bridge.items()
-                 if entry["kind"] != "function" or entry["name"] != name]
+    observe_bridged_tools(bridge, req["model"], slug)
+    observe_request_history(req.get("input"), {
+        "model": req["model"], "slug": slug,
+        "thread": request_thread_context(headers, req),
+    })
+    rewritten = []
+    for name, entry in bridge.items():
+        if entry["kind"] == "namespace":
+            rewritten.append("%s.%s->%s" % (entry.get("namespace", ""),
+                                            entry["name"], name))
+        elif entry["kind"] != "function" or entry["name"] != name:
+            rewritten.append("%s->%s:%s" % (entry["name"], name, entry["kind"]))
     if rewritten:
         sys.stderr.write("[proxy %s] bridge: %s\n" % (DISPLAY, ", ".join(rewritten)))
     if slug != req["model"]:
@@ -901,6 +1409,84 @@ def apply_no_tools_note(req, tools_count):
     else:
         req["input"] = [note_item]
     return req
+
+
+def _portable_content_parts(content):
+    """Content parts a third-party endpoint understands, in order.
+
+    `input_text` / `output_text` are portable as they are. Codex carries an
+    inter-agent message payload in an `encrypted_content` part (the field name
+    is Codex's own; the value is the text the other agent must read), so its
+    text is re-emitted as `input_text` instead of being lost — dropping it
+    would hand the child thread an empty task.
+    """
+    parts = []
+    for part in (content if isinstance(content, list) else []):
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in PORTABLE_CONTENT_PART_TYPES:
+            text = part.get("text")
+        elif kind == "encrypted_content":
+            text = part.get("encrypted_content")
+        else:
+            continue
+        if isinstance(text, str) and text:
+            parts.append({"type": "input_text", "text": text})
+    return parts
+
+
+def sanitize_input_items(input_items):
+    """Translate away the input items only Codex sends.
+
+    A provider that does not implement Codex's multi-agent protocol rejects the
+    entire request over one unknown item, so each Codex-only shape is either
+    translated into an equivalent portable one or dropped:
+
+    * `agent_message` -> `{"type": "message", "role": "user"}` (OpenCode Go
+      answers `422` otherwise). It is an input the model must read, hence the
+      `user` role, and its text is kept verbatim.
+    * `reasoning` -> the account-scoped `encrypted_content` blob and a null
+      `content` slot are removed, keeping the portable `summary`
+      (OpenCode Go answers `400` otherwise).
+    * anything else unknown is dropped, because relaying one would fail the
+      whole request instead of the single item.
+    """
+    if not isinstance(input_items, list):
+        return input_items
+    out = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        kind = item.get("type")
+        if kind == CODEX_AGENT_MESSAGE_TYPE:
+            content = _portable_content_parts(item.get("content"))
+            if not content:
+                sys.stderr.write("[proxy %s] agent_message vide ignore\n" % DISPLAY)
+                continue
+            sys.stderr.write("[proxy %s] agent_message -> message user\n" % DISPLAY)
+            out.append({"type": "message", "role": "user", "content": content})
+            continue
+        if kind == "reasoning":
+            cleaned = {key: value for key, value in item.items()
+                       if key != "encrypted_content"}
+            content = cleaned.get("content")
+            if not isinstance(content, list) or not content:
+                # `content: null` is rejected too; the summary is the portable
+                # half of a reasoning item.
+                cleaned.pop("content", None)
+            if "encrypted_content" in item:
+                sys.stderr.write("[proxy %s] reasoning: encrypted_content retire\n"
+                                 % DISPLAY)
+            out.append(cleaned)
+            continue
+        if kind in PORTABLE_INPUT_ITEM_TYPES:
+            out.append(item)
+            continue
+        sys.stderr.write("[proxy %s] item d'entree Codex-only ignore: %s\n"
+                         % (DISPLAY, kind))
+    return out
 
 
 TOOL_CALL_ITEM_TYPES = ("function_call", "custom_tool_call", "local_shell_call")
@@ -1638,7 +2224,8 @@ def do_anthropic_request(body_bytes, headers, stream):
     # flavor (freeform apply_patch, local_shell, MCP function tools) is bridged
     # to an Anthropic tool and restored on the way back.
     server_tools = anthropic_server_tools(req.get("tools"))
-    req, bridge, bridged_count, slug = prepare_upstream_request(req, extra_tools=len(server_tools))
+    req, bridge, bridged_count, slug = prepare_upstream_request(
+        req, extra_tools=len(server_tools), headers=headers)
     tools_count = bridged_count + len(server_tools)
     restore_needed = bridge_needs_restore(bridge)
     anth = responses_to_anthropic(req)
@@ -1656,6 +2243,8 @@ def do_anthropic_request(body_bytes, headers, stream):
     hdrs["Content-Type"] = "application/json"
     resp, error = _post_anthropic(anth, hdrs, server_tools)
     if error:
+        observe_upstream_error(error[0], model=req.get("model"), slug=slug,
+                               detail=upstream_error_detail(error[1]))
         return error[0], error[1], "application/json"
     # Responses always carry the slug Codex asked for, never the real model.
     if stream and tools_count > 0 and not restore_needed:
@@ -1672,7 +2261,8 @@ def do_anthropic_request(body_bytes, headers, stream):
             final = complete_tool_calls_anthropic(req, hdrs, final)
         final["id"] = final.get("id") or f"resp_{uuid.uuid4().hex[:24]}"
         final["status"] = "completed"
-        final["output"] = restore_output_items(final.get("output"), bridge)
+        final["output"] = restore_output_items(final.get("output"), bridge,
+                                               _restore_context(req, slug, headers))
         return 200, emit_stream_from_response(final), "text/event-stream"
     body = json.loads(resp.read().decode("utf-8"))
     out = anthropic_to_responses(body, slug)
@@ -1681,7 +2271,8 @@ def do_anthropic_request(body_bytes, headers, stream):
     # Desktop requests that explicitly supplied no tools.
     if tools_count == 0 and has_function_calls(out):
         out = complete_tool_calls_anthropic(req, hdrs, out)
-    out["output"] = restore_output_items(out.get("output"), bridge)
+    out["output"] = restore_output_items(out.get("output"), bridge,
+                                         _restore_context(req, slug, headers))
     return 200, json.dumps(out).encode(), "application/json"
 
 
@@ -1780,7 +2371,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if ADAPTER == "opencode-go" and self.path.startswith("/v1/responses") and data:
             try:
-                req, bridge, _, slug = prepare_upstream_request(json.loads(data))
+                req, bridge, _, slug = prepare_upstream_request(
+                    json.loads(data), headers=self.headers)
                 if req.get("model") not in OPENCODE_GO_RESPONSE_MODELS:
                     self.relay_opencode_chat(req, bridge, slug)
                     return
@@ -1827,7 +2419,9 @@ class Handler(BaseHTTPRequestHandler):
                 upstream = json.loads(response.read().decode("utf-8"))
             final = chat_to_responses(upstream, slug)
             if bridge_needs_restore(bridge):
-                final["output"] = restore_output_items(final.get("output"), bridge)
+                final["output"] = restore_output_items(
+                    final.get("output"), bridge,
+                    _restore_context(req, slug, self.headers))
             payload = emit_stream_from_response(final) if should_stream else json.dumps(final).encode()
             self.send_response(200)
             self.send_header("Content-Type",
@@ -1837,6 +2431,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
         except urllib.error.HTTPError as error:
             body = error.read()
+            observe_upstream_error(error.code, model=req.get("model"), slug=slug,
+                                   detail=upstream_error_detail(body))
             if error.code in (401, 402, 403, 500, 502, 503):
                 try:
                     detail = (json.loads(body.decode("utf-8")).get("error") or {}).get("message", "")
@@ -1854,6 +2450,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as error:
+            observe_upstream_error(None, model=req.get("model"), slug=slug,
+                                   detail=str(error))
             body = json.dumps({"error": {"type": "proxy_error", "message": str(error)}}).encode()
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
@@ -1878,7 +2476,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         if body_bytes and self.path.startswith("/v1/responses"):
             try:
-                req, bridge, tools_count, slug = prepare_upstream_request(json.loads(body_bytes))
+                req, bridge, tools_count, slug = prepare_upstream_request(
+                    json.loads(body_bytes), headers=self.headers)
                 restore_needed = bridge_needs_restore(bridge)
                 body_bytes = json.dumps(req).encode()
             except Exception:
@@ -1962,7 +2561,9 @@ class Handler(BaseHTTPRequestHandler):
                 if restore_needed and isinstance(final, dict):
                     # Rebuild apply_patch / local_shell / renamed MCP calls in
                     # the shape Codex executes natively.
-                    final["output"] = restore_output_items(final.get("output"), bridge)
+                    final["output"] = restore_output_items(
+                        final.get("output"), bridge,
+                        _restore_context(req, slug, self.headers))
                 if slug and isinstance(final, dict) and final.get("model"):
                     # Codex must read back the slug it asked for, not the
                     # provider model that answered.
@@ -1976,6 +2577,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(payload)
         except urllib.error.HTTPError as e:
             body = e.read()
+            observe_upstream_error(e.code, model=(req or {}).get("model"), slug=slug,
+                                   detail=upstream_error_detail(body))
             if ADAPTER in ("opencode", "opencode-go") and e.code in (401, 402, 403, 500, 502, 503):
                 detail = ""
                 try:
@@ -1996,6 +2599,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as e:
+            observe_upstream_error(None, model=(req or {}).get("model"), slug=slug,
+                                   detail=str(e))
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.end_headers()

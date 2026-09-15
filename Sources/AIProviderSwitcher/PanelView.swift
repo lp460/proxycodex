@@ -210,6 +210,14 @@ struct PanelView: View {
                     symbol: "info.circle"
                 )
             }
+
+            // What has really been observed for this exact provider + model.
+            MultiAgentCompatibilityRow(
+                compatibility: state.activeMultiAgentCompatibility,
+                providerName: state.activeProvider?.displayName,
+                model: state.snapshot.activeModel
+            )
+
             if state.shouldShowModelPicker {
                 modelSlotPicker
             }
@@ -451,13 +459,12 @@ struct PanelView: View {
                 symbolColor: agentQuotaColor
             )
 
-            if state.activeProvider?.id != "openai" {
-                SecondaryInfoRow(
-                    text: L("La délégation est pilotée par Codex. La compatibilité dépend du modèle et des outils exposés."),
-                    symbol: "info.circle",
-                    symbolColor: .secondary
-                )
-            }
+            // Prefer real evidence over a general sentence as soon as one exists.
+            MultiAgentCompatibilityRow(
+                compatibility: state.activeMultiAgentCompatibility,
+                providerName: state.activeProvider?.displayName,
+                model: state.snapshot.activeModel
+            )
         }
     }
 
@@ -1580,6 +1587,131 @@ private struct SecondaryInfoRow: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Multi-Agent V2 compatibility for the active provider + model.
+///
+/// Shows what a real session proved, never what a provider claims. The wording
+/// stays user-level on purpose: no namespace, bridge or `call_id` reaches the
+/// panel — that detail belongs to the journal.
+private struct MultiAgentCompatibilityRow: View {
+    let compatibility: MultiAgentCompatibility
+    let providerName: String?
+    let model: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.system(size: 10))
+                    .foregroundStyle(color)
+
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 16)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text(title))
+        .accessibilityValue(Text(detail ?? ""))
+    }
+
+    /// "GLM (Z.ai) · glm-5.3", so the status is never attributed to a model the
+    /// user is not actually running.
+    private var identity: String? {
+        guard let providerName, !providerName.isEmpty else { return model.isEmpty ? nil : model }
+        return model.isEmpty ? providerName : "\(providerName) · \(model)"
+    }
+
+    private var title: String {
+        switch compatibility.path {
+        case .nativeCodex:
+            return L("Multi-Agent V2 · support natif Codex")
+        case .unbridged:
+            return L("Multi-Agent V2 · non vérifié avec ce modèle")
+        case .bridged:
+            switch compatibility.status {
+            case .unknown:
+                return L("Multi-Agent V2 · non vérifié avec ce modèle")
+            case .observed:
+                return L("Multi-Agent V2 · utilisation observée")
+            case .validated:
+                return L("Multi-Agent V2 · validé avec ce modèle")
+            case .inconclusive:
+                return L("Multi-Agent V2 · non vérifié")
+            case .incompatible:
+                return L("Multi-Agent V2 · non compatible avec ce modèle")
+            case .stale:
+                return L("Multi-Agent V2 · à revalider")
+            }
+        }
+    }
+
+    private var detail: String? {
+        guard compatibility.path != .nativeCodex else { return identity }
+        let reason = MultiAgentFailureReason(code: compatibility.reason)
+        switch compatibility.status {
+        case .inconclusive:
+            return "\(identity ?? "") · \(L("Dernier essai non concluant")) · \(L(reason.localizationKey))"
+        case .observed, .validated, .stale:
+            var parts: [String] = []
+            if let identity { parts.append(identity) }
+            if compatibility.status == .stale {
+                parts.append(L("À revalider à la prochaine utilisation"))
+            } else if compatibility.status == .observed {
+                parts.append(L("En attente d’un cycle complet"))
+            }
+            return parts.joined(separator: " · ")
+        case .incompatible:
+            return [identity, L(reason.localizationKey)]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+        case .unknown:
+            return [identity, L("Aucun test lancé : la compatibilité est apprise pendant l’utilisation réelle.")]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+        }
+    }
+
+    private var symbol: String {
+        switch compatibility.path {
+        case .nativeCodex: return "checkmark.seal"
+        case .unbridged: return "questionmark.circle"
+        case .bridged:
+            switch compatibility.status {
+            case .unknown: return "questionmark.circle"
+            case .observed: return "circle.lefthalf.filled"
+            case .validated: return "checkmark.circle.fill"
+            case .inconclusive: return "circle.dashed"
+            case .incompatible: return "xmark.circle.fill"
+            case .stale: return "arrow.clockwise.circle"
+            }
+        }
+    }
+
+    private var color: Color {
+        switch compatibility.path {
+        case .nativeCodex: return .secondary
+        case .unbridged: return .secondary
+        case .bridged:
+            switch compatibility.status {
+            case .validated: return .green
+            case .observed: return .blue
+            case .incompatible: return .red
+            case .stale: return .orange
+            case .unknown, .inconclusive: return .secondary
+            }
+        }
     }
 }
 
