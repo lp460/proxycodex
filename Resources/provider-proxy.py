@@ -549,6 +549,42 @@ def _anthropic_image_block(part):
     return {"type": "image", "source": {"type": "url", "url": url}}
 
 
+def _tool_result_content(output):
+    """A Responses tool result as Anthropic `tool_result` content.
+
+    Anthropic accepts a string or a list of content blocks, but its block types
+    are `text` / `image` — a list of Responses `input_text` parts is rejected.
+    Text-only results are returned as one string, which every
+    Anthropic-compatible gateway accepts.
+    """
+    if isinstance(output, str):
+        return output
+    if output is None:
+        return ""
+    if not isinstance(output, list):
+        return json.dumps(output)
+    blocks = []
+    for part in output:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in ("input_text", "output_text", "text"):
+            text = part.get("text", "")
+            if text and blocks and blocks[-1]["type"] == "text":
+                blocks[-1]["text"] += text
+            elif text:
+                blocks.append({"type": "text", "text": text})
+        elif kind == "input_image":
+            image = _anthropic_image_block(part) if SUPPORTS_IMAGES else None
+            if image:
+                blocks.append(image)
+    if not blocks:
+        return json.dumps(output)
+    if all(block["type"] == "text" for block in blocks):
+        return "\n".join(block["text"] for block in blocks)
+    return blocks
+
+
 def anthropic_server_tools(tools):
     """Anthropic runs web search itself, so Codex's hosted `web_search` tool has
     a real equivalent here instead of being dropped."""
@@ -1436,6 +1472,30 @@ def _portable_content_parts(content):
     return parts
 
 
+def _text_only_tool_output(output):
+    """A tool result that carries nothing but text, as one string.
+
+    Responses allows `function_call_output.output` to be a list of input parts,
+    which is how Codex hands back computer-use and vision results. A gateway
+    that implements Responses over Chat deserializes those parts with its own
+    Chat part enum and rejects the whole request over one `input_text`. The
+    string form is valid for every Responses endpoint, so a text-only list is
+    collapsed. Returns None when the list carries anything else (an image, a
+    part type this adapter does not know), which is relayed untouched.
+    """
+    if not isinstance(output, list) or not output:
+        return None
+    texts = []
+    for part in output:
+        if not isinstance(part, dict) or part.get("type") not in PORTABLE_CONTENT_PART_TYPES:
+            return None
+        text = part.get("text")
+        if not isinstance(text, str):
+            return None
+        texts.append(text)
+    return "".join(texts)
+
+
 def sanitize_input_items(input_items):
     """Translate away the input items only Codex sends.
 
@@ -1480,6 +1540,11 @@ def sanitize_input_items(input_items):
                 sys.stderr.write("[proxy %s] reasoning: encrypted_content retire\n"
                                  % DISPLAY)
             out.append(cleaned)
+            continue
+        if kind in ("function_call_output", "custom_tool_call_output",
+                    "local_shell_call_output"):
+            text = _text_only_tool_output(item.get("output"))
+            out.append(dict(item, output=text) if text is not None else item)
             continue
         if kind in PORTABLE_INPUT_ITEM_TYPES:
             out.append(item)
@@ -1607,13 +1672,55 @@ def _responses_parts_to_chat(content):
              for item in parts]
 
 
+def _tool_output_to_chat(output):
+    """A Responses tool result as Chat-compatible content.
+
+    The Responses API lets a `function_call_output` carry either a plain string
+    or a list of input content parts, and Codex uses the list form for the tools
+    that return rich content: computer-use and vision results arrive as
+    `{"type": "input_text", ...}` parts. Chat Completions only knows `text`,
+    `image_url` and `file`, and a strict gateway rejects the whole request over
+    one unknown part type:
+
+        messages[186]: unknown variant `input_text`, expected one of `text`,
+        `image_url`, `file`
+
+    so the list is translated instead of relayed as is.
+    """
+    if isinstance(output, str):
+        return output
+    if output is None:
+        return ""
+    if not isinstance(output, list):
+        return json.dumps(output)
+    content = _responses_parts_to_chat(output)
+    if content or not output:
+        return content
+    # Nothing portable survived (unknown part types): hand the provider the
+    # JSON text rather than silently dropping the tool result.
+    return json.dumps(output)
+
+
 def _normalize_chat_content(content):
-    """Remove Responses-only image parts from an already Chat-shaped body."""
+    """Rewrite Responses-only content parts in an already Chat-shaped body.
+
+    A Chat message content list is typed by the provider: `text`, `image_url`
+    and `file`. Any Responses part that reaches this shape (`input_text`,
+    `output_text`, `input_image`) is translated, so a rejected request can
+    never come from a part type the proxy left behind.
+    """
     if not isinstance(content, list):
         return content
     normalized = []
     for part in content:
-        if not isinstance(part, dict) or part.get("type") != "input_image":
+        if not isinstance(part, dict):
+            normalized.append(part)
+            continue
+        kind = part.get("type")
+        if kind in ("input_text", "output_text"):
+            normalized.append({"type": "text", "text": part.get("text", "")})
+            continue
+        if kind != "input_image":
             normalized.append(part)
             continue
         url = part.get("image_url")
@@ -1693,14 +1800,15 @@ def responses_to_chat(body):
                         "arguments": item.get("arguments") or "{}",
                     },
                 })
-            elif item_type == "function_call_output":
+            elif item_type in ("function_call_output", "custom_tool_call_output",
+                               "local_shell_call_output"):
                 if pending_tool_calls:
                     append_message("assistant", "", pending_tool_calls)
                     pending_tool_calls = []
                 messages.append({
                     "role": "tool",
                     "tool_call_id": item.get("call_id", ""),
-                    "content": item.get("output") or "",
+                    "content": _tool_output_to_chat(item.get("output")),
                 })
         if pending_tool_calls:
             append_message("assistant", "", pending_tool_calls)
@@ -1842,7 +1950,7 @@ def responses_to_anthropic(body):
                             blocks.append({
                                 "type": "tool_result",
                                 "tool_use_id": part.get("call_id", ""),
-                                "content": part.get("output", ""),
+                                "content": _tool_result_content(part.get("output")),
                             })
                 if blocks:
                     messages.append({"role": role, "content": blocks})
@@ -1853,7 +1961,7 @@ def responses_to_anthropic(body):
                 messages.append({"role": "user", "content": [{
                     "type": "tool_result",
                     "tool_use_id": item.get("call_id", ""),
-                    "content": item.get("output", ""),
+                    "content": _tool_result_content(item.get("output")),
                 }]})
             elif t == "function_call":
                 args = item.get("arguments", "{}")

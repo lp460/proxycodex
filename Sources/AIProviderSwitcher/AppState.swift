@@ -1371,7 +1371,7 @@ final class AppState: ObservableObject {
     // v11: a namespaced `function_call` whose namespace is no longer in the
     // bridge (restarted proxy) used to be forwarded with its `namespace` key
     // intact; the wrapper is now always dropped before the provider sees it.
-    private let proxyVersion = "2026-09-14-opencode-go-v11"
+    private let proxyVersion = "2026-09-15-opencode-go-v12"
 
     /// Stable, non-reversible metadata used to detect credential changes and
     /// restart a proxy that still carries an older key.

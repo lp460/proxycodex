@@ -356,6 +356,8 @@ Go route ses modèles vers Responses, Chat Completions ou Anthropic Messages sel
 
 Cette liste ne dit rien de la compatibilité Multi-Agent : elle est apprise passivement, modèle par modèle, pendant de vrais workflows (voir « Compatibilité Multi-Agent apprise à l’usage »). Rien ne garantit que les quelque soixante modèles Go se comportent tous de la même façon, et chacun garde son propre statut.
 
+Les résultats d’outils suivent le même alignement. Responses accepte un `function_call_output` sous forme de liste de parties `input_text`, ce que Codex utilise pour les outils qui renvoient du contenu riche (computer-use, vision). Chat Completions ne connaît que `text`, `image_url` et `file`, et la passerelle rejette la requête entière sur une partie inconnue : `messages[186]: unknown variant input_text, expected one of text, image_url, file`. Ces sorties sont donc converties en texte pour les modèles traduits vers Chat, et un résultat dont aucun type de partie n’est reconnu est transmis en JSON plutôt que perdu.
+
 Le proxy ajoute les en-têtes `x-opencode-session`, `x-opencode-request`, `x-opencode-client` et `User-Agent` attendus pour le routage et l'affinité de cache. L'identifiant de session est dérivé de façon stable à partir de l'ID explicite de la requête ou du premier message utilisateur ; aucune clé n'est écrite dans ces en-têtes ni dans les journaux.
 
 Pour Zen, aucune clé n'est requise à la base. Le proxy cherche, dans cet ordre :

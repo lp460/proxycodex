@@ -646,6 +646,99 @@ trust_level = "trusted"
         self.assertNotIn("input_image", json.dumps(chat))
         self.assertNotIn("input_image", json.dumps(direct))
 
+    def test_rich_tool_results_reach_chat_upstreams_as_text(self):
+        # Computer-use and vision tools answer a `function_call_output` with a
+        # list of input content parts. Relayed as is, OpenCode Go rejected the
+        # entire request: `messages[186]: unknown variant `input_text`,
+        # expected one of `text`, `image_url`, `file``.
+        output = [
+            {"type": "input_text", "text": "Wall time: 0.07 seconds\nOutput:"},
+            {"type": "input_text", "text": "{\"application\":\"Veil\"}"},
+        ]
+        chat = self.proxy.responses_to_chat({
+            "model": "model",
+            "input": [
+                {"type": "function_call", "call_id": "call-1",
+                 "name": "list_windows", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1",
+                 "output": output},
+            ],
+        })
+        tool = [message for message in chat["messages"] if message["role"] == "tool"][0]
+        self.assertEqual(tool["tool_call_id"], "call-1")
+        self.assertEqual(tool["content"],
+                         "Wall time: 0.07 seconds\nOutput:{\"application\":\"Veil\"}")
+        self.assertNotIn("input_text", json.dumps(chat))
+
+    def test_unknown_tool_result_parts_are_relayed_as_json_text(self):
+        output = [{"type": "a_future_part_type", "value": 1}]
+        chat = self.proxy.responses_to_chat({
+            "model": "model",
+            "input": [
+                {"type": "function_call", "call_id": "call-1",
+                 "name": "list_windows", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1",
+                 "output": output},
+            ],
+        })
+        tool = [message for message in chat["messages"] if message["role"] == "tool"][0]
+        self.assertEqual(tool["content"], json.dumps(output))
+
+    def test_text_only_tool_results_are_relayed_as_strings(self):
+        # The string form is the one shape every Responses endpoint accepts,
+        # including the gateways that implement Responses over Chat internally.
+        req, _, _, _ = self.proxy.prepare_upstream_request({
+            "model": "model",
+            "input": [{
+                "type": "function_call_output", "call_id": "call-1",
+                "output": [{"type": "input_text", "text": "windows"},
+                           {"type": "input_text", "text": ": none"}],
+            }],
+            "tools": [{"type": "function", "name": "list_windows"}],
+        })
+        self.assertEqual(req["input"][0]["output"], "windows: none")
+
+    def test_tool_results_carrying_images_keep_their_parts(self):
+        output = [{"type": "input_text", "text": "screenshot"},
+                  {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}]
+        req, _, _, _ = self.proxy.prepare_upstream_request({
+            "model": "model",
+            "input": [{"type": "function_call_output", "call_id": "call-1",
+                       "output": output}],
+            "tools": [{"type": "function", "name": "view_image"}],
+        })
+        self.assertEqual(req["input"][0]["output"], output)
+
+    def test_chat_requests_never_carry_responses_text_parts(self):
+        direct = self.proxy.normalize_chat_request({
+            "messages": [
+                {"role": "tool", "tool_call_id": "call-1",
+                 "content": [{"type": "input_text", "text": "ok"}]},
+                {"role": "user", "content": [{"type": "output_text", "text": "hi"}]},
+            ],
+        })
+        self.assertEqual(direct["messages"][0]["content"], [{"type": "text", "text": "ok"}])
+        self.assertNotIn("input_text", json.dumps(direct))
+        self.assertNotIn("output_text", json.dumps(direct))
+
+    def test_anthropic_tool_results_use_text_content(self):
+        body = {
+            "model": "model",
+            "input": [
+                {"type": "function_call", "call_id": "call-1",
+                 "name": "list_windows", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": [
+                    {"type": "input_text", "text": "windows"},
+                    {"type": "input_text", "text": "[]"},
+                ]},
+            ],
+        }
+        anthropic = self.proxy.responses_to_anthropic(body)
+        result = anthropic["messages"][1]["content"][0]
+        self.assertEqual(result["type"], "tool_result")
+        self.assertEqual(result["content"], "windows[]")
+        self.assertNotIn("input_text", json.dumps(anthropic))
+
     def test_web_search_maps_to_the_anthropic_server_tool(self):
         original = self.proxy.SUPPORTS_WEB_SEARCH
         try:
